@@ -18,3 +18,8 @@ without OAuth credentials. SQLite data is stored in `data/mcq.db`.
 For deployment, configure Google OIDC credentials through Streamlit secrets or
 environment variables. Claude ingestion is optional; without `ANTHROPIC_API_KEY`
 the built-in structured text parser is used.
+
+## TODO
+
+- [ ] Configure an email provider (e.g., SMTP) to send welcome emails on signup
+      and password-reset emails for the "forgot password" flow.
