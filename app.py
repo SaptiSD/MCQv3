@@ -2,6 +2,7 @@
 
 import streamlit as st
 
+from admin_portal import dashboard as admin_dashboard
 from db import init_db, seed_demo_data
 from student_portal import dashboard as student_dashboard
 from teacher_portal import create as create_quiz
@@ -40,8 +41,12 @@ def main() -> None:
             roster_page(user)
         elif page == "Analytics":
             analytics_page(user)
+        elif page == "Student view":
+            student_dashboard(user)
         else:
             teacher_dashboard(user)
+    elif user["role"] == "admin":
+        admin_dashboard(user)
     else:
         student_dashboard(user)
 

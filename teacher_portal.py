@@ -190,6 +190,8 @@ def create(user) -> None:
             with second: st.number_input("Passing score (%)", 0, 100, form.get("new-passing", 70), key="new-passing", on_change=_create_save_setting, args=("new-passing",))
             st.checkbox("Allow retakes", form.get("new-retakes", False), key="new-retakes", on_change=_create_save_setting, args=("new-retakes",))
             st.checkbox("Show class average to students", form.get("new-average", False), key="new-average", on_change=_create_save_setting, args=("new-average",))
+            st.checkbox("Randomize question order", form.get("new-randomize-questions", True), key="new-randomize-questions", on_change=_create_save_setting, args=("new-randomize-questions",))
+            st.checkbox("Randomize answer order", form.get("new-randomize-answers", True), key="new-randomize-answers", on_change=_create_save_setting, args=("new-randomize-answers",))
             today = datetime.now().date()
             tomorrow = today + timedelta(days=1)
             opening_enabled = form.get("new-opening-enabled", True)
@@ -269,7 +271,7 @@ def create(user) -> None:
         st.info(f"The quiz opens on {opening.strftime('%b %d, %I:%M %p')} and won't be visible to students until then.")
     assigned_students = {row["id"] for row in form.get("new-selected", [])}
     assigned_students.update(student_ids_for_teams(user["id"], [team["id"] for team in form.get("new-team-selected", [])]))
-    quiz_id = create_quiz(user["id"], title, form.get("new-duration", 30), form.get("new-passing", 70), form.get("new-retakes", False), form.get("new-average", False), opening.isoformat(), closing.isoformat(), list(assigned_students), opening_enabled, closing_enabled)
+    quiz_id = create_quiz(user["id"], title, form.get("new-duration", 30), form.get("new-passing", 70), form.get("new-retakes", False), form.get("new-average", False), opening.isoformat(), closing.isoformat(), list(assigned_students), opening_enabled, closing_enabled, form.get("new-randomize-questions", True), form.get("new-randomize-answers", True))
     save_question_bank(quiz_id, questions)
     st.session_state.manage_quiz = quiz_id
     st.session_state[f"quiz-section-{quiz_id}"] = "questions"
@@ -453,6 +455,8 @@ def settings_editor(quiz) -> None:
             with closing_time: closing_clock = st.time_input("Closing time", closing.timetz().replace(tzinfo=None), disabled=has_attempts or not closing_enabled)
         allow_retake = st.checkbox("Allow retakes", bool(quiz["allow_retake"]), disabled=has_attempts)
         show_average = st.checkbox("Show class average", bool(quiz["show_average"]), disabled=has_attempts)
+        randomize_questions = st.checkbox("Randomize question order", bool(quiz["randomize_questions"]), disabled=has_attempts)
+        randomize_answers = st.checkbox("Randomize answer order", bool(quiz["randomize_answers"]), disabled=has_attempts)
         saved = st.form_submit_button("Save settings", type="primary", disabled=has_attempts, width="stretch")
     if saved:
         opening_value = datetime.combine(opening_day, opening_clock, tzinfo=timezone.utc)
@@ -462,7 +466,7 @@ def settings_editor(quiz) -> None:
         elif closing_enabled and closing_value <= datetime.now(timezone.utc):
             st.error("Closing time is in the past; students won't be able to take this quiz. Set a closing time in the future.")
         else:
-            update_quiz_settings(quiz["id"], duration, passing, allow_retake, show_average, opening_value.isoformat(), closing_value.isoformat(), opening_enabled, closing_enabled)
+            update_quiz_settings(quiz["id"], duration, passing, allow_retake, show_average, opening_value.isoformat(), closing_value.isoformat(), opening_enabled, closing_enabled, randomize_questions, randomize_answers)
             st.success("Settings saved.")
 
 

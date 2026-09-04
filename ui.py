@@ -7,6 +7,7 @@ import os
 import streamlit as st
 
 from db import get_or_create_user
+from repository import authenticate
 
 
 def styles() -> None:
@@ -54,15 +55,19 @@ def styles() -> None:
 
 def login_page() -> None:
     st.markdown('<div class="hero"><div class="eyebrow">MCQ / testing platform</div><h1>Make every question count.</h1><p>A focused place for teachers to shape assessments and students to take them with confidence.</p></div>', unsafe_allow_html=True)
-    left, right = st.columns(2, gap="large")
-    with left:
-        st.markdown('<div class="panel"><div class="eyebrow">For educators</div><h2>Build a better quiz</h2><p class="muted">Upload a question bank, set the rules, and assign it to exactly the students who need it.</p></div>', unsafe_allow_html=True)
-        if st.button("Enter teacher workspace", type="primary", width="stretch"):
-            st.session_state.user = dict(get_or_create_user("teacher@mcq.local", "Avery Morgan", "teacher")); st.rerun()
-    with right:
-        st.markdown('<div class="panel"><div class="eyebrow">For students</div><h2>Take the right test</h2><p class="muted">See your assigned assessments, save your progress, and get a clear result.</p></div>', unsafe_allow_html=True)
-        if st.button("Enter student workspace", width="stretch"):
-            st.session_state.user = dict(get_or_create_user("student@mcq.local", "Jordan Lee", "student")); st.rerun()
+    with st.container(border=True):
+        st.markdown('<div class="eyebrow">Sign in</div><h2>Welcome back</h2>', unsafe_allow_html=True)
+        with st.form("login"):
+            identifier = st.text_input("Email or full name")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login", type="primary", width="stretch")
+        if submitted:
+            user = authenticate(identifier, password)
+            if user is None:
+                st.error("No account matches that name, email, or password.")
+            else:
+                st.session_state.user = user; st.rerun()
+        st.caption("Demo access: `teacher@mcq.local` / `teacher` · `student@mcq.local` / `student` · `admin@mcq.local` / `admin`")
     try:
         oidc_configured = "auth" in st.secrets
     except Exception:
@@ -76,7 +81,7 @@ def login_page() -> None:
 
 def workspace_nav(user, selected_page: str | None = None) -> str:
     st.markdown(f"<div class='top-brand'><strong>MCQ</strong><span>Assessment studio</span><span class='top-user'>{user['name']} · {user['role'].title()}</span></div>", unsafe_allow_html=True)
-    pages = ["Dashboard", "Create quiz", "Students", "Analytics"] if user["role"] == "teacher" else ["Dashboard"]
+    pages = ["Dashboard", "Create quiz", "Students", "Analytics", "Student view"] if user["role"] == "teacher" else ["Dashboard"]
     nav, sign_out = st.columns([8, 1], vertical_alignment="center")
     with nav:
         default_page = selected_page if selected_page in pages else pages[0]

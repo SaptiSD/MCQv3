@@ -34,7 +34,15 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY,
                 email TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('teacher', 'student'))
+                role TEXT NOT NULL CHECK(role IN ('teacher', 'student')),
+                password TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS admins (
+                id INTEGER PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS quizzes (
                 id INTEGER PRIMARY KEY,
@@ -49,6 +57,8 @@ def init_db() -> None:
                 closing_time TEXT NOT NULL,
                 opening_enabled INTEGER NOT NULL DEFAULT 1,
                 closing_enabled INTEGER NOT NULL DEFAULT 1,
+                randomize_questions INTEGER NOT NULL DEFAULT 1,
+                randomize_answers INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at TEXT NOT NULL
             );
@@ -107,9 +117,33 @@ def init_db() -> None:
             db.execute("ALTER TABLE quizzes ADD COLUMN opening_enabled INTEGER NOT NULL DEFAULT 1")
         if "closing_enabled" not in quiz_columns:
             db.execute("ALTER TABLE quizzes ADD COLUMN closing_enabled INTEGER NOT NULL DEFAULT 1")
+        user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+        if "password" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN password TEXT NOT NULL DEFAULT 'password'")
+        if "randomize_questions" not in quiz_columns:
+            db.execute("ALTER TABLE quizzes ADD COLUMN randomize_questions INTEGER NOT NULL DEFAULT 1")
+        if "randomize_answers" not in quiz_columns:
+            db.execute("ALTER TABLE quizzes ADD COLUMN randomize_answers INTEGER NOT NULL DEFAULT 1")
         columns = {row["name"] for row in db.execute("PRAGMA table_info(questions)")}
         if "question_type" not in columns:
             db.execute("ALTER TABLE questions ADD COLUMN question_type TEXT NOT NULL DEFAULT 'Multiple choice'")
+        admin_columns = {row["name"] for row in db.execute("PRAGMA table_info(admins)")}
+        if "email" not in admin_columns:
+            db.executescript("""
+                ALTER TABLE admins ADD COLUMN email TEXT;
+                UPDATE admins SET email = lower(username) || '@mcq.local' WHERE email IS NULL OR email = '';
+                CREATE TABLE admins_new (
+                    id INTEGER PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    password TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO admins_new(id, email, password, name, created_at)
+                    SELECT id, email, password, name, created_at FROM admins;
+                DROP TABLE admins;
+                ALTER TABLE admins_new RENAME TO admins;
+            """)
 
 
 def get_or_create_user(email: str, name: str, role: str) -> sqlite3.Row:
@@ -129,6 +163,9 @@ def seed_demo_data() -> None:
     teacher = get_or_create_user("teacher@mcq.local", "Avery Morgan", "teacher")
     student = get_or_create_user("student@mcq.local", "Jordan Lee", "student")
     with connect() as db:
+        db.execute("INSERT OR IGNORE INTO admins(email, password, name, created_at) VALUES ('admin@mcq.local', 'admin', 'Administrator', ?)", (utc_now(),))
+        for email, password in (("teacher@mcq.local", "teacher"), ("student@mcq.local", "student")):
+            db.execute("UPDATE users SET password = ? WHERE email = ? AND (password = '' OR password = 'password')", (password, email))
         db.executemany(
             "INSERT OR IGNORE INTO teams(teacher_id, name, created_at) VALUES (?, ?, ?)",
             [(teacher["id"], name, utc_now()) for name in ("Tutors", "Software", "Finance", "Assistants")],

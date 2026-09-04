@@ -51,10 +51,12 @@ def start_attempt(user, quiz) -> None:
         open_attempt = db.execute("SELECT * FROM attempts WHERE quiz_id=? AND student_id=? AND submitted_at IS NULL", (quiz["id"], user["id"])).fetchone()
         if open_attempt:
             st.session_state.attempt_id = open_attempt["id"]; return
-        questions = list(questions_for_quiz(quiz["id"])); random.shuffle(questions)
+        questions = list(questions_for_quiz(quiz["id"]))
+        if quiz["randomize_questions"]: random.shuffle(questions)
         frozen = []
         for question in questions:
-            options = json.loads(question["options_json"]); random.shuffle(options)
+            options = json.loads(question["options_json"])
+            if quiz["randomize_answers"]: random.shuffle(options)
             correct = json.loads(question["correct_label"]) if question["question_type"] == "Multiple choice - select all that apply" else question["correct_label"]
             frozen.append({"text": question["question_text"], "options": options, "correct": correct, "question_type": question["question_type"]})
         started = current_time(); deadline = min(started + timedelta(minutes=quiz["duration_minutes"]), datetime.fromisoformat(quiz["closing_time"]))
