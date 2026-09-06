@@ -96,7 +96,10 @@ def workspace_nav(user, selected_page: str | None = None) -> str:
                 st.session_state.create_nav_guard = True
                 st.session_state.create_nav_request = "Sign out"
                 st.rerun()
-            st.session_state.pop("user", None); st.rerun()
+            if getattr(st.user, "is_logged_in", False):
+                st.logout()
+            else:
+                st.session_state.pop("user", None); st.rerun()
     return page
 
 
@@ -109,7 +112,10 @@ def confirm_discard_dialog() -> None:
         st.session_state.pop("create_nav_guard", None)
         st.session_state.pop("create_dirty", None)
         if target == "Sign out":
-            st.session_state.pop("user", None)
+            if getattr(st.user, "is_logged_in", False):
+                st.logout()
+            else:
+                st.session_state.pop("user", None)
         elif target:
             st.session_state.page_override = target
         st.rerun()
