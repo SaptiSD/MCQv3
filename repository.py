@@ -459,9 +459,8 @@ def available_quizzes(student_id: int, owner_id: int | None = None):
         return _rows(base.eq("owner_id", owner_id).order("closing_time").execute())
     quizzes = _rows(base.order("closing_time").execute())
     quiz_student_rows = _rows(supabase.table("quiz_students").select("quiz_id,student_id").execute())
-    any_assigned = {row["quiz_id"] for row in quiz_student_rows}
     mine = {row["quiz_id"] for row in quiz_student_rows if row["student_id"] == student_id}
-    return [q for q in quizzes if q["id"] not in any_assigned or q["id"] in mine]
+    return [q for q in quizzes if q["id"] in mine]
 
 
 def attempts_for_student(student_id: int):

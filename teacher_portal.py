@@ -60,7 +60,7 @@ def dashboard(user) -> None:
             with details:
                 st.subheader(quiz["title"])
                 assigned = len(assigned_student_ids(quiz["id"]))
-                audience = f"{assigned} assigned students" if assigned else "All students"
+                audience = f"{assigned} assigned students" if assigned else "Not assigned"
                 st.caption(f"{len(questions_for_quiz(quiz['id']))} questions  ·  {quiz['duration_minutes']} minutes  ·  pass at {quiz['passing_score']}%  ·  {audience}")
             with action:
                 if st.button("Manage", key=f"manage-{quiz['id']}", width="stretch"):
@@ -208,11 +208,12 @@ def create(user) -> None:
             with closing_time: st.time_input("Closing time", form.get("new-closing-clock", time(17, 0)), key="new-closing-clock", disabled=not closing_enabled, on_change=_create_save_setting, args=("new-closing-clock",))
             st.divider(); st.subheader("Audience")
             roster = students(user["id"])
-            audience_mode = st.radio("Assign to", ["Students", "Teams"], horizontal=True, key="new-audience-mode",
-                                     index=0 if form.get("new-audience-mode") != "Teams" else 1, on_change=_create_save_setting, args=("new-audience-mode",))
+            audience_mode = st.radio("Assign to", ["All", "Students", "Teams"], horizontal=True, key="new-audience-mode",
+                                     index=0 if form.get("new-audience-mode") != "Students" and form.get("new-audience-mode") != "Teams" else 1 if form.get("new-audience-mode") == "Students" else 2,
+                                     on_change=_create_save_setting, args=("new-audience-mode",))
             if audience_mode == "Students":
                 st.multiselect("Assign to students", options=roster, default=form.get("new-selected", []), format_func=lambda row: f"{row['name']}  ·  {row['email']}", key="new-selected", on_change=_create_save_setting, args=("new-selected",))
-            else:
+            elif audience_mode == "Teams":
                 st.multiselect("Assign to teams", options=teams_for_teacher(user["id"]), default=form.get("new-team-selected", []), format_func=lambda team: team["name"], key="new-team-selected", on_change=_create_save_setting, args=("new-team-selected",))
 
     bottom_publish = st.button("Publish quiz", key="new-quiz-publish-bottom", type="primary", width="stretch")
@@ -271,8 +272,11 @@ def create(user) -> None:
         return
     if opening_enabled and opening > now:
         st.info(f"The quiz opens on {opening.strftime('%b %d, %I:%M %p')} and won't be visible to students until then.")
-    assigned_students = {row["id"] for row in form.get("new-selected", [])}
-    assigned_students.update(student_ids_for_teams(user["id"], [team["id"] for team in form.get("new-team-selected", [])]))
+    if form.get("new-audience-mode", "All") == "All":
+        assigned_students = {row["id"] for row in students(user["id"])}
+    else:
+        assigned_students = {row["id"] for row in form.get("new-selected", [])}
+        assigned_students.update(student_ids_for_teams(user["id"], [team["id"] for team in form.get("new-team-selected", [])]))
     quiz_id = create_quiz(user["id"], title, form.get("new-duration", 30), form.get("new-passing", 70), form.get("new-retakes", False), form.get("new-average", False), opening.isoformat(), closing.isoformat(), list(assigned_students), opening_enabled, closing_enabled, form.get("new-randomize-questions", True), form.get("new-randomize-answers", True))
     save_question_bank(quiz_id, questions)
     st.session_state.page_override = "Dashboard"
@@ -476,9 +480,12 @@ def settings_editor(quiz) -> None:
 def assignment_editor(quiz) -> None:
     roster = students(quiz["owner_id"]); current = assigned_student_ids(quiz["id"])
     st.write("Choose who can see this assessment")
-    st.caption("An empty selection means the quiz is available to every student. Selected students see it only on their dashboard.")
-    audience_mode = st.radio("Assign to", ["Students", "Teams"], horizontal=True, key=f"assigned-mode-{quiz['id']}")
-    if audience_mode == "Students":
+    st.caption("Select 'All' to assign every student on your roster, or choose specific students or teams.")
+    is_all = len(roster) > 0 and len(current) == len(roster)
+    audience_mode = st.radio("Assign to", ["All", "Students", "Teams"], horizontal=True, index=0 if is_all else 1, key=f"assigned-mode-{quiz['id']}")
+    if audience_mode == "All":
+        selected_ids = [row["id"] for row in roster]
+    elif audience_mode == "Students":
         selected = st.multiselect("Assigned students", options=roster, default=[row for row in roster if row["id"] in current], format_func=lambda row: f"{row['name']}  ·  {row['email']}", key=f"assigned-{quiz['id']}")
         selected_ids = [row["id"] for row in selected]
     else:
