@@ -40,6 +40,9 @@ def dashboard(user) -> None:
     quizzes = quizzes_for_teacher(user["id"])
     roster = students(user["id"])
     analytics = teacher_analytics(user["id"])
+    created_title = st.session_state.pop("quiz_created", None)
+    if created_title:
+        st.success(f"Quiz created.")
     st.markdown('<div class="eyebrow">Teacher workspace</div><h1>Your assessments</h1>', unsafe_allow_html=True)
     st.caption("Create, assign, review, and understand the assessments you own.")
     metrics = [(analytics["quizzes"], "Total quizzes"), (analytics["active_quizzes"], "Published"), (len(roster), "Students in roster"), (analytics["completed"], "Completed attempts"), (f"{analytics['average_score'] or 0:.1f}%", "Average score"), (f"{(analytics['pass_rate'] or 0) * 100:.0f}%", "Pass rate"), (analytics["assigned_students"], "Assigned students"), (f"{(analytics['completed'] / analytics['attempts'] * 100) if analytics['attempts'] else 0:.0f}%", "Completion rate")]
@@ -47,11 +50,7 @@ def dashboard(user) -> None:
         for column, (value, label) in zip(st.columns(4), metrics[row:row + 4]):
             with column: st.markdown(f'<div class="metric"><strong>{value}</strong><small>{label}</small></div>', unsafe_allow_html=True)
     st.divider()
-    create_col, search_col = st.columns([1, 3], vertical_alignment="center")
-    if create_col.button("＋  Create new", type="primary", width="stretch"):
-        st.session_state.page_override = "Create quiz"
-        st.rerun()
-    quiz_search = search_col.text_input("Search quizzes", placeholder="Search by title", label_visibility="collapsed", key="dashboard-quiz-search")
+    quiz_search = st.text_input("Search quizzes", placeholder="Search by title", label_visibility="collapsed", key="dashboard-quiz-search")
     visible_quizzes = [quiz for quiz in quizzes if not quiz_search.strip() or quiz_search.lower() in quiz["title"].lower()]
     if not visible_quizzes:
         st.info("No assessments match your search.")
@@ -273,8 +272,9 @@ def create(user) -> None:
     assigned_students.update(student_ids_for_teams(user["id"], [team["id"] for team in form.get("new-team-selected", [])]))
     quiz_id = create_quiz(user["id"], title, form.get("new-duration", 30), form.get("new-passing", 70), form.get("new-retakes", False), form.get("new-average", False), opening.isoformat(), closing.isoformat(), list(assigned_students), opening_enabled, closing_enabled, form.get("new-randomize-questions", True), form.get("new-randomize-answers", True))
     save_question_bank(quiz_id, questions)
-    st.session_state.manage_quiz = quiz_id
-    st.session_state[f"quiz-section-{quiz_id}"] = "questions"
+    st.session_state.page_override = "Dashboard"
+    st.session_state.quiz_created = title
+    st.session_state.pop("manage_quiz", None)
     st.session_state.pop("new-quiz-section", None)
     st.session_state.pop("new_quiz_data", None)
     st.rerun()

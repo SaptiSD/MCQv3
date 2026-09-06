@@ -19,7 +19,7 @@ def current_time() -> datetime:
 def dashboard(user) -> None:
     st.markdown('<div class="eyebrow">Student workspace</div><h1>Ready when you are.</h1>', unsafe_allow_html=True)
     st.caption("Your assigned assessments and latest results, all in one place.")
-    quizzes = available_quizzes(user["id"])
+    quizzes = available_quizzes(user["id"], user["id"] if user["role"] == "teacher" else None)
     attempts = attempts_for_student(user["id"])
     latest = {}
     for attempt in attempts: latest.setdefault(attempt["quiz_id"], attempt)

@@ -223,8 +223,15 @@ def student_progress_for_quiz(teacher_id: int, quiz_id: int):
         return progress
 
 
-def available_quizzes(student_id: int):
+def available_quizzes(student_id: int, owner_id: int | None = None):
     with connect() as db:
+        if owner_id is not None:
+            return db.execute("""SELECT * FROM quizzes q
+                                WHERE q.owner_id = ?
+                                    AND q.status = 'active'
+                                    AND (q.opening_enabled = 0 OR q.opening_time <= ?)
+                                    AND (q.closing_enabled = 0 OR q.closing_time >= ?)
+                                ORDER BY q.closing_time""", (owner_id, utc_now(), utc_now())).fetchall()
         return db.execute("""SELECT DISTINCT q.* FROM quizzes q
             LEFT JOIN quiz_students qs ON qs.quiz_id = q.id
                         WHERE q.status = 'active'
