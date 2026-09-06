@@ -85,11 +85,40 @@ def workspace_nav(user, selected_page: str | None = None) -> str:
     nav, sign_out = st.columns([8, 1], vertical_alignment="center")
     with nav:
         default_page = selected_page if selected_page in pages else pages[0]
+        if selected_page and selected_page in pages:
+            st.session_state["workspace-nav"] = selected_page
+            default_page = selected_page
+        elif st.session_state.get("create_nav_guard") and user["role"] == "teacher" and st.session_state.get("current_page") == "Create quiz":
+            st.session_state["workspace-nav"] = "Create quiz"
+            default_page = "Create quiz"
         page = st.radio("Workspace", pages, index=pages.index(default_page), horizontal=True, key="workspace-nav", label_visibility="collapsed")
     with sign_out:
         if st.button("Sign out", key="top-sign-out", width="stretch"):
+            if user["role"] == "teacher" and st.session_state.get("current_page") == "Create quiz" and st.session_state.get("create_dirty") and not st.session_state.get("create_nav_guard"):
+                st.session_state.create_nav_guard = True
+                st.session_state.create_nav_request = "Sign out"
+                st.rerun()
             st.session_state.pop("user", None); st.rerun()
     return page
+
+
+@st.dialog("Discard unsaved changes?")
+def confirm_discard_dialog() -> None:
+    st.write("You have an assessment in progress. Your questions and settings **won't be saved** if you leave now.")
+    leave, cancel = st.columns(2)
+    if leave.button("Continue", key="confirm-discard-leave", type="primary", width="stretch"):
+        target = st.session_state.pop("create_nav_request", None)
+        st.session_state.pop("create_nav_guard", None)
+        st.session_state.pop("create_dirty", None)
+        if target == "Sign out":
+            st.session_state.pop("user", None)
+        elif target:
+            st.session_state.page_override = target
+        st.rerun()
+    if cancel.button("Cancel", key="confirm-discard-cancel", width="stretch"):
+        st.session_state.pop("create_nav_guard", None)
+        st.session_state.pop("create_nav_request", None)
+        st.rerun()
 
 
 def google_user():

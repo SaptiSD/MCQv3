@@ -8,7 +8,7 @@ from student_portal import dashboard as student_dashboard
 from teacher_portal import create as create_quiz
 from teacher_portal import analytics_page, dashboard as teacher_dashboard
 from teacher_portal import roster_page
-from ui import google_user, login_page, styles, workspace_nav
+from ui import confirm_discard_dialog, google_user, login_page, styles, workspace_nav
 
 
 st.set_page_config(page_title="MCQ | Assessment studio", page_icon="M", layout="wide")
@@ -30,6 +30,18 @@ def main() -> None:
     page = workspace_nav(user, pending_page)
     page = st.session_state.pop("page_override", page)
     previous_page = st.session_state.get("current_page")
+    if (
+        user["role"] == "teacher"
+        and previous_page == "Create quiz"
+        and page != "Create quiz"
+        and st.session_state.get("create_dirty")
+        and not st.session_state.get("create_nav_guard")
+    ):
+        st.session_state.create_nav_request = page
+        st.session_state.create_nav_guard = True
+        st.rerun()
+    if page == "Create quiz" and previous_page != "Create quiz":
+        st.session_state.pop("new-quiz-section", None)
     if previous_page != page:
         st.session_state.pop("detail_student_id", None)
         st.session_state.pop("show_student_detail", None)
@@ -49,6 +61,8 @@ def main() -> None:
         admin_dashboard(user)
     else:
         student_dashboard(user)
+    if user["role"] == "teacher" and st.session_state.get("create_nav_guard"):
+        confirm_discard_dialog()
 
 
 main()

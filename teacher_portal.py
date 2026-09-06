@@ -110,14 +110,15 @@ def _create_save_setting(key: str) -> None:
     if "new_quiz_data" not in st.session_state:
         st.session_state["new_quiz_data"] = {}
     st.session_state["new_quiz_data"][key] = st.session_state[key]
+    st.session_state["create_dirty"] = True
 
 
 def create(user) -> None:
     form = st.session_state.setdefault("new_quiz_data", {})
     st.markdown('<div class="eyebrow">New assessment</div><h1>Shape the experience</h1>', unsafe_allow_html=True)
-    st.caption("Build questions first, set the rules second, then publish when everything is ready.")
+    st.caption("Shape the experience first, then build the questions, and publish when everything is ready.")
     top_publish = st.button("Publish quiz", key="new-quiz-publish-top", type="primary", width="stretch")
-    section = st.session_state.get("new-quiz-section", "questions")
+    section = st.session_state.get("new-quiz-section", "settings")
     settings_button, questions_button = st.columns(2)
     if settings_button.button("Quiz settings", key="new-quiz-settings", type="primary" if section == "settings" else "secondary", width="stretch"):
         st.session_state["new-quiz-section"] = "settings"
@@ -138,6 +139,7 @@ def create(user) -> None:
                     except Exception as exc:
                         form["new-uploaded-questions"] = []
                         st.error(f"Could not read this question bank: {exc}")
+                    st.session_state["create_dirty"] = True
                 uploaded_questions = form.get("new-uploaded-questions", [])
                 if not isinstance(uploaded_questions, list):
                     uploaded_questions = []
@@ -153,9 +155,11 @@ def create(user) -> None:
                 st.write(f"**{int(count)}** question{'s' if int(count) != 1 else ''} in this quiz")
                 if add_col.button("Add another question", key="new-manual-add", width="stretch"):
                     form[count_key] = int(count) + 1
+                    st.session_state["create_dirty"] = True
                     st.rerun()
                 if remove_col.button("Remove last question", key="new-manual-remove", width="stretch", disabled=int(count) <= 1):
                     form[count_key] = int(count) - 1
+                    st.session_state["create_dirty"] = True
                     st.rerun()
                 for index in range(int(count)):
                     with st.container(border=True):
@@ -274,6 +278,7 @@ def create(user) -> None:
     save_question_bank(quiz_id, questions)
     st.session_state.page_override = "Dashboard"
     st.session_state.quiz_created = title
+    st.session_state.pop("create_dirty", None)
     st.session_state.pop("manage_quiz", None)
     st.session_state.pop("new-quiz-section", None)
     st.session_state.pop("new_quiz_data", None)

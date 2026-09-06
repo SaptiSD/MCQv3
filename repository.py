@@ -175,7 +175,7 @@ def teacher_analytics(teacher_id: int) -> dict:
             AVG(CASE WHEN a.submitted_at IS NOT NULL THEN a.score_percent END) AS average_score,
             AVG(CASE WHEN a.submitted_at IS NOT NULL THEN a.passed END) AS pass_rate,
             COUNT(DISTINCT qs.student_id) AS assigned_students
-            FROM quizzes q LEFT JOIN attempts a ON a.quiz_id=q.id
+            FROM quizzes q LEFT JOIN attempts a ON a.quiz_id=q.id AND a.student_id<>q.owner_id
             LEFT JOIN quiz_students qs ON qs.quiz_id=q.id WHERE q.owner_id=?""", (teacher_id,)).fetchone()
         return dict(row)
 
@@ -183,7 +183,7 @@ def teacher_analytics(teacher_id: int) -> dict:
 def student_analytics(teacher_id: int):
     with connect() as db:
         return db.execute("""SELECT u.id, u.name, u.email,
-            COUNT(DISTINCT qs.quiz_id) AS assigned_quizzes,
+            COUNT(DISTINCT CASE WHEN q.id IS NOT NULL THEN qs.quiz_id END) AS assigned_quizzes,
             COUNT(DISTINCT a.id) AS attempts,
             COUNT(DISTINCT CASE WHEN a.submitted_at IS NOT NULL THEN a.id END) AS completed,
             AVG(CASE WHEN a.submitted_at IS NOT NULL THEN a.score_percent END) AS average_score,
