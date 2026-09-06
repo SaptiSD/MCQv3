@@ -234,7 +234,7 @@ def create(user) -> None:
                 correct = form.get(f"new-correct-all-{index}", []) if question_type == SELECT_ALL_TYPE else form.get(f"new-correct-{index}", "A")
             elif question_type == "True / False":
                 options = [("A", "True"), ("B", "False")]
-                correct = "A" if form.get(f"new-correct-{index}") == "True" else "B"
+                correct = "A" if st.session_state.get(f"new-correct-{index}", "True") == "True" else "B"
             else:
                 answer = form.get(f"new-correct-{index}", "").strip()
                 options, correct = ([("A", answer)] if answer else []), "A"
