@@ -5,17 +5,44 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from repository import (add_admin, admins_list, create_user, remove_admin,
+from repository import (add_admin, admins_list, assign_role, create_user, remove_admin,
                         remove_user, update_admin, update_user, users_by_role)
 
 
 def dashboard(user) -> None:
     st.markdown('<div class="eyebrow">Admin console</div><h1>Manage the workspace</h1>', unsafe_allow_html=True)
-    st.caption("Add, edit, and remove teachers, students, and fellow administrators.")
+    st.caption("Review sign-ups, assign roles, and manage teachers, students, and administrators.")
     st.divider()
+    unassigned_section()
     user_section("Teachers", "Accounts that can build, assign, and review assessments.", "teacher", "teachers")
     user_section("Students", "Student accounts available across the platform.", "student", "students")
     admins_section(user)
+
+
+def unassigned_section() -> None:
+    with st.container(border=True):
+        st.subheader("Unassigned accounts")
+        st.caption("New Google sign-ins land here until you decide their role.")
+        waiting = users_by_role("unassigned")
+        if not waiting:
+            st.info("No unassigned accounts.")
+            return
+        st.dataframe(pd.DataFrame([{"Name": row["name"], "Email": row["email"]} for row in waiting]), width="stretch", hide_index=True)
+        st.divider()
+        options = {row["id"]: f"{row['name']}  ·  {row['email']}" for row in waiting}
+        assign_cols = st.columns([3, 2])
+        with assign_cols[0]:
+            user_id = st.selectbox("Select account", list(options), format_func=options.get, key="unassigned-select")
+        with assign_cols[1]:
+            role = st.selectbox("Assign role", ["student", "teacher", "admin"], key="unassigned-role")
+        if st.button("Assign role", type="primary", key="unassigned-assign", width="stretch"):
+            try:
+                assign_role(user_id, role)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.success("Role assigned.")
+                st.rerun()
 
 
 def user_section(title: str, caption: str, role: str, prefix: str) -> None:

@@ -8,7 +8,7 @@ from student_portal import dashboard as student_dashboard
 from teacher_portal import create as create_quiz
 from teacher_portal import analytics_page, dashboard as teacher_dashboard
 from teacher_portal import roster_page
-from ui import confirm_discard_dialog, google_user, login_page, styles, workspace_nav
+from ui import confirm_discard_dialog, google_user, login_page, styles, waiting_page, workspace_nav
 
 
 st.set_page_config(page_title="MCQ | Assessment studio", page_icon="M", layout="wide")
@@ -59,6 +59,8 @@ def main() -> None:
             teacher_dashboard(user)
     elif user["role"] == "admin":
         admin_dashboard(user)
+    elif user["role"] == "unassigned":
+        waiting_page(user)
     else:
         student_dashboard(user)
     if user["role"] == "teacher" and st.session_state.get("create_nav_guard"):

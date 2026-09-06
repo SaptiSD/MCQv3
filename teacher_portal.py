@@ -10,11 +10,10 @@ import pandas as pd
 import streamlit as st
 from docx import Document
 
-from db import connect
 from ingestion import extract_upload, parse_bank
 from repository import (add_student_to_roster, assigned_student_ids, create_quiz,
                         delete_quiz, move_question, questions_for_quiz, quiz_for_teacher, quizzes_for_teacher,
-                        save_question_bank, set_quiz_assignments, students,
+                        quiz_has_attempts, save_question_bank, set_quiz_assignments, students,
                         student_analytics, student_detail_analytics, student_progress_for_quiz,
                         set_team_members, student_ids_for_teams, team_student_ids, teams_for_student, teams_for_teacher,
                         teacher_analytics, update_quiz_settings)
@@ -438,8 +437,7 @@ def manual_question_editor(quiz) -> None:
 
 
 def settings_editor(quiz) -> None:
-    with connect() as db:
-        has_attempts = db.execute("SELECT 1 FROM attempts WHERE quiz_id = ? LIMIT 1", (quiz["id"],)).fetchone() is not None
+    has_attempts = quiz_has_attempts(quiz["id"])
     if has_attempts:
         st.info("Settings are read-only after a student starts this assessment.")
     opening = datetime.fromisoformat(quiz["opening_time"])

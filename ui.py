@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import os
-
 import streamlit as st
 
 from db import get_or_create_user
-from repository import authenticate
+from repository import admin_by_email, authenticate
 
 
 def styles() -> None:
@@ -125,6 +123,20 @@ def google_user():
     if not getattr(st.user, "is_logged_in", False):
         return None
     email = st.user.email.lower()
-    teacher_emails = {item.strip().lower() for item in os.getenv("MCQ_TEACHER_EMAILS", "").split(",") if item.strip()}
-    role = "teacher" if email in teacher_emails else "student"
-    return dict(get_or_create_user(email, st.user.name or email.split("@")[0], role))
+    admin = admin_by_email(email)
+    if admin:
+        return admin
+    # New accounts start unassigned until an administrator assigns a role.
+    return dict(get_or_create_user(email, st.user.name or email.split("@")[0], "unassigned"))
+
+
+def waiting_page(user: dict) -> None:
+    first = (user.get("name") or "").split()[0] if user.get("name") else "there"
+    st.markdown(f'<div class="eyebrow">Account pending</div><h1>Hi {first} — you&rsquo;re in the queue.</h1>', unsafe_allow_html=True)
+    st.caption("Your account was created the moment you signed in. An administrator just needs to assign your role.")
+    st.divider()
+    with st.container(border=True):
+        st.subheader("What happens next")
+        st.write("An administrator will review your account and assign you as a **teacher** or **student**.")
+        st.write("This can take a few minutes or a few days. Come back anytime — once you have a role, your workspace will appear right here.")
+    st.info("Questions? Reach out to whoever invited you to this platform.")
