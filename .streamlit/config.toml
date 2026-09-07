@@ -1,7 +1,8 @@
+# Keep these in step with the CSS custom properties in ui.py's styles().
 [theme]
 base = "light"
-primaryColor = "#176B52"
-backgroundColor = "#F7FAF7"
+primaryColor = "#12694F"
+backgroundColor = "#F6F9F7"
 secondaryBackgroundColor = "#FFFFFF"
-textColor = "#15231F"
+textColor = "#12211C"
 font = "sans serif"
