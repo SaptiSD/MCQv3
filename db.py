@@ -49,8 +49,9 @@ def client():
     return create_client(url, key)
 
 
+@st.cache_resource
 def init_db() -> None:
-    """Verify connectivity. Schema DDL lives in supabase/schema.sql."""
+    """Verify connectivity once per session. Schema DDL lives in supabase/schema.sql."""
     try:
         client().table("users").select("id").limit(1).execute()
     except Exception as exc:
@@ -68,8 +69,9 @@ def get_or_create_user(email: str, name: str, role: str) -> dict:
     return inserted[0]
 
 
+@st.cache_resource
 def seed_demo_data() -> None:
-    """Seed demo users/teams/quiz only when absent (matches local demo flow)."""
+    """Seed demo users/teams/quiz only when absent (runs once per session)."""
     supabase = client()
     existing = supabase.table("users").select("email").execute().data
     emails = {row["email"] for row in existing}
