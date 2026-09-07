@@ -13,7 +13,7 @@ from fpdf import FPDF
 
 import grading
 from ingestion import extract_upload, parse_bank
-from ui import empty_state, metric_row, page_header, pill
+from ui import empty_state, metric_row, page_header, pill, when
 from repository import (add_student_to_roster, assigned_student_ids, create_quiz,
                         delete_quiz, move_question, questions_for_quiz, quiz_counts_for_teacher,
                         quiz_for_teacher, quizzes_for_teacher,
@@ -211,7 +211,7 @@ def analytics_page(user) -> None:
     st.divider()
     st.subheader("Student performance")
     if students_data:
-        st.dataframe(pd.DataFrame([{"Student": row["name"], "Email": row["email"], "Assigned": row["assigned_quizzes"], "Attempts": row["attempts"], "Completed": row["completed"], "Average score": f"{row['average_score']:.1f}%" if row["average_score"] is not None else "-", "Pass rate": f"{row['pass_rate'] * 100:.0f}%" if row["pass_rate"] is not None else "-", "Last activity": row["last_activity"] or "-"} for row in students_data]), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame([{"Student": row["name"], "Email": row["email"], "Assigned": row["assigned_quizzes"], "Attempts": row["attempts"], "Completed": row["completed"], "Average score": f"{row['average_score']:.1f}%" if row["average_score"] is not None else "-", "Pass rate": f"{row['pass_rate'] * 100:.0f}%" if row["pass_rate"] is not None else "-", "Last activity": when(row["last_activity"])} for row in students_data]), width="stretch", hide_index=True)
     else:
         empty_state("No students tracked yet", "Students appear here once they choose you as their teacher, or once you add them from the Students page.")
     st.divider()
@@ -227,7 +227,7 @@ def analytics_page(user) -> None:
                 progress = [row for row in progress if search.lower() in row["student"].lower() or search.lower() in row["email"].lower()]
             counts = {status: sum(row["status"] == status for row in progress) for status in ("Not started", "In progress", "Completed")}
             metric_row([(counts["Not started"], "Not started"), (counts["In progress"], "In progress"), (counts["Completed"], "Completed")], per_row=3)
-            st.dataframe(pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": f"{row['score']:.1f}%" if row["score"] is not None else "-", "Result": row["result"], "Last activity": row["last_activity"]} for row in progress]), width="stretch", hide_index=True)
+            st.dataframe(pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": f"{row['score']:.1f}%" if row["score"] is not None else "-", "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress]), width="stretch", hide_index=True)
         else:
             st.info("No students are assigned to this exam yet.")
 
@@ -413,7 +413,7 @@ def _quiz_downloads(quiz, questions: list | None = None) -> None:
     st.subheader("Download")
     progress = student_progress_for_quiz(quiz["owner_id"], quiz["id"])
     if progress:
-        results_frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": row["score"], "Result": row["result"], "Last activity": row["last_activity"]} for row in progress])
+        results_frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": row["score"], "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress])
         st.download_button("Download results CSV", results_frame.to_csv(index=False), "student-results.csv", "text/csv", key=f"results-download-{quiz['id']}")
     else:
         st.info("No students are assigned to this exam yet.")
@@ -800,7 +800,7 @@ def results(quiz) -> None:
     progress = student_progress_for_quiz(quiz["owner_id"], quiz["id"])
     if not progress:
         st.info("No students are assigned to this exam yet."); return
-    frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": row["score"], "Result": row["result"], "Last activity": row["last_activity"]} for row in progress])
+    frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": row["score"], "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress])
     st.dataframe(frame, width="stretch", hide_index=True)
 
 
@@ -879,7 +879,7 @@ def roster_page(user) -> None:
             empty_state("Your roster is empty", "Students appear here as soon as they choose you as their teacher. You can also add them by hand above.")
 
 
-@st.dialog("Student analytics")
+@st.dialog("Student analytics", width="large")
 def student_detail_dialog(user, student_id: int) -> None:
     detail = student_detail_analytics(user["id"], student_id)
     if not detail:
@@ -889,7 +889,17 @@ def student_detail_dialog(user, student_id: int) -> None:
     st.subheader(student["name"])
     st.caption(student["email"])
     st.write("Teams: " + (", ".join(team["name"] for team in detail["teams"]) or "No team"))
-    results_data = [{"Test": row["title"], "Status": "Completed" if row["submitted_at"] else "In progress", "Score": f"{row['score_percent']:.1f}%" if row["score_percent"] is not None else "-", "Result": "Passed" if row["passed"] else ("Failed" if row["passed"] is not None else "-"), "Last activity": row["submitted_at"] or row["started_at"]} for row in detail["results"]]
+    results_data = [
+        {
+            "Test": row["title"],
+            # A quiz with no attempt at all is "Not started", not "In progress".
+            "Status": "Completed" if row["submitted_at"] else ("In progress" if row["started_at"] else "Not started"),
+            "Score": f"{row['score_percent']:.0f}%" if row["score_percent"] is not None else "-",
+            "Result": "Passed" if row["passed"] else ("Failed" if row["passed"] is not None else "-"),
+            "Last activity": when(row["submitted_at"] or row["started_at"]),
+        }
+        for row in detail["results"]
+    ]
     if results_data:
         st.dataframe(pd.DataFrame(results_data), width="stretch", hide_index=True)
     else:

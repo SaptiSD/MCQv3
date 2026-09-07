@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import streamlit as st
 
 from db import get_or_create_user
@@ -173,6 +175,19 @@ def styles() -> None:
     @media print { .topbar, .st-key-workspace-nav, [data-testid='stDownloadButton'] { display:none !important; } }
     </style>
     """, unsafe_allow_html=True)
+
+
+def when(timestamp) -> str:
+    """Format a stored UTC timestamp for display in the reader's local time."""
+    if not timestamp or timestamp == "-":
+        return "-"
+    try:
+        moment = datetime.fromisoformat(str(timestamp))
+    except ValueError:
+        return str(timestamp)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone().strftime("%b %d, %I:%M %p").replace(" 0", " ")
 
 
 def page_header(eyebrow: str, title: str, lede: str = "") -> None:
