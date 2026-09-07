@@ -5,43 +5,44 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from ui import page_header
 from repository import (add_admin, admins_list, assign_role, create_user, remove_admin,
                         remove_user, update_admin, update_user, users_by_role)
 
 
 def dashboard(user) -> None:
-    st.markdown('<div class="eyebrow">Admin console</div><h1>Manage the workspace</h1>', unsafe_allow_html=True)
-    st.caption("Review sign-ups, assign roles, and manage teachers, students, and administrators.")
+    page_header("Admin console", "Manage the workspace", "Teachers, students and administrators — and moving accounts between roles.")
     st.divider()
-    unassigned_section()
+    role_section()
     user_section("Teachers", "Accounts that can build, assign, and review assessments.", "teacher", "teachers")
     user_section("Students", "Student accounts available across the platform.", "student", "students")
     admins_section(user)
 
 
-def unassigned_section() -> None:
+def role_section() -> None:
+    """Change an existing account's role. Sign-ups no longer wait for approval."""
     with st.container(border=True):
-        st.subheader("Unassigned accounts")
-        st.caption("New Google sign-ins land here until you decide their role.")
-        waiting = users_by_role("unassigned")
-        if not waiting:
-            st.info("No unassigned accounts.")
+        st.subheader("Change a role")
+        st.caption("Accounts are created with a role the moment someone signs in, so nothing waits here for approval. Use this to move someone between roles.")
+        accounts = [*users_by_role("teacher"), *users_by_role("student"), *users_by_role("unassigned")]
+        if not accounts:
+            st.info("No accounts yet.")
             return
-        st.dataframe(pd.DataFrame([{"Name": row["name"], "Email": row["email"]} for row in waiting]), width="stretch", hide_index=True)
-        st.divider()
-        options = {row["id"]: f"{row['name']}  ·  {row['email']}" for row in waiting}
-        assign_cols = st.columns([3, 2])
-        with assign_cols[0]:
-            user_id = st.selectbox("Select account", list(options), format_func=options.get, key="unassigned-select")
-        with assign_cols[1]:
-            role = st.selectbox("Assign role", ["student", "teacher", "admin"], key="unassigned-role")
-        if st.button("Assign role", type="primary", key="unassigned-assign", width="stretch"):
+        options = {row["id"]: f"{row['name']}  ·  {row['email']}  ·  {row['role']}" for row in accounts}
+        pick, choose = st.columns([3, 2])
+        with pick:
+            user_id = st.selectbox("Select account", list(options), format_func=options.get, key="role-select")
+        with choose:
+            role = st.selectbox("New role", ["student", "teacher", "admin"], key="role-new")
+        if role == "admin":
+            st.caption("Promoting to administrator moves the account into the administrators table; they sign in with Google.")
+        if st.button("Change role", type="primary", key="role-assign", width="stretch"):
             try:
                 assign_role(user_id, role)
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                st.success("Role assigned.")
+                st.success("Role updated.")
                 st.rerun()
 
 

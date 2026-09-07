@@ -2,10 +2,66 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import secrets
 
 from db import client, utc_now
+
+_PBKDF2_ITERATIONS = 200_000
+
+
+class PortalMismatch(Exception):
+    """Raised when valid credentials are used on the wrong side of the login page."""
+
+    def __init__(self, role: str) -> None:
+        super().__init__(role)
+        self.role = role
+
+
+def hash_password(password: str) -> str:
+    """Return a salted PBKDF2 hash. Empty passwords stay empty (login is then impossible)."""
+    if not password:
+        return ""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS)
+    return f"pbkdf2${_PBKDF2_ITERATIONS}${base64.b64encode(salt).decode()}${base64.b64encode(digest).decode()}"
+
+
+def verify_password(stored: str, given: str) -> bool:
+    """Check a password against a stored hash, still accepting legacy plaintext rows."""
+    if not stored or not given:
+        return False
+    if stored.startswith("pbkdf2$"):
+        try:
+            _, iterations, salt_b64, digest_b64 = stored.split("$")
+            digest = hashlib.pbkdf2_hmac(
+                "sha256", given.encode("utf-8"), base64.b64decode(salt_b64), int(iterations)
+            )
+        except Exception:
+            return False
+        return hmac.compare_digest(digest, base64.b64decode(digest_b64))
+    return hmac.compare_digest(stored, given)
+
+
+def _needs_rehash(stored: str) -> bool:
+    return bool(stored) and not stored.startswith("pbkdf2$")
+
+
+def _exact(rows: list[dict], field: str, value: str) -> dict | None:
+    """Confirm a case-insensitive `ilike` lookup really was an exact match.
+
+    PostgREST treats `%`, `_` and `*` in an ilike pattern as wildcards, so an
+    identifier like `%` would otherwise match an arbitrary row. Re-checking the
+    returned row in Python closes that hole regardless of pattern handling.
+    """
+    wanted = value.strip().casefold()
+    for row in rows:
+        if (row.get(field) or "").strip().casefold() == wanted:
+            return row
+    return None
 
 
 def _rows(result) -> list[dict]:
@@ -19,6 +75,26 @@ def quizzes_for_teacher(owner_id: int):
         .order("created_at", desc=True)
         .execute()
     )
+
+
+def quiz_counts_for_teacher(owner_id: int) -> dict[int, dict]:
+    """Question and assignment counts for every quiz a teacher owns, in two queries.
+
+    The dashboard renders one card per quiz; asking per card turned a page load
+    into 2N round trips.
+    """
+    quiz_ids = [row["id"] for row in _rows(
+        client().table("quizzes").select("id").eq("owner_id", owner_id).execute()
+    )]
+    counts = {quiz_id: {"questions": 0, "assigned": 0} for quiz_id in quiz_ids}
+    if not quiz_ids:
+        return counts
+    supabase = client()
+    for row in _rows(supabase.table("questions").select("quiz_id").in_("quiz_id", quiz_ids).execute()):
+        counts[row["quiz_id"]]["questions"] += 1
+    for row in _rows(supabase.table("quiz_students").select("quiz_id").in_("quiz_id", quiz_ids).execute()):
+        counts[row["quiz_id"]]["assigned"] += 1
+    return counts
 
 
 def quiz_for_teacher(quiz_id: int, owner_id: int):
@@ -164,18 +240,43 @@ def search_teachers(student_id: int, query: str):
     return sorted(seen.values(), key=lambda row: row["name"])
 
 
+def all_teachers(student_id: int | None = None):
+    """Every teacher, newest joiners last. Used by the student's teacher picker."""
+    rows = _rows(
+        client().table("users").select("id,name,email").eq("role", "teacher").order("name").execute()
+    )
+    return [row for row in rows if row["id"] != student_id]
+
+
 def join_teacher(student_id: int, teacher_id: int) -> bool:
-    """Join a teacher's roster. Returns False if already joined or invalid."""
+    """Join a teacher's roster and pick up their class-wide assessments.
+
+    A quiz already assigned to everyone on the roster was published to the whole
+    class, so a student joining afterwards should see it too — otherwise they
+    land on an empty dashboard and assume the site is broken.
+    """
     supabase = client()
     teacher = _rows(
         supabase.table("users").select("id").eq("id", teacher_id).eq("role", "teacher").limit(1).execute()
     )
     if not teacher:
         return False
+    roster_before = {row["id"] for row in students(teacher_id)}
     supabase.table("teacher_students").upsert(
         {"teacher_id": teacher_id, "student_id": student_id, "added_at": utc_now()},
         on_conflict="teacher_id,student_id",
     ).execute()
+    if not roster_before or student_id in roster_before:
+        return True
+    class_wide = [
+        quiz["id"] for quiz in quizzes_for_teacher(teacher_id)
+        if (assigned := assigned_student_ids(quiz["id"])) and roster_before <= assigned
+    ]
+    if class_wide:
+        supabase.table("quiz_students").upsert(
+            [{"quiz_id": quiz_id, "student_id": student_id, "assigned_at": utc_now()} for quiz_id in class_wide],
+            on_conflict="quiz_id,student_id",
+        ).execute()
     return True
 
 
@@ -358,7 +459,7 @@ def save_question_bank(quiz_id: int, questions: list[dict]) -> None:
             {
                 "quiz_id": quiz_id, "question_text": q["question_text"],
                 "options_json": json.dumps(q["options"]),
-                "correct_label": json.dumps(q["correct_label"]) if isinstance(q["correct_label"], list) else q["correct_label"],
+                "correct_label": json.dumps(q["correct_label"]) if isinstance(q["correct_label"], (list, dict)) else q["correct_label"],
                 "question_type": q.get("question_type", "Multiple choice"),
                 "position": i,
             }
@@ -488,11 +589,10 @@ def student_progress_for_quiz(teacher_id: int, quiz_id: int):
     assigned = _rows(
         supabase.table("quiz_students").select("student_id").eq("quiz_id", quiz_id).execute()
     )
-    if assigned:
-        assigned_ids = {row["student_id"] for row in assigned}
-        students_rows = [student for student in roster if student["id"] in assigned_ids]
-    else:
-        students_rows = roster
+    if not assigned:
+        return []
+    assigned_ids = {row["student_id"] for row in assigned}
+    students_rows = [student for student in roster if student["id"] in assigned_ids]
 
     attempt_rows = []
     if students_rows and quiz_id:
@@ -531,8 +631,10 @@ def available_quizzes(student_id: int, owner_id: int | None = None):
     if owner_id is not None:
         return _rows(base.eq("owner_id", owner_id).order("closing_time").execute())
     quizzes = _rows(base.order("closing_time").execute())
-    quiz_student_rows = _rows(supabase.table("quiz_students").select("quiz_id,student_id").execute())
-    mine = {row["quiz_id"] for row in quiz_student_rows if row["student_id"] == student_id}
+    mine = {
+        row["quiz_id"]
+        for row in _rows(supabase.table("quiz_students").select("quiz_id").eq("student_id", student_id).execute())
+    }
     return [q for q in quizzes if q["id"] in mine]
 
 
@@ -613,34 +715,71 @@ def complete_attempt(attempt_id: int, answers_json: str, score: float, passed: b
     ).eq("id", attempt_id).execute()
 
 
-def quiz_has_attempts(quiz_id: int) -> bool:
-    return bool(_rows(
-        client().table("attempts").select("id").eq("quiz_id", quiz_id).limit(1).execute()
-    ))
+def quiz_has_attempts(quiz_id: int, exclude_student_id: int | None = None) -> bool:
+    query = client().table("attempts").select("id").eq("quiz_id", quiz_id)
+    if exclude_student_id is not None:
+        query = query.neq("student_id", exclude_student_id)
+    return bool(_rows(query.limit(1).execute()))
+
+
+def _admin_row(email: str) -> dict | None:
+    rows = _rows(client().table("admins").select("*").ilike("email", email.strip()).limit(5).execute())
+    return _exact(rows, "email", email)
+
+
+def _user_row(identifier: str) -> dict | None:
+    """Look a user up by email, falling back to their full name. Both are exact, case-insensitive."""
+    supabase = client()
+    rows = _rows(supabase.table("users").select("*").ilike("email", identifier).limit(5).execute())
+    match = _exact(rows, "email", identifier)
+    if match:
+        return match
+    rows = _rows(supabase.table("users").select("*").ilike("name", identifier).limit(20).execute())
+    return _exact(rows, "name", identifier)
+
+
+def user_by_email(email: str) -> dict | None:
+    rows = _rows(client().table("users").select("*").eq("email", email.strip().lower()).limit(1).execute())
+    return rows[0] if rows else None
 
 
 def authenticate_admin(email: str, password: str):
-    rows = _rows(
-        client().table("admins").select("*").ilike("email", email.strip()).limit(1).execute()
-    )
-    row = rows[0] if rows else None
-    return row if row and row["password"] == password else None
+    row = _admin_row(email)
+    if not row or not verify_password(row["password"], password):
+        return None
+    if _needs_rehash(row["password"]):
+        client().table("admins").update({"password": hash_password(password)}).eq("id", row["id"]).execute()
+    return row
 
 
-def authenticate(identifier: str, password: str) -> dict | None:
-    """Universal login: accepts an admin email, or a user's email or full name (first and last name)."""
-    identifier = identifier.strip()
-    if not identifier:
+def authenticate(identifier: str, password: str, expected_role: str | None = None) -> dict | None:
+    """Log in with an admin email, or a user's email or full name.
+
+    `expected_role` scopes the attempt to one side of the split login page:
+    "teacher" also admits administrators, "student" admits students only.
+    Raises PortalMismatch when the credentials are valid but for the other side.
+    """
+    identifier = (identifier or "").strip()
+    if not identifier or not password:
         return None
     supabase = client()
-    admin_rows = _rows(supabase.table("admins").select("*").ilike("email", identifier).limit(1).execute())
-    if admin_rows and admin_rows[0]["password"] == password:
-        return admin_session(admin_rows[0])
-    user_rows = _rows(supabase.table("users").select("*").ilike("email", identifier).limit(1).execute())
-    if not user_rows:
-        user_rows = _rows(supabase.table("users").select("*").ilike("name", identifier).limit(1).execute())
-    if user_rows and user_rows[0]["password"] and user_rows[0]["password"] == password:
-        session = dict(user_rows[0])
+
+    admin_row = _admin_row(identifier)
+    if admin_row and verify_password(admin_row["password"], password):
+        if expected_role == "student":
+            raise PortalMismatch("admin")
+        if _needs_rehash(admin_row["password"]):
+            supabase.table("admins").update({"password": hash_password(password)}).eq("id", admin_row["id"]).execute()
+        return admin_session(admin_row)
+
+    user_row = _user_row(identifier)
+    if user_row and verify_password(user_row.get("password") or "", password):
+        role = user_row["role"]
+        if expected_role and role != expected_role:
+            raise PortalMismatch(role)
+        if _needs_rehash(user_row["password"]):
+            supabase.table("users").update({"password": hash_password(password)}).eq("id", user_row["id"]).execute()
+        session = dict(user_row)
         session.pop("password", None)
         return session
     return None
@@ -652,14 +791,12 @@ def admin_session(admin_row) -> dict:
 
 def admin_by_email(email: str) -> dict | None:
     """Return an admin session if this email is an administrator, else None."""
-    rows = _rows(
-        client().table("admins").select("*").ilike("email", email.strip().lower()).limit(1).execute()
-    )
-    return admin_session(rows[0]) if rows else None
+    row = _admin_row(email)
+    return admin_session(row) if row else None
 
 
 def assign_role(user_id: int, role: str) -> None:
-    """Assign an unassigned account a role: teacher, student, or admin.
+    """Set an account's role: teacher, student, or admin.
 
     Admin accounts live in the `admins` table (Google sign-in is how they log
     in), so promoting to admin converts the user row into an admins row.
@@ -679,7 +816,7 @@ def assign_role(user_id: int, role: str) -> None:
             # Random password keeps the universal-login form locked; Google is
             # the intended sign-in for promoted administrators.
             supabase.table("admins").insert(
-                {"email": user["email"].lower(), "password": secrets.token_hex(16),
+                {"email": user["email"].lower(), "password": hash_password(secrets.token_hex(16)),
                  "name": user["name"], "created_at": utc_now()}
             ).execute()
         try:
@@ -688,6 +825,12 @@ def assign_role(user_id: int, role: str) -> None:
             raise ValueError("That account has existing activity and can't be converted to an administrator.")
     else:
         supabase.table("users").update({"role": role}).eq("id", user_id).execute()
+
+
+def set_user_role(user_id: int, role: str) -> None:
+    if role not in ("teacher", "student"):
+        raise ValueError("Role must be teacher or student.")
+    client().table("users").update({"role": role}).eq("id", user_id).execute()
 
 
 def admins_list():
@@ -700,7 +843,7 @@ def add_admin(email: str, password: str, name: str) -> int:
     try:
         return _rows(
             client().table("admins").insert(
-                {"email": email.strip().lower(), "password": password, "name": name.strip() or email.strip(), "created_at": utc_now()}
+                {"email": email.strip().lower(), "password": hash_password(password), "name": name.strip() or email.strip(), "created_at": utc_now()}
             ).select("id").execute()
         )[0]["id"]
     except Exception:
@@ -736,7 +879,7 @@ def create_user(name: str, email: str, role: str, password: str) -> dict:
         raise ValueError("A user with that email already exists.")
     return _rows(
         client().table("users").insert(
-            {"email": email, "name": name.strip(), "role": role, "password": password}
+            {"email": email, "name": name.strip(), "role": role, "password": hash_password(password)}
         ).select("*").execute()
     )[0]
 
@@ -760,7 +903,7 @@ def update_user(user_id: int, name: str = None, email: str = None, password: str
         {
             "name": name.strip() if name is not None else user["name"],
             "email": new_email,
-            "password": password if password is not None else user["password"],
+            "password": hash_password(password) if password else user["password"],
         }
     ).eq("id", user_id).execute()
 
@@ -782,7 +925,7 @@ def update_admin(admin_id: int, email: str = None, name: str = None, password: s
         {
             "email": new_email,
             "name": name.strip() if name else admin["name"],
-            "password": password if password is not None else admin["password"],
+            "password": hash_password(password) if password else admin["password"],
         }
     ).eq("id", admin_id).execute()
 

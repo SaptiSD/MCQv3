@@ -2,14 +2,15 @@
 
 import streamlit as st
 
+import guide
 from admin_portal import dashboard as admin_dashboard
 from db import init_db, seed_demo_data
-from student_portal import dashboard as student_dashboard
-from student_portal import join_teacher_page as join_teacher_dashboard
+from student_portal import choose_teacher_page, dashboard as student_dashboard
+from student_portal import my_teachers_page, needs_a_teacher
 from teacher_portal import create as create_quiz
 from teacher_portal import analytics_page, dashboard as teacher_dashboard
 from teacher_portal import roster_page
-from ui import confirm_discard_dialog, google_user, login_page, styles, waiting_page, workspace_nav
+from ui import choose_role_page, confirm_discard_dialog, google_user, login_page, styles, workspace_nav
 
 
 st.set_page_config(page_title="MCQ | Assessment studio", page_icon="M", layout="wide")
@@ -23,10 +24,17 @@ def main() -> None:
         authenticated_user = google_user()
         if authenticated_user:
             st.session_state.user = authenticated_user
+        elif getattr(st.user, "is_logged_in", False):
+            # Signed in with Google but we don't know which side they came from.
+            choose_role_page()
+            return
     if "user" not in st.session_state:
         login_page()
         return
     user = st.session_state.user
+    if user["role"] == "student" and needs_a_teacher(user):
+        choose_teacher_page(user)
+        return
     pending_page = st.session_state.get("page_override")
     page = workspace_nav(user, pending_page)
     page = st.session_state.pop("page_override", page)
@@ -47,6 +55,9 @@ def main() -> None:
         st.session_state.pop("detail_student_id", None)
         st.session_state.pop("show_student_detail", None)
     st.session_state.current_page = page
+    if page == "Guide":
+        guide.page(user)
+        return
     if user["role"] == "teacher":
         if page == "Create quiz":
             create_quiz(user)
@@ -60,11 +71,9 @@ def main() -> None:
             teacher_dashboard(user)
     elif user["role"] == "admin":
         admin_dashboard(user)
-    elif user["role"] == "unassigned":
-        waiting_page(user)
     else:
-        if page == "Join teacher":
-            join_teacher_dashboard(user)
+        if page == "My teachers":
+            my_teachers_page(user)
         else:
             student_dashboard(user)
     if user["role"] == "teacher" and st.session_state.get("create_nav_guard"):

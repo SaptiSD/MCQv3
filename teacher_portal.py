@@ -11,9 +11,12 @@ import streamlit as st
 from docx import Document
 from fpdf import FPDF
 
+import grading
 from ingestion import extract_upload, parse_bank
+from ui import empty_state, metric_row, page_header, pill
 from repository import (add_student_to_roster, assigned_student_ids, create_quiz,
-                        delete_quiz, move_question, questions_for_quiz, quiz_for_teacher, quizzes_for_teacher,
+                        delete_quiz, move_question, questions_for_quiz, quiz_counts_for_teacher,
+                        quiz_for_teacher, quizzes_for_teacher,
                         quiz_has_attempts, save_question_bank, set_quiz_assignments, students,
                         student_analytics, student_detail_analytics, student_progress_for_quiz,
                         set_team_members, student_ids_for_teams, team_student_ids, teams_for_student, teams_for_teacher,
@@ -22,6 +25,111 @@ from repository import (add_student_to_roster, assigned_student_ids, create_quiz
 
 SELECT_ALL_TYPE = "Multiple choice - select all that apply"
 QUESTION_TYPES = ["Multiple choice", SELECT_ALL_TYPE, "True / False", "Fill in the blank", "Short answer"]
+ANSWER_FORMATS = {"Text": grading.TEXT, "Number": grading.NUMBER}
+TEXT_QUESTION_TYPES = grading.TEXT_QUESTION_TYPES
+
+
+def _question_errors(questions: list[dict]) -> list[str]:
+    """Validate a built question list the same way for both editors."""
+    errors = []
+    for index, question in enumerate(questions, 1):
+        question_type = question.get("question_type")
+        if not question["question_text"]:
+            errors.append(f"Question {index} needs text.")
+        if question_type in TEXT_QUESTION_TYPES:
+            spec = question["correct_label"]
+            if not (isinstance(spec, dict) and spec.get("value")):
+                errors.append(f"Question {index} needs a correct answer.")
+            elif spec.get("format") == grading.NUMBER and grading._to_number(spec["value"]) is None:
+                errors.append(f"Question {index} has a Number answer that isn't a number.")
+            continue
+        if len(question["options"]) < 2:
+            errors.append(f"Question {index} needs at least two options.")
+        labels = question["correct_label"] if question_type == SELECT_ALL_TYPE else [question["correct_label"]]
+        if question_type == SELECT_ALL_TYPE and not labels:
+            errors.append(f"Question {index} needs at least one correct answer.")
+        elif not set(labels).issubset({label for label, _ in question["options"]}):
+            errors.append(f"Question {index} needs its selected correct option filled in.")
+    return errors
+
+
+def _typed_spec_from(store, prefix: str) -> dict:
+    """Rebuild an answer specification from whichever state store the editor saved into."""
+    get = store.get
+    limit = str(get(f"{prefix}-limit", "") or "").strip()
+    alternatives = str(get(f"{prefix}-alternatives", "") or "").split(",")
+    label = get(f"{prefix}-format", "Text")
+    return grading.build_spec(
+        str(get(f"{prefix}-answer", "") or ""),
+        ANSWER_FORMATS.get(label, grading.TEXT),
+        str(get(f"{prefix}-tolerance", "") or "").strip() or None,
+        int(limit) if limit.isdigit() and int(limit) > 0 else None,
+        alternatives,
+        bool(get(f"{prefix}-typos", False)),
+    )
+
+
+def _create_save_typed(key: str) -> None:
+    """Persist a typed-answer widget into the new-quiz draft."""
+    form = st.session_state.setdefault("new_quiz_data", {})
+    form[key] = st.session_state[key]
+    st.session_state["create_dirty"] = True
+
+
+def typed_answer_editor(prefix: str, read, write=None) -> dict:
+    """Answer controls for a Fill in the blank / Short answer question.
+
+    `read(name, default)` fetches a stored value and `write(name)` is the
+    on_change callback; the two question editors keep their state differently,
+    so they pass their own accessors in.
+    """
+    fmt_label = read("format", "Text")
+    fmt_label = fmt_label if fmt_label in ANSWER_FORMATS else "Text"
+    answer_col, format_col = st.columns([3, 2])
+    with answer_col:
+        value = st.text_input(
+            "Correct answer", value=read("answer", ""), key=f"{prefix}-answer",
+            placeholder="e.g. 6  ·  33.33  ·  Paris",
+            **({"on_change": write, "args": (f"{prefix}-answer",)} if write else {}),
+        )
+    with format_col:
+        fmt_label = st.selectbox(
+            "Answer type", list(ANSWER_FORMATS), index=list(ANSWER_FORMATS).index(fmt_label),
+            key=f"{prefix}-format",
+            help="Number grades 6, 6.0 and 6.00 as the same answer. Text ignores capitals and extra spaces.",
+            **({"on_change": write, "args": (f"{prefix}-format",)} if write else {}),
+        )
+    answer_format = ANSWER_FORMATS[fmt_label]
+    alternatives, allow_typos, tolerance, max_length = [], False, "", None
+    with st.expander("Marking options"):
+        if answer_format == grading.NUMBER:
+            tolerance = st.text_input(
+                "Accept answers within ±", value=read("tolerance", ""), key=f"{prefix}-tolerance",
+                placeholder="leave blank to use the answer's own precision",
+                **({"on_change": write, "args": (f"{prefix}-tolerance",)} if write else {}),
+            )
+        else:
+            alternatives = [
+                item for item in st.text_input(
+                    "Also accept (comma separated)", value=read("alternatives", ""),
+                    key=f"{prefix}-alternatives", placeholder="e.g. USA, US, America",
+                    **({"on_change": write, "args": (f"{prefix}-alternatives",)} if write else {}),
+                ).split(",")
+            ]
+            allow_typos = st.checkbox(
+                "Forgive single-letter spelling slips", value=bool(read("typos", False)),
+                key=f"{prefix}-typos",
+                **({"on_change": write, "args": (f"{prefix}-typos",)} if write else {}),
+            )
+        limit_raw = st.text_input(
+            "Limit the answer box to (characters)", value=read("limit", ""), key=f"{prefix}-limit",
+            placeholder="leave blank to size it automatically",
+            **({"on_change": write, "args": (f"{prefix}-limit",)} if write else {}),
+        )
+        max_length = int(limit_raw) if limit_raw.strip().isdigit() and int(limit_raw) > 0 else None
+    spec = grading.build_spec(value, answer_format, tolerance or None, max_length, alternatives, allow_typos)
+    st.caption(grading.teacher_summary(spec))
+    return spec
 
 
 @st.dialog("Delete assessment?")
@@ -42,27 +150,43 @@ def dashboard(user) -> None:
     analytics = teacher_analytics(user["id"])
     created_title = st.session_state.pop("quiz_created", None)
     if created_title:
-        st.success(f"Quiz created.")
-    st.markdown('<div class="eyebrow">Teacher workspace</div><h1>Your assessments</h1>', unsafe_allow_html=True)
-    st.caption("Create, assign, review, and understand the assessments you own.")
-    metrics = [(analytics["quizzes"], "Total quizzes"), (analytics["active_quizzes"], "Published"), (len(roster), "Students in roster"), (analytics["completed"], "Completed attempts"), (f"{analytics['average_score'] or 0:.1f}%", "Average score"), (f"{(analytics['pass_rate'] or 0) * 100:.0f}%", "Pass rate"), (analytics["assigned_students"], "Assigned students"), (f"{(analytics['completed'] / analytics['attempts'] * 100) if analytics['attempts'] else 0:.0f}%", "Completion rate")]
-    for row in range(0, len(metrics), 4):
-        for column, (value, label) in zip(st.columns(4), metrics[row:row + 4]):
-            with column: st.markdown(f'<div class="metric"><strong>{value}</strong><small>{label}</small></div>', unsafe_allow_html=True)
+        st.success(f"**{created_title}** was created.")
+    page_header("Teacher workspace", "Your assessments", "Create, assign, review, and understand the assessments you own.")
+    metric_row([
+        (analytics["quizzes"], "Total quizzes"),
+        (analytics["active_quizzes"], "Published"),
+        (len(roster), "Students in roster"),
+        (analytics["completed"], "Completed attempts"),
+        (f"{analytics['average_score'] or 0:.0f}%", "Average score"),
+        (f"{(analytics['pass_rate'] or 0) * 100:.0f}%", "Pass rate"),
+        (analytics["assigned_students"], "Assigned students"),
+        (f"{(analytics['completed'] / analytics['attempts'] * 100) if analytics['attempts'] else 0:.0f}%", "Completion rate"),
+    ])
     st.divider()
     quiz_search = st.text_input("Search quizzes", placeholder="Search by title", label_visibility="collapsed", key="dashboard-quiz-search")
     visible_quizzes = [quiz for quiz in quizzes if not quiz_search.strip() or quiz_search.lower() in quiz["title"].lower()]
     if not visible_quizzes:
-        st.info("No assessments match your search.")
+        if quizzes:
+            empty_state("Nothing matches that search", "Try a different word, or clear the search box to see every assessment.")
+        else:
+            empty_state("No assessments yet", "Head to Create quiz to build your first one. It takes about a minute.")
         return
+    counts = quiz_counts_for_teacher(user["id"])
     for quiz in visible_quizzes:
         with st.container(border=True):
             details, action = st.columns([4, 1])
             with details:
-                st.subheader(quiz["title"])
-                assigned = len(assigned_student_ids(quiz["id"]))
-                audience = f"{assigned} assigned students" if assigned else "Not assigned"
-                st.caption(f"{len(questions_for_quiz(quiz['id']))} questions  ·  {quiz['duration_minutes']} minutes  ·  pass at {quiz['passing_score']}%  ·  {audience}")
+                summary = counts.get(quiz["id"], {"questions": 0, "assigned": 0})
+                assigned = summary["assigned"]
+                if quiz["status"] != "active" or not summary["questions"]:
+                    badge = pill("Draft", "grey")
+                elif not assigned:
+                    badge = pill("Not assigned", "amber")
+                else:
+                    badge = pill("Published", "green")
+                st.markdown(f"### {quiz['title']} &nbsp;{badge}", unsafe_allow_html=True)
+                audience = f"{assigned} assigned student{'s' if assigned != 1 else ''}" if assigned else "Not assigned"
+                st.caption(f"{summary['questions']} questions  ·  {quiz['duration_minutes']} minutes  ·  pass at {quiz['passing_score']}%  ·  {audience}")
             with action:
                 if st.button("Manage", key=f"manage-{quiz['id']}", width="stretch"):
                     st.session_state.manage_quiz = quiz["id"]; st.rerun()
@@ -75,17 +199,21 @@ def dashboard(user) -> None:
 def analytics_page(user) -> None:
     analytics = teacher_analytics(user["id"])
     students_data = student_analytics(user["id"])
-    st.markdown('<div class="eyebrow">Teacher workspace</div><h1>Performance overview</h1>', unsafe_allow_html=True)
-    st.caption("A quick read on assessment health, student outcomes, and completion.")
-    metrics = [(analytics["attempts"], "Total attempts"), (analytics["completed"], "Completed"), (f"{analytics['average_score'] or 0:.1f}%", "Average score"), (f"{(analytics['pass_rate'] or 0) * 100:.0f}%", "Pass rate"), (f"{(analytics['completed'] / analytics['attempts'] * 100) if analytics['attempts'] else 0:.0f}%", "Completion rate"), (len(students_data), "Students tracked")]
-    for column, (value, label) in zip(st.columns(6), metrics):
-        with column: st.markdown(f'<div class="metric"><strong>{value}</strong><small>{label}</small></div>', unsafe_allow_html=True)
+    page_header("Teacher workspace", "Performance overview", "A quick read on assessment health, student outcomes, and completion.")
+    metric_row([
+        (analytics["attempts"], "Total attempts"),
+        (analytics["completed"], "Completed"),
+        (f"{analytics['average_score'] or 0:.0f}%", "Average score"),
+        (f"{(analytics['pass_rate'] or 0) * 100:.0f}%", "Pass rate"),
+        (f"{(analytics['completed'] / analytics['attempts'] * 100) if analytics['attempts'] else 0:.0f}%", "Completion rate"),
+        (len(students_data), "Students tracked"),
+    ], per_row=3)
     st.divider()
     st.subheader("Student performance")
     if students_data:
         st.dataframe(pd.DataFrame([{"Student": row["name"], "Email": row["email"], "Assigned": row["assigned_quizzes"], "Attempts": row["attempts"], "Completed": row["completed"], "Average score": f"{row['average_score']:.1f}%" if row["average_score"] is not None else "-", "Pass rate": f"{row['pass_rate'] * 100:.0f}%" if row["pass_rate"] is not None else "-", "Last activity": row["last_activity"] or "-"} for row in students_data]), width="stretch", hide_index=True)
     else:
-        st.info("Add students to your roster to start tracking performance.")
+        empty_state("No students tracked yet", "Students appear here once they choose you as their teacher, or once you add them from the Students page.")
     st.divider()
     st.subheader("Exam participation")
     quizzes = quizzes_for_teacher(user["id"])
@@ -98,8 +226,7 @@ def analytics_page(user) -> None:
             if search.strip():
                 progress = [row for row in progress if search.lower() in row["student"].lower() or search.lower() in row["email"].lower()]
             counts = {status: sum(row["status"] == status for row in progress) for status in ("Not started", "In progress", "Completed")}
-            for column, (value, label) in zip(st.columns(3), [(counts["Not started"], "Not started"), (counts["In progress"], "In progress"), (counts["Completed"], "Completed")]):
-                with column: st.markdown(f'<div class="metric"><strong>{value}</strong><small>{label}</small></div>', unsafe_allow_html=True)
+            metric_row([(counts["Not started"], "Not started"), (counts["In progress"], "In progress"), (counts["Completed"], "Completed")], per_row=3)
             st.dataframe(pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": f"{row['score']:.1f}%" if row["score"] is not None else "-", "Result": row["result"], "Last activity": row["last_activity"]} for row in progress]), width="stretch", hide_index=True)
         else:
             st.info("No students are assigned to this exam yet.")
@@ -114,8 +241,7 @@ def _create_save_setting(key: str) -> None:
 
 def create(user) -> None:
     form = st.session_state.setdefault("new_quiz_data", {})
-    st.markdown('<div class="eyebrow">New assessment</div><h1>Shape the experience</h1>', unsafe_allow_html=True)
-    st.caption("Shape the experience first, then build the questions, and publish when everything is ready.")
+    page_header("New assessment", "Build an assessment", "Set it up first, then write the questions, and publish when everything is ready.")
     top_publish = st.button("Publish quiz", key="new-quiz-publish-top", type="primary", width="stretch")
     section = st.session_state.get("new-quiz-section", "settings")
     settings_button, questions_button = st.columns(2)
@@ -181,7 +307,11 @@ def create(user) -> None:
                             tf_val = form.get(f"new-correct-{index}")
                             st.selectbox("Correct answer", ["True", "False"], index=(0 if tf_val != "False" else 1), key=f"new-correct-{index}", on_change=_create_save_setting, args=(f"new-correct-{index}",))
                         else:
-                            st.text_input("Correct answer", key=f"new-correct-{index}", value=form.get(f"new-correct-{index}", ""), on_change=_create_save_setting, args=(f"new-correct-{index}",))
+                            typed_answer_editor(
+                                f"new-typed-{index}",
+                                lambda name, default, i=index: form.get(f"new-typed-{i}-{name}", default),
+                                _create_save_typed,
+                            )
     else:
         with st.container(border=True):
             st.subheader("Quiz settings")
@@ -235,32 +365,22 @@ def create(user) -> None:
                 correct = form.get(f"new-correct-all-{index}", []) if question_type == SELECT_ALL_TYPE else form.get(f"new-correct-{index}", "A")
             elif question_type == "True / False":
                 options = [("A", "True"), ("B", "False")]
-                correct = "A" if st.session_state.get(f"new-correct-{index}", "True") == "True" else "B"
+                correct = "A" if form.get(f"new-correct-{index}", "True") != "False" else "B"
             else:
-                answer = form.get(f"new-correct-{index}", "").strip()
-                options, correct = ([("A", answer)] if answer else []), "A"
+                correct = _typed_spec_from(form, f"new-typed-{index}")
+                options = []
             questions.append({"question_text": form.get(f"new-text-{index}", "").strip(), "options": options, "correct_label": correct, "question_type": question_type})
     errors = []
     if not title:
         errors.append("Give the quiz a title first.")
     if not questions:
         errors.append("Add at least one question before publishing.")
-    for index, question in enumerate(questions, 1):
-        minimum = 1 if question.get("question_type") in {"Fill in the blank", "Short answer"} else 2
-        if not question["question_text"]:
-            errors.append(f"Question {index} needs text.")
-        if len(question["options"]) < minimum:
-            errors.append(f"Question {index} needs an answer." if minimum == 1 else f"Question {index} needs at least two options.")
-        correct_labels = question["correct_label"] if question.get("question_type") == SELECT_ALL_TYPE else [question["correct_label"]]
-        if question.get("question_type") == SELECT_ALL_TYPE and not correct_labels:
-            errors.append(f"Question {index} needs at least one correct answer.")
-        if not set(correct_labels).issubset({label for label, _ in question["options"]}):
-            errors.append(f"Question {index} needs its selected correct option filled in.")
+    errors.extend(_question_errors(questions))
     if errors:
         st.error(" ".join(errors))
         return
-    opening = datetime.combine(form.get("new-opening-day", datetime.now().date()), form.get("new-opening-clock", time(8, 0)), tzinfo=timezone.utc)
-    closing = datetime.combine(form.get("new-closing-day", (datetime.now().date() + timedelta(days=1))), form.get("new-closing-clock", time(17, 0)), tzinfo=timezone.utc)
+    opening = datetime.combine(form.get("new-opening-day", datetime.now().date()), form.get("new-opening-clock", time(8, 0))).astimezone()
+    closing = datetime.combine(form.get("new-closing-day", (datetime.now().date() + timedelta(days=1))), form.get("new-closing-clock", time(17, 0))).astimezone()
     opening_enabled = form.get("new-opening-enabled", True)
     closing_enabled = form.get("new-closing-enabled", True)
     now = datetime.now(timezone.utc)
@@ -271,7 +391,7 @@ def create(user) -> None:
         st.error("Closing time is in the past; students won't be able to take this quiz. Set a closing time in the future.")
         return
     if opening_enabled and opening > now:
-        st.info(f"The quiz opens on {opening.strftime('%b %d, %I:%M %p')} and won't be visible to students until then.")
+        st.info(f"The quiz opens on {opening.astimezone().strftime('%b %d, %I:%M %p')} and won't be visible to students until then.")
     if form.get("new-audience-mode", "All") == "All":
         assigned_students = {row["id"] for row in students(user["id"])}
     else:
@@ -345,6 +465,11 @@ def manage_quiz(user, quiz_id: int) -> None:
 
 
 def _format_correct(question) -> str:
+    if question["question_type"] in TEXT_QUESTION_TYPES:
+        spec = grading.answer_spec(question)
+        extras = spec.get("alternatives") or []
+        answer = spec.get("value", "")
+        return f"{answer} (or {', '.join(extras)})" if extras else answer
     options = json.loads(question["options_json"])
     if question["question_type"] == SELECT_ALL_TYPE:
         labels = json.loads(question["correct_label"])
@@ -353,6 +478,21 @@ def _format_correct(question) -> str:
     if question["question_type"] == "True / False":
         return "True" if correct_label == "A" else "False"
     return next((text for label, text in options if label == correct_label), correct_label)
+
+
+_PDF_REPLACEMENTS = {
+    "‘": "'", "’": "'", "‚": "'", "“": '"', "”": '"',
+    "„": '"', "–": "-", "—": "-", "…": "...", "•": "-",
+    " ": " ", "−": "-", "′": "'", "″": '"',
+}
+
+
+def _pdf_text(value) -> str:
+    """FPDF's core fonts are Latin-1 only; text pasted from Word routinely isn't."""
+    text = str(value or "")
+    for source, target in _PDF_REPLACEMENTS.items():
+        text = text.replace(source, target)
+    return text.encode("latin-1", "replace").decode("latin-1")
 
 
 def _render_quiz_pdf(quiz, questions, format_key: str) -> bytes:
@@ -367,7 +507,7 @@ def _render_quiz_pdf(quiz, questions, format_key: str) -> bytes:
     pdf.set_auto_page_break(auto=True, margin=18)
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 18)
-    pdf.multi_cell(0, 8, quiz["title"], new_x="LMARGIN", new_y="NEXT")
+    pdf.multi_cell(0, 8, _pdf_text(quiz["title"]), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(2)
 
     if format_key == "questions-answers-settings":
@@ -386,7 +526,7 @@ def _render_quiz_pdf(quiz, questions, format_key: str) -> bytes:
             f"Randomize answer order: {'Yes' if quiz.get('randomize_answers') else 'No'}",
         ]
         for line in settings_lines:
-            pdf.multi_cell(0, 6, line, new_x="LMARGIN", new_y="NEXT")
+            pdf.multi_cell(0, 6, _pdf_text(line), new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
         pdf.ln(3)
 
@@ -394,15 +534,15 @@ def _render_quiz_pdf(quiz, questions, format_key: str) -> bytes:
         if pdf.get_y() > 250:
             pdf.add_page()
         pdf.set_font("Helvetica", "B", 12)
-        pdf.multi_cell(0, 6, f"{index}. {question['question_text']}", new_x="LMARGIN", new_y="NEXT")
+        pdf.multi_cell(0, 6, _pdf_text(f"{index}. {question['question_text']}"), new_x="LMARGIN", new_y="NEXT")
         pdf.ln(1)
         pdf.set_font("Helvetica", "", 11)
         for label, text in json.loads(question["options_json"]):
-            pdf.multi_cell(0, 5.5, f"{label}) {text}", new_x="LMARGIN", new_y="NEXT")
+            pdf.multi_cell(0, 5.5, _pdf_text(f"{label}) {text}"), new_x="LMARGIN", new_y="NEXT")
         if format_key in ("questions-answers", "questions-answers-settings"):
             pdf.set_font("Helvetica", "I", 10)
             pdf.set_text_color(23, 107, 82)
-            pdf.multi_cell(0, 5.5, f"Correct answer: {_format_correct(question)}", new_x="LMARGIN", new_y="NEXT")
+            pdf.multi_cell(0, 5.5, _pdf_text(f"Correct answer: {_format_correct(question)}"), new_x="LMARGIN", new_y="NEXT")
             pdf.set_text_color(0, 0, 0)
         pdf.ln(4)
 
@@ -440,20 +580,78 @@ def question_bank(quiz) -> None:
             st.warning("No valid questions found. Include numbered questions, options, and an Answer Key before publishing.")
             return
         st.write("Review extracted questions before publishing")
-        table = pd.DataFrame([{"Question": q["question_text"], "Options": " | ".join(f"{a}) {b}" for a, b in q["options"]), "Correct": q["correct_label"]} for q in draft])
-        edited = st.data_editor(table, num_rows="dynamic", width="stretch", key=f"editor-{quiz['id']}")
+        table = pd.DataFrame([
+            {
+                "Question": q["question_text"],
+                "Type": q.get("question_type", "Multiple choice"),
+                "Options": " | ".join(f"{a}) {b}" for a, b in q["options"]),
+                "Correct": q["correct_label"],
+            }
+            for q in draft
+        ])
+        edited = st.data_editor(
+            table, num_rows="dynamic", width="stretch", key=f"editor-{quiz['id']}",
+            column_config={
+                "Type": st.column_config.SelectboxColumn("Type", options=QUESTION_TYPES, required=True),
+                "Options": st.column_config.TextColumn("Options", help="A) first | B) second — leave blank for typed answers"),
+                "Correct": st.column_config.TextColumn("Correct", help="A letter for choice questions, or the answer itself for typed ones"),
+            },
+        )
+        st.caption("Set the Type column to change how a question is answered and marked. Typed questions grade the Correct column as text unless it reads as a number.")
         if st.button("Save question bank and publish", type="primary", key=f"save-{quiz['id']}"):
-            questions = []
-            for _, row in edited.iterrows():
-                options = [(chr(65 + i), part.split(")", 1)[-1].strip()) for i, part in enumerate(str(row["Options"]).split("|"))]
-                questions.append({"question_text": str(row["Question"]), "options": options, "correct_label": str(row["Correct"]).strip().upper()})
-            save_question_bank(quiz["id"], questions); st.session_state.pop(f"draft-{quiz['id']}", None); st.success("Question bank published."); st.rerun(scope="fragment")
+            questions = _questions_from_table(edited)
+            errors = _question_errors(questions)
+            if errors:
+                st.error(" ".join(errors))
+            else:
+                save_question_bank(quiz["id"], questions)
+                st.session_state.pop(f"draft-{quiz['id']}", None)
+                st.success("Question bank published.")
+                st.rerun(scope="fragment")
         return
     st.caption(f"Question bank: {len(questions)} questions")
     for index, question in enumerate(questions, 1):
         options = json.loads(question["options_json"])
         st.write(f"**{index}. {question['question_text']}**")
         st.caption("  ·  ".join(f"{label}) {text}" for label, text in options))
+
+
+def _questions_from_table(frame) -> list[dict]:
+    """Turn the reviewed upload table back into saveable questions, type intact."""
+    questions = []
+    for _, row in frame.iterrows():
+        text = str(row.get("Question", "") or "").strip()
+        if not text:
+            continue
+        question_type = str(row.get("Type") or "Multiple choice").strip()
+        if question_type not in QUESTION_TYPES:
+            question_type = "Multiple choice"
+        correct_raw = str(row.get("Correct", "") or "").strip()
+        if question_type in TEXT_QUESTION_TYPES:
+            answer_format = grading.NUMBER if grading._to_number(correct_raw) is not None else grading.TEXT
+            questions.append({
+                "question_text": text, "options": [],
+                "correct_label": grading.build_spec(correct_raw, answer_format),
+                "question_type": question_type,
+            })
+            continue
+        if question_type == "True / False":
+            options = [("A", "True"), ("B", "False")]
+        else:
+            options = [
+                (chr(65 + i), part.split(")", 1)[-1].strip())
+                for i, part in enumerate(str(row.get("Options", "") or "").split("|"))
+                if part.split(")", 1)[-1].strip()
+            ]
+        if question_type == SELECT_ALL_TYPE:
+            correct = [part.strip().upper() for part in correct_raw.replace("|", ",").split(",") if part.strip()]
+        else:
+            correct = correct_raw.upper()[:1]
+        questions.append({
+            "question_text": text, "options": options,
+            "correct_label": correct, "question_type": question_type,
+        })
+    return questions
 
 
 def manual_question_editor(quiz) -> None:
@@ -470,18 +668,35 @@ def manual_question_editor(quiz) -> None:
                 st.session_state[f"manual-option-{quiz['id']}-{index}-{label}"] = value
             if question_type == SELECT_ALL_TYPE:
                 st.session_state[f"manual-correct-all-{quiz['id']}-{index}"] = json.loads(question["correct_label"])
-            elif question_type in {"Fill in the blank", "Short answer"}:
-                options = json.loads(question["options_json"])
-                st.session_state[f"manual-correct-{quiz['id']}-{index}"] = options[0][1] if options else ""
+            elif question_type in TEXT_QUESTION_TYPES:
+                spec = grading.answer_spec(question)
+                prefix = f"manual-typed-{quiz['id']}-{index}"
+                st.session_state[f"{prefix}-answer"] = spec.get("value", "")
+                st.session_state[f"{prefix}-format"] = "Number" if spec.get("format") == grading.NUMBER else "Text"
+                st.session_state[f"{prefix}-tolerance"] = str(spec.get("tolerance") or "")
+                st.session_state[f"{prefix}-alternatives"] = ", ".join(spec.get("alternatives") or [])
+                st.session_state[f"{prefix}-typos"] = bool(spec.get("allow_typos"))
+                st.session_state[f"{prefix}-limit"] = str(spec.get("max_length") or "")
             else:
                 st.session_state[f"manual-correct-{quiz['id']}-{index}"] = question["correct_label"]
-    count = st.number_input("Number of questions", min_value=1, max_value=200, value=st.session_state[count_key])
+    def _sync_count() -> None:
+        st.session_state[count_key] = int(st.session_state[f"{count_key}-input"])
+
+    count = st.number_input("Number of questions", min_value=1, max_value=200,
+                            value=st.session_state[count_key], key=f"{count_key}-input",
+                            on_change=_sync_count)
+    st.session_state[count_key] = int(count)
     add_col, remove_col = st.columns(2)
+    def _set_count(value: int) -> None:
+        # Drop the widget's own key so the number_input picks up the new value.
+        st.session_state.pop(f"{count_key}-input", None)
+        st.session_state[count_key] = value
+
     if add_col.button("Add another question", key=f"manual-add-{quiz['id']}", width="stretch"):
-        st.session_state[count_key] = int(count) + 1
+        _set_count(int(count) + 1)
         st.rerun(scope="fragment")
     if remove_col.button("Remove last question", key=f"manual-remove-{quiz['id']}", width="stretch", disabled=int(count) <= 1):
-        st.session_state[count_key] = int(count) - 1
+        _set_count(int(count) - 1)
         st.rerun(scope="fragment")
     questions = []
     for index in range(int(count)):
@@ -503,25 +718,21 @@ def manual_question_editor(quiz) -> None:
                 correct = st.selectbox("Correct answer", ["A", "B"], format_func=lambda value: "True" if value == "A" else "False", key=f"manual-correct-{quiz['id']}-{index}")
             elif question_type == SELECT_ALL_TYPE:
                 correct = st.multiselect("Correct answers", ["A", "B", "C", "D"], key=f"manual-correct-all-{quiz['id']}-{index}")
+            elif question_type == "Multiple choice":
+                available = [label for label, _ in options] or ["A", "B", "C", "D"]
+                stored = st.session_state.get(f"manual-correct-{quiz['id']}-{index}")
+                correct = st.selectbox("Correct answer", available,
+                                       index=available.index(stored) if stored in available else 0,
+                                       key=f"manual-correct-mc-{quiz['id']}-{index}")
+                st.session_state[f"manual-correct-{quiz['id']}-{index}"] = correct
             else:
-                correct = st.text_input("Correct answer", value="A" if question_type == "Multiple choice" else "", key=f"manual-correct-{quiz['id']}-{index}")
-            if question_type in {"Fill in the blank", "Short answer"}:
-                options = [("A", correct.strip())] if correct.strip() else []
-            correct_label = "A" if question_type in {"Fill in the blank", "Short answer"} else (correct if question_type == SELECT_ALL_TYPE else correct.strip().upper())
+                prefix = f"manual-typed-{quiz['id']}-{index}"
+                correct = typed_answer_editor(prefix, lambda name, default, p=prefix: st.session_state.get(f"{p}-{name}", default))
+                options = []
+            correct_label = correct if question_type in TEXT_QUESTION_TYPES or question_type == SELECT_ALL_TYPE else correct.strip().upper()
             questions.append({"question_text": text.strip(), "options": options, "correct_label": correct_label, "question_type": question_type})
     if st.button("Save manually created test", type="primary", key=f"manual-save-{quiz['id']}", width="stretch"):
-        errors = []
-        for index, question in enumerate(questions, 1):
-            if not question["question_text"]:
-                errors.append(f"Question {index} needs text.")
-            minimum_options = 1 if question["question_type"] in {"Fill in the blank", "Short answer"} else 2
-            if len(question["options"]) < minimum_options:
-                errors.append(f"Question {index} needs an answer." if minimum_options == 1 else f"Question {index} needs at least two options.")
-            correct_labels = question["correct_label"] if question["question_type"] == SELECT_ALL_TYPE else [question["correct_label"]]
-            if question["question_type"] == SELECT_ALL_TYPE and not correct_labels:
-                errors.append(f"Question {index} needs at least one correct answer.")
-            if not set(correct_labels).issubset({label for label, _ in question["options"]}):
-                errors.append(f"Question {index} needs its selected correct option filled in.")
+        errors = _question_errors(questions)
         if errors:
             st.error(" ".join(errors))
         else:
@@ -531,11 +742,11 @@ def manual_question_editor(quiz) -> None:
 
 
 def settings_editor(quiz) -> None:
-    has_attempts = quiz_has_attempts(quiz["id"])
+    has_attempts = quiz_has_attempts(quiz["id"], exclude_student_id=quiz["owner_id"])
     if has_attempts:
-        st.info("Settings are read-only after a student starts this assessment.")
-    opening = datetime.fromisoformat(quiz["opening_time"])
-    closing = datetime.fromisoformat(quiz["closing_time"])
+        st.info("Settings are read-only after a student starts this assessment. Your own preview attempts don't count.")
+    opening = datetime.fromisoformat(quiz["opening_time"]).astimezone()
+    closing = datetime.fromisoformat(quiz["closing_time"]).astimezone()
     with st.form(f"settings-{quiz['id']}"):
         first, second, third = st.columns(3)
         with first: duration = st.number_input("Time allowed (minutes)", 1, 480, quiz["duration_minutes"], disabled=has_attempts)
@@ -544,20 +755,20 @@ def settings_editor(quiz) -> None:
         with st.container(border=True):
             opening_date, opening_time = st.columns(2)
             with opening_date: opening_day = st.date_input("Opens on", opening.date(), disabled=has_attempts or not opening_enabled)
-            with opening_time: opening_clock = st.time_input("Opening time", opening.timetz().replace(tzinfo=None), disabled=has_attempts or not opening_enabled)
+            with opening_time: opening_clock = st.time_input("Opening time", opening.time(), disabled=has_attempts or not opening_enabled)
         closing_enabled = st.checkbox("Enable closing date and time", value=bool(quiz["closing_enabled"]), disabled=has_attempts)
         with st.container(border=True):
             closing_date, closing_time = st.columns(2)
             with closing_date: closing_day = st.date_input("Closes on", closing.date(), disabled=has_attempts or not closing_enabled)
-            with closing_time: closing_clock = st.time_input("Closing time", closing.timetz().replace(tzinfo=None), disabled=has_attempts or not closing_enabled)
+            with closing_time: closing_clock = st.time_input("Closing time", closing.time(), disabled=has_attempts or not closing_enabled)
         allow_retake = st.checkbox("Allow retakes", bool(quiz["allow_retake"]), disabled=has_attempts)
         show_average = st.checkbox("Show class average", bool(quiz["show_average"]), disabled=has_attempts)
         randomize_questions = st.checkbox("Randomize question order", bool(quiz["randomize_questions"]), disabled=has_attempts)
         randomize_answers = st.checkbox("Randomize answer order", bool(quiz["randomize_answers"]), disabled=has_attempts)
         saved = st.form_submit_button("Save settings", type="primary", disabled=has_attempts, width="stretch")
     if saved:
-        opening_value = datetime.combine(opening_day, opening_clock, tzinfo=timezone.utc)
-        closing_value = datetime.combine(closing_day, closing_clock, tzinfo=timezone.utc)
+        opening_value = datetime.combine(opening_day, opening_clock).astimezone()
+        closing_value = datetime.combine(closing_day, closing_clock).astimezone()
         if opening_enabled and closing_enabled and closing_value <= opening_value:
             st.error("Closing time must be after opening time.")
         elif closing_enabled and closing_value <= datetime.now(timezone.utc):
@@ -597,8 +808,7 @@ def roster_page(user) -> None:
     roster = students(user["id"])
     performance = student_analytics(user["id"])
     teams = teams_for_teacher(user["id"])
-    st.markdown('<div class="eyebrow">Teacher workspace</div><h1>Student roster</h1>', unsafe_allow_html=True)
-    st.caption("Add the students you teach here. Only this roster appears in your assignment controls.")
+    page_header("Teacher workspace", "Student roster", "Students who choose you appear here automatically. You can also add them yourself.")
     team_options = {team["id"]: team["name"] for team in teams}
     with st.container(border=True):
         st.subheader("Add an existing student to roster")
@@ -666,7 +876,7 @@ def roster_page(user) -> None:
             if st.session_state.pop("show_student_detail", False):
                 student_detail_dialog(user, st.session_state.detail_student_id)
         else:
-            st.info("Your roster is empty. Add a student above before assigning a quiz.")
+            empty_state("Your roster is empty", "Students appear here as soon as they choose you as their teacher. You can also add them by hand above.")
 
 
 @st.dialog("Student analytics")

@@ -81,14 +81,19 @@ def seed_demo_data() -> None:
     if "admin@mcq.local" not in emails:
         existing_admins = supabase.table("admins").select("email").execute().data
         if not existing_admins:
+            from repository import hash_password  # local import avoids a circular import at module load
+
             supabase.table("admins").insert(
-                {"email": "admin@mcq.local", "password": "admin", "name": "Administrator", "created_at": utc_now()}
+                {"email": "admin@mcq.local", "password": hash_password("admin"),
+                 "name": "Administrator", "created_at": utc_now()}
             ).execute()
 
+    from repository import hash_password  # local import avoids a circular import at module load
+
     if teacher["email"] not in emails:
-        supabase.table("users").update({"password": "teacher"}).eq("email", teacher["email"]).execute()
+        supabase.table("users").update({"password": hash_password("teacher")}).eq("email", teacher["email"]).execute()
     if student["email"] not in emails:
-        supabase.table("users").update({"password": "student"}).eq("email", student["email"]).execute()
+        supabase.table("users").update({"password": hash_password("student")}).eq("email", student["email"]).execute()
 
     for team_name in ("Tutors", "Software", "Finance", "Assistants"):
         existing_teams = supabase.table("teams").select("id").eq("teacher_id", teacher["id"]).eq("name", team_name).execute().data
