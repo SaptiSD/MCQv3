@@ -5,6 +5,7 @@ import streamlit as st
 from admin_portal import dashboard as admin_dashboard
 from db import init_db, seed_demo_data
 from student_portal import dashboard as student_dashboard
+from student_portal import join_teacher_page as join_teacher_dashboard
 from teacher_portal import create as create_quiz
 from teacher_portal import analytics_page, dashboard as teacher_dashboard
 from teacher_portal import roster_page
@@ -62,7 +63,10 @@ def main() -> None:
     elif user["role"] == "unassigned":
         waiting_page(user)
     else:
-        student_dashboard(user)
+        if page == "Join teacher":
+            join_teacher_dashboard(user)
+        else:
+            student_dashboard(user)
     if user["role"] == "teacher" and st.session_state.get("create_nav_guard"):
         confirm_discard_dialog()
 

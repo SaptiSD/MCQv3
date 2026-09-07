@@ -10,8 +10,9 @@ import streamlit as st
 
 from db import utc_now
 from repository import (attempt_with_quiz, attempts_for_student, available_quizzes,
-                        complete_attempt, create_attempt, open_attempt,
-                        questions_for_quiz, save_attempt_answers)
+                        complete_attempt, create_attempt, join_teacher, leave_teacher,
+                        open_attempt, questions_for_quiz, quiz_average_score,
+                        save_attempt_answers, search_teachers, teachers_for_student)
 
 
 def current_time() -> datetime:
@@ -34,7 +35,11 @@ def dashboard(user) -> None:
                 st.subheader(quiz["title"])
                 st.caption(f"{quiz['duration_minutes']} minutes  ·  closes {datetime.fromisoformat(quiz['closing_time']).astimezone().strftime('%b %d, %I:%M %p')}")
                 if attempt and attempt["submitted_at"]:
-                    average = "" if not quiz["show_average"] else "  ·  class average available"
+                    if quiz["show_average"]:
+                        class_average = quiz_average_score(quiz["id"])
+                        average = f"  ·  class average: **{class_average:.0f}%**" if class_average is not None else ""
+                    else:
+                        average = ""
                     st.write(f"Latest result: **{attempt['score_percent']:.0f}%**  ·  {'Passed' if attempt['passed'] else 'Needs another try'}{average}")
             with action:
                 done = attempt and attempt["submitted_at"]
@@ -46,6 +51,36 @@ def dashboard(user) -> None:
                         start_attempt(user, quiz); st.rerun()
     if st.session_state.get("attempt_id"):
         take_attempt(user, st.session_state.attempt_id)
+
+
+def join_teacher_page(user) -> None:
+    st.markdown('<div class="eyebrow">Student workspace</div><h1>Your teachers</h1>', unsafe_allow_html=True)
+    st.caption("See who you've joined and connect with new teachers.")
+    current = teachers_for_student(user["id"])
+    with st.container(border=True):
+        st.subheader("Joined teachers")
+        if current:
+            for teacher in current:
+                details, action = st.columns([5, 1])
+                details.write(f"**{teacher['name']}**  ·  {teacher['email']}")
+                if action.button("Leave", key=f"leave-{teacher['id']}", width="stretch"):
+                    leave_teacher(user["id"], teacher["id"]); st.rerun()
+        else:
+            st.info("You haven't joined any teachers yet. Search for one below to get started.")
+    st.divider()
+    with st.container(border=True):
+        st.subheader("Join a new teacher")
+        search = st.text_input("Search teachers", placeholder="Search by name or email", key="join-teacher-search")
+        matches = search_teachers(user["id"], search)
+        if search.strip():
+            if not matches:
+                st.info("No teachers match that search.")
+            else:
+                for teacher in matches:
+                    details, action = st.columns([5, 1])
+                    details.write(f"**{teacher['name']}**  ·  {teacher['email']}")
+                    if action.button("Join", key=f"join-{teacher['id']}", type="primary", width="stretch"):
+                        join_teacher(user["id"], teacher["id"]); st.rerun()
 
 
 def start_attempt(user, quiz) -> None:

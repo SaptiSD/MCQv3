@@ -79,7 +79,7 @@ def login_page() -> None:
 
 def workspace_nav(user, selected_page: str | None = None) -> str:
     st.markdown(f"<div class='top-brand'><strong>MCQ</strong><span>Assessment studio</span><span class='top-user'>{user['name']} · {user['role'].title()}</span></div>", unsafe_allow_html=True)
-    pages = ["Dashboard", "Create quiz", "Students", "Analytics", "Student view"] if user["role"] == "teacher" else ["Dashboard"]
+    pages = ["Dashboard", "Create quiz", "Students", "Analytics", "Student view"] if user["role"] == "teacher" else ["Dashboard", "Join teacher"]
     nav, sign_out = st.columns([8, 1], vertical_alignment="center")
     with nav:
         default_page = selected_page if selected_page in pages else pages[0]

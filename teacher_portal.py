@@ -9,6 +9,7 @@ from datetime import datetime, time, timedelta, timezone
 import pandas as pd
 import streamlit as st
 from docx import Document
+from fpdf import FPDF
 
 from ingestion import extract_upload, parse_bank
 from repository import (add_student_to_roster, assigned_student_ids, create_quiz,
@@ -288,10 +289,42 @@ def create(user) -> None:
     st.rerun()
 
 
+def _quiz_downloads(quiz, questions: list | None = None) -> None:
+    """Always-visible export controls (CSV / DOCX / PDF / results) at the top of the quiz manager."""
+    st.subheader("Download")
+    progress = student_progress_for_quiz(quiz["owner_id"], quiz["id"])
+    if progress:
+        results_frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": row["score"], "Result": row["result"], "Last activity": row["last_activity"]} for row in progress])
+        st.download_button("Download results CSV", results_frame.to_csv(index=False), "student-results.csv", "text/csv", key=f"results-download-{quiz['id']}")
+    else:
+        st.info("No students are assigned to this exam yet.")
+    if questions is None:
+        questions = list(questions_for_quiz(quiz["id"]))
+    if not questions:
+        return
+    pdf_format = st.selectbox("PDF contents", ["Questions only", "Questions with correct answers", "Questions with correct answers and quiz settings"], format_func=lambda value: value, key=f"pdf-format-{quiz['id']}")
+    format_map = {
+        "Questions only": "questions",
+        "Questions with correct answers": "questions-answers",
+        "Questions with correct answers and quiz settings": "questions-answers-settings",
+    }
+    pdf_bytes = _render_quiz_pdf(quiz, questions, format_map[pdf_format])
+    st.download_button("Download PDF", pdf_bytes, "quiz.pdf", "application/pdf", type="primary", key=f"pdf-{quiz['id']}")
+    frame = pd.DataFrame([{"Question": q["question_text"], "Correct": q["correct_label"], **dict(json.loads(q["options_json"]))} for q in questions])
+    st.download_button("Download question bank CSV", frame.to_csv(index=False), "question-bank.csv", "text/csv", key=f"bank-csv-{quiz['id']}")
+    document = Document(); document.add_heading(quiz["title"], 0)
+    for index, q in enumerate(questions, 1):
+        document.add_paragraph(f"{index}. {q['question_text']}")
+        for label, text in json.loads(q["options_json"]): document.add_paragraph(f"{label}) {text}", style="List Bullet")
+    output = io.BytesIO(); document.save(output)
+    st.download_button("Download printable DOCX", output.getvalue(), "quiz.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"docx-{quiz['id']}")
+
+
 def manage_quiz(user, quiz_id: int) -> None:
     quiz = quiz_for_teacher(quiz_id, user["id"])
     if not quiz: return
     st.divider(); st.markdown(f"### Manage: {quiz['title']}")
+    _quiz_downloads(quiz)
     questions_button, settings_button = st.columns(2)
     section = st.session_state.get(f"quiz-section-{quiz_id}", "questions")
     if settings_button.button("Quiz settings", key=f"settings-section-{quiz_id}", type="primary" if section == "settings" else "secondary", width="stretch"):
@@ -308,6 +341,71 @@ def manage_quiz(user, quiz_id: int) -> None:
         assignment_editor(quiz)
         results(quiz)
     if st.button("Close manager", key=f"close-{quiz_id}"): st.session_state.pop("manage_quiz", None); st.rerun()
+
+
+def _format_correct(question) -> str:
+    options = json.loads(question["options_json"])
+    if question["question_type"] == SELECT_ALL_TYPE:
+        labels = json.loads(question["correct_label"])
+        return ", ".join(next((text for label, text in options if label == lab), lab) for lab in labels)
+    correct_label = question["correct_label"]
+    if question["question_type"] == "True / False":
+        return "True" if correct_label == "A" else "False"
+    return next((text for label, text in options if label == correct_label), correct_label)
+
+
+def _render_quiz_pdf(quiz, questions, format_key: str) -> bytes:
+    """Render a quiz as a printable PDF.
+
+    format_key selects which detail is included:
+      "questions"                 -> questions + options only
+      "questions-answers"         -> also include the answer key
+      "questions-answers-settings"-> answer key plus quiz settings
+    """
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.multi_cell(0, 8, quiz["title"], new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    if format_key == "questions-answers-settings":
+        pdf.set_font("Helvetica", "I", 11)
+        pdf.set_text_color(90, 90, 90)
+        opening = datetime.fromisoformat(quiz["opening_time"]).astimezone().strftime("%b %d, %I:%M %p") if quiz.get("opening_enabled") else "Any time"
+        closing = datetime.fromisoformat(quiz["closing_time"]).astimezone().strftime("%b %d, %I:%M %p") if quiz.get("closing_enabled") else "Open"
+        settings_lines = [
+            f"Time allowed: {quiz['duration_minutes']} minutes",
+            f"Passing score: {quiz['passing_score']}%",
+            f"Opens: {opening}",
+            f"Closes: {closing}",
+            f"Retakes: {'Allowed' if quiz.get('allow_retake') else 'Not allowed'}",
+            f"Show class average: {'Yes' if quiz.get('show_average') else 'No'}",
+            f"Randomize question order: {'Yes' if quiz.get('randomize_questions') else 'No'}",
+            f"Randomize answer order: {'Yes' if quiz.get('randomize_answers') else 'No'}",
+        ]
+        for line in settings_lines:
+            pdf.multi_cell(0, 6, line, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(3)
+
+    for index, question in enumerate(questions, 1):
+        if pdf.get_y() > 250:
+            pdf.add_page()
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.multi_cell(0, 6, f"{index}. {question['question_text']}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
+        pdf.set_font("Helvetica", "", 11)
+        for label, text in json.loads(question["options_json"]):
+            pdf.multi_cell(0, 5.5, f"{label}) {text}", new_x="LMARGIN", new_y="NEXT")
+        if format_key in ("questions-answers", "questions-answers-settings"):
+            pdf.set_font("Helvetica", "I", 10)
+            pdf.set_text_color(23, 107, 82)
+            pdf.multi_cell(0, 5.5, f"Correct answer: {_format_correct(question)}", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
+        pdf.ln(4)
+
+    return bytes(pdf.output())
 
 
 def question_bank(quiz) -> None:
@@ -355,15 +453,6 @@ def question_bank(quiz) -> None:
         options = json.loads(question["options_json"])
         st.write(f"**{index}. {question['question_text']}**")
         st.caption("  ·  ".join(f"{label}) {text}" for label, text in options))
-    if questions:
-        frame = pd.DataFrame([{"Question": q["question_text"], "Correct": q["correct_label"], **dict(json.loads(q["options_json"]))} for q in questions])
-        st.download_button("Download question bank CSV", frame.to_csv(index=False), "question-bank.csv", "text/csv", key=f"bank-csv-{quiz['id']}")
-        document = Document(); document.add_heading(quiz["title"], 0)
-        for index, q in enumerate(questions, 1):
-            document.add_paragraph(f"{index}. {q['question_text']}")
-            for label, text in json.loads(q["options_json"]): document.add_paragraph(f"{label}) {text}", style="List Bullet")
-        output = io.BytesIO(); document.save(output)
-        st.download_button("Download printable DOCX", output.getvalue(), "quiz.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"docx-{quiz['id']}")
 
 
 def manual_question_editor(quiz) -> None:
@@ -501,7 +590,6 @@ def results(quiz) -> None:
         st.info("No students are assigned to this exam yet."); return
     frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": row["score"], "Result": row["result"], "Last activity": row["last_activity"]} for row in progress])
     st.dataframe(frame, width="stretch", hide_index=True)
-    st.download_button("Download student results CSV", frame.to_csv(index=False), "student-results.csv", "text/csv", key=f"results-{quiz['id']}")
 
 
 def roster_page(user) -> None:

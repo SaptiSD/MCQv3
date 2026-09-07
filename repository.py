@@ -110,6 +110,79 @@ def add_student_to_roster(teacher_id: int, name: str, email: str, team_id: int |
     return row
 
 
+def teachers_for_student(student_id: int):
+    teacher_ids = [
+        row["teacher_id"]
+        for row in _rows(
+            client().table("teacher_students").select("teacher_id").eq("student_id", student_id).execute()
+        )
+    ]
+    if not teacher_ids:
+        return []
+    return _rows(
+        client().table("users").select("*")
+        .eq("role", "teacher")
+        .in_("id", teacher_ids)
+        .order("name")
+        .execute()
+    )
+
+
+def search_teachers(student_id: int, query: str):
+    """Return teachers matching a name/email search, excluding those already joined."""
+    query = query.strip()
+    if not query:
+        return []
+    joined = {
+        row["teacher_id"]
+        for row in _rows(
+            client().table("teacher_students").select("teacher_id").eq("student_id", student_id).execute()
+        )
+    }
+    joined.add(student_id)
+    supabase = client()
+    by_name = _rows(
+        supabase.table("users").select("*")
+        .eq("role", "teacher")
+        .ilike("name", f"%{query}%")
+        .order("name")
+        .execute()
+    )
+    by_email = _rows(
+        supabase.table("users").select("*")
+        .eq("role", "teacher")
+        .ilike("email", f"%{query}%")
+        .order("name")
+        .execute()
+    )
+    seen: dict = {}
+    for row in [*by_name, *by_email]:
+        teacher_id = row["id"]
+        if teacher_id in joined:
+            continue
+        seen.setdefault(teacher_id, row)
+    return sorted(seen.values(), key=lambda row: row["name"])
+
+
+def join_teacher(student_id: int, teacher_id: int) -> bool:
+    """Join a teacher's roster. Returns False if already joined or invalid."""
+    supabase = client()
+    teacher = _rows(
+        supabase.table("users").select("id").eq("id", teacher_id).eq("role", "teacher").limit(1).execute()
+    )
+    if not teacher:
+        return False
+    supabase.table("teacher_students").upsert(
+        {"teacher_id": teacher_id, "student_id": student_id, "added_at": utc_now()},
+        on_conflict="teacher_id,student_id",
+    ).execute()
+    return True
+
+
+def leave_teacher(student_id: int, teacher_id: int) -> None:
+    client().table("teacher_students").delete().eq("teacher_id", teacher_id).eq("student_id", student_id).execute()
+
+
 def teams_for_teacher(teacher_id: int):
     return _rows(
         client().table("teams").select("*")
@@ -461,6 +534,18 @@ def available_quizzes(student_id: int, owner_id: int | None = None):
     quiz_student_rows = _rows(supabase.table("quiz_students").select("quiz_id,student_id").execute())
     mine = {row["quiz_id"] for row in quiz_student_rows if row["student_id"] == student_id}
     return [q for q in quizzes if q["id"] in mine]
+
+
+def quiz_average_score(quiz_id: int):
+    """Average score (percent) across completed attempts for a quiz, or None."""
+    rows = _rows(
+        client().table("attempts").select("score_percent")
+        .eq("quiz_id", quiz_id)
+        .not_.is_("submitted_at", None)
+        .execute()
+    )
+    scores = [row.get("score_percent") for row in rows if row.get("score_percent") is not None]
+    return (sum(scores) / len(scores)) if scores else None
 
 
 def attempts_for_student(student_id: int):
