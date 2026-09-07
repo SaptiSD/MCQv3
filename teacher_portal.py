@@ -69,8 +69,7 @@ def dashboard(user) -> None:
                 if st.button("Delete", key=f"delete-{quiz['id']}", width="stretch"):
                     delete_quiz_dialog(user, quiz["id"], quiz["title"])
         if st.session_state.get("manage_quiz") == quiz["id"]:
-            with st.container(border=True):
-                manage_quiz(user, quiz["id"])
+            manage_quiz(user, quiz["id"])
 
 
 def analytics_page(user) -> None:
@@ -320,27 +319,29 @@ def _quiz_downloads(quiz, questions: list | None = None) -> None:
     st.download_button("Download printable DOCX", output.getvalue(), "quiz.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"docx-{quiz['id']}")
 
 
+@st.fragment
 def manage_quiz(user, quiz_id: int) -> None:
-    quiz = quiz_for_teacher(quiz_id, user["id"])
-    if not quiz: return
-    st.divider(); st.markdown(f"### Manage: {quiz['title']}")
-    _quiz_downloads(quiz)
-    questions_button, settings_button = st.columns(2)
-    section = st.session_state.get(f"quiz-section-{quiz_id}", "questions")
-    if settings_button.button("Quiz settings", key=f"settings-section-{quiz_id}", type="primary" if section == "settings" else "secondary", width="stretch"):
-        st.session_state[f"quiz-section-{quiz_id}"] = "settings"
-        st.rerun()
-    if questions_button.button("Questions", key=f"questions-section-{quiz_id}", type="primary" if section == "questions" else "secondary", width="stretch"):
-        st.session_state[f"quiz-section-{quiz_id}"] = "questions"
-        st.rerun()
-    if section == "settings":
-        settings_editor(quiz)
-    else:
-        question_bank(quiz)
-    with st.expander("Assign by students or teams · View results"):
-        assignment_editor(quiz)
-        results(quiz)
-    if st.button("Close manager", key=f"close-{quiz_id}"): st.session_state.pop("manage_quiz", None); st.rerun()
+    with st.container(border=True):
+        quiz = quiz_for_teacher(quiz_id, user["id"])
+        if not quiz: return
+        st.divider(); st.markdown(f"### Manage: {quiz['title']}")
+        _quiz_downloads(quiz)
+        questions_button, settings_button = st.columns(2)
+        section = st.session_state.get(f"quiz-section-{quiz_id}", "questions")
+        if settings_button.button("Quiz settings", key=f"settings-section-{quiz_id}", type="primary" if section == "settings" else "secondary", width="stretch"):
+            st.session_state[f"quiz-section-{quiz_id}"] = "settings"
+            st.rerun(scope="fragment")
+        if questions_button.button("Questions", key=f"questions-section-{quiz_id}", type="primary" if section == "questions" else "secondary", width="stretch"):
+            st.session_state[f"quiz-section-{quiz_id}"] = "questions"
+            st.rerun(scope="fragment")
+        if section == "settings":
+            settings_editor(quiz)
+        else:
+            question_bank(quiz)
+        with st.expander("Assign by students or teams · View results"):
+            assignment_editor(quiz)
+            results(quiz)
+        if st.button("Close manager", key=f"close-{quiz_id}"): st.session_state.pop("manage_quiz", None); st.rerun()
 
 
 def _format_correct(question) -> str:
@@ -418,10 +419,10 @@ def question_bank(quiz) -> None:
             move_up, move_down = st.columns(2)
             if move_up.button("Move up", key=f"move-up-{quiz['id']}", disabled=selected_index == 0, width="stretch"):
                 move_question(quiz["id"], selected_id, -1)
-                st.rerun()
+                st.rerun(scope="fragment")
             if move_down.button("Move down", key=f"move-down-{quiz['id']}", disabled=selected_index == len(questions) - 1, width="stretch"):
                 move_question(quiz["id"], selected_id, 1)
-                st.rerun()
+                st.rerun(scope="fragment")
     mode = st.radio("How would you like to add questions?", ["Create manually", "Upload question bank"], horizontal=True, key=f"question-mode-{quiz['id']}")
     if mode == "Create manually":
         manual_question_editor(quiz)
@@ -446,7 +447,7 @@ def question_bank(quiz) -> None:
             for _, row in edited.iterrows():
                 options = [(chr(65 + i), part.split(")", 1)[-1].strip()) for i, part in enumerate(str(row["Options"]).split("|"))]
                 questions.append({"question_text": str(row["Question"]), "options": options, "correct_label": str(row["Correct"]).strip().upper()})
-            save_question_bank(quiz["id"], questions); st.session_state.pop(f"draft-{quiz['id']}", None); st.success("Question bank published."); st.rerun()
+            save_question_bank(quiz["id"], questions); st.session_state.pop(f"draft-{quiz['id']}", None); st.success("Question bank published."); st.rerun(scope="fragment")
         return
     st.caption(f"Question bank: {len(questions)} questions")
     for index, question in enumerate(questions, 1):
@@ -478,10 +479,10 @@ def manual_question_editor(quiz) -> None:
     add_col, remove_col = st.columns(2)
     if add_col.button("Add another question", key=f"manual-add-{quiz['id']}", width="stretch"):
         st.session_state[count_key] = int(count) + 1
-        st.rerun()
+        st.rerun(scope="fragment")
     if remove_col.button("Remove last question", key=f"manual-remove-{quiz['id']}", width="stretch", disabled=int(count) <= 1):
         st.session_state[count_key] = int(count) - 1
-        st.rerun()
+        st.rerun(scope="fragment")
     questions = []
     for index in range(int(count)):
         with st.container(border=True):
@@ -526,7 +527,7 @@ def manual_question_editor(quiz) -> None:
         else:
             save_question_bank(quiz["id"], questions)
             st.success("Test saved and published.")
-            st.rerun()
+            st.rerun(scope="fragment")
 
 
 def settings_editor(quiz) -> None:

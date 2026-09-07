@@ -53,6 +53,7 @@ def dashboard(user) -> None:
         take_attempt(user, st.session_state.attempt_id)
 
 
+@st.fragment
 def join_teacher_page(user) -> None:
     st.markdown('<div class="eyebrow">Student workspace</div><h1>Your teachers</h1>', unsafe_allow_html=True)
     st.caption("See who you've joined and connect with new teachers.")
@@ -64,7 +65,7 @@ def join_teacher_page(user) -> None:
                 details, action = st.columns([5, 1])
                 details.write(f"**{teacher['name']}**  ·  {teacher['email']}")
                 if action.button("Leave", key=f"leave-{teacher['id']}", width="stretch"):
-                    leave_teacher(user["id"], teacher["id"]); st.rerun()
+                    leave_teacher(user["id"], teacher["id"]); st.rerun(scope="fragment")
         else:
             st.info("You haven't joined any teachers yet. Search for one below to get started.")
     st.divider()
@@ -80,7 +81,7 @@ def join_teacher_page(user) -> None:
                     details, action = st.columns([5, 1])
                     details.write(f"**{teacher['name']}**  ·  {teacher['email']}")
                     if action.button("Join", key=f"join-{teacher['id']}", type="primary", width="stretch"):
-                        join_teacher(user["id"], teacher["id"]); st.rerun()
+                        join_teacher(user["id"], teacher["id"]); st.rerun(scope="fragment")
 
 
 def start_attempt(user, quiz) -> None:
@@ -102,6 +103,7 @@ def start_attempt(user, quiz) -> None:
     )
 
 
+@st.fragment
 def take_attempt(user, attempt_id: int) -> None:
     attempt = attempt_with_quiz(attempt_id, user["id"])
     if not attempt: return
@@ -130,7 +132,7 @@ def take_attempt(user, attempt_id: int) -> None:
         save_clicked = save.form_submit_button("Save progress", width="stretch")
         submit_clicked = submit.form_submit_button("Submit quiz", type="primary", width="stretch")
     if save_clicked:
-        payload["answers"] = answers; update_answers(attempt_id, payload); st.success("Progress saved."); st.rerun()
+        payload["answers"] = answers; update_answers(attempt_id, payload); st.success("Progress saved."); st.rerun(scope="fragment")
     if submit_clicked:
         payload["answers"] = answers; submit_attempt(attempt, payload, False); st.session_state.pop("attempt_id", None); st.rerun()
 
