@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from functools import lru_cache
 
+import httpx
 import streamlit as st
 
 # Prefer env vars (useful for scripts/migrations); fall back to st.secrets.
@@ -28,6 +30,72 @@ def _resolve(secret_key: str, env: str) -> str:
         return ""
 
 
+# A Streamlit app sits idle between clicks, so pooled connections go quiet for
+# minutes at a time. Supabase sits behind a gateway that hangs up on idle
+# sockets long before httpx would, and reusing one of those dead sockets fails
+# mid-read -- on Windows as "WinError 10035: a non-blocking socket operation
+# could not be completed immediately". Retiring idle connections well inside the
+# gateway's own timeout means the pool hands out live sockets or none at all.
+_KEEPALIVE_SECONDS = 20
+
+# Failures worth another go: the connection died rather than the server saying no.
+_CONNECTION_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+_MID_REQUEST_ERRORS = (
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    httpx.ReadTimeout,
+)
+# Repeating a read is free. Repeating a write is not: if the server did receive
+# the insert before the connection dropped, a retry writes it twice. Writes are
+# therefore only retried when the connection never opened in the first place.
+_REPEATABLE_METHODS = {"GET", "HEAD", "OPTIONS"}
+_RETRY_BACKOFF_SECONDS = (0.2, 0.6)
+
+
+class _ResilientTransport(httpx.HTTPTransport):
+    """An HTTP transport that retries a request whose connection failed under it."""
+
+    def handle_request(self, request):
+        attempts = len(_RETRY_BACKOFF_SECONDS) + 1
+        for attempt in range(attempts):
+            try:
+                return super().handle_request(request)
+            except _CONNECTION_ERRORS + _MID_REQUEST_ERRORS as exc:
+                repeatable = (
+                    isinstance(exc, _CONNECTION_ERRORS)
+                    or request.method.upper() in _REPEATABLE_METHODS
+                )
+                if attempt == attempts - 1 or not repeatable:
+                    raise
+                time.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _harden(session) -> None:
+    """Give one of the SDK's httpx clients a short-lived, self-healing pool.
+
+    The transport is replaced rather than the whole client: the SDK builds its
+    session with the base URL, the service-role headers and HTTP/2 already set
+    up, and handing it a client of our own would quietly drop all of that.
+    """
+    existing = getattr(session, "_transport", None)
+    if not isinstance(existing, httpx.HTTPTransport):
+        # A different httpx layout than we expect: leave it alone rather than
+        # break a working client. Requests still work, just without the retry.
+        return
+    session._transport = _ResilientTransport(
+        http2=True,
+        limits=httpx.Limits(max_connections=10, max_keepalive_connections=5,
+                            keepalive_expiry=_KEEPALIVE_SECONDS),
+    )
+    existing.close()
+
+
 @lru_cache(maxsize=1)
 def client():
     """Return a shared Supabase client backed by the service-role key.
@@ -46,7 +114,14 @@ def client():
             "SUPABASE_SERVICE_ROLE_KEY env vars, or the [supabase] section "
             "of .streamlit/secrets.toml."
         )
-    return create_client(url, key)
+    supabase = create_client(url, key)
+    try:
+        _harden(supabase.postgrest.session)
+    except Exception:
+        # Hardening is an optimisation, not a requirement. A client that works
+        # without it beats no client at all.
+        pass
+    return supabase
 
 
 @st.cache_resource

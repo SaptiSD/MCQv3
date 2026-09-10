@@ -1,5 +1,6 @@
 """MCQ V3 application shell: startup, authentication, and routing only."""
 
+import httpx
 import streamlit as st
 
 import guide
@@ -16,9 +17,29 @@ from ui import (choose_role_page, confirm_discard_dialog, enforce_session, googl
 
 
 st.set_page_config(page_title="MCQ | Assessment studio", page_icon="M", layout="wide")
-init_db()
-seed_demo_data()
 styles()
+
+
+def unreachable(detail: str) -> None:
+    """Explain a lost database connection instead of showing a stack trace.
+
+    Nothing the person did caused this and there is nothing in the traceback
+    they can act on, so offer the one thing that does help: trying again.
+    """
+    st.error("Can't reach the assessment database right now.")
+    st.caption("This is usually a brief network hiccup. Nothing you had saved has been lost.")
+    if st.button("Try again", type="primary"):
+        st.rerun()
+    with st.expander("Technical detail"):
+        st.code(detail)
+
+
+try:
+    init_db()
+    seed_demo_data()
+except (httpx.HTTPError, RuntimeError) as exc:
+    unreachable(str(exc))
+    st.stop()
 
 
 def main() -> None:
@@ -92,4 +113,10 @@ def main() -> None:
     warn_before_leaving(bool(st.session_state.get("create_dirty")))
 
 
-main()
+try:
+    main()
+except httpx.HTTPError as exc:
+    # A connection that died under a query, after the retries in db.py had
+    # their turn. The page is half-drawn; say so plainly rather than letting
+    # Streamlit paint a traceback over it.
+    unreachable(str(exc))
