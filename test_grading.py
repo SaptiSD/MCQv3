@@ -85,6 +85,12 @@ rejects(forgiving, "Photo", "Respiration")
 short = g.build_spec("cat", g.TEXT, allow_typos=True)
 rejects(short, "bat", "cot")  # too short to guess at
 
+# A swapped pair of adjacent letters is one slip, not two.
+swaps = g.build_spec("Italy", g.TEXT, allow_typos=True)
+accepts(swaps, "Itlay", "Itlay ", "itlay")
+rejects(swaps, "Ilaty", "Spain")  # two letters out of place is a different word
+accepts(g.build_spec("Photosynthesis", g.TEXT, allow_typos=True), "Photosynthseis")
+
 print("\n== input limits ==")
 check("whole number box is small", g.input_limit(six), 4)
 check("two-digit answer box", g.input_limit(g.build_spec("42", g.NUMBER)), 5)

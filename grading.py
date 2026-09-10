@@ -151,25 +151,33 @@ def normalise_text(text: str) -> str:
 
 
 def _edit_distance_within_one(left: str, right: str) -> bool:
-    """True when the two strings are at most one insert/delete/substitution apart."""
-    if abs(len(left) - len(right)) > 1:
+    """True when one edit turns `left` into `right`.
+
+    An edit is a single insert, delete, substitution, or a swap of two adjacent
+    characters. Swaps count as one edit even though plain Levenshtein scores them
+    as two: typing "Itlay" for "Italy" is the commonest slip there is, and a
+    student who clearly knew the answer should not lose the mark for it.
+    """
+    if left == right:
+        return True
+    length_left, length_right = len(left), len(right)
+    if abs(length_left - length_right) > 1:
         return False
-    if len(left) > len(right):
-        left, right = right, left
-    index_left = index_right = 0
-    slack_used = False
-    while index_left < len(left) and index_right < len(right):
-        if left[index_left] == right[index_right]:
-            index_left += 1
-            index_right += 1
-            continue
-        if slack_used:
-            return False
-        slack_used = True
-        if len(left) == len(right):
-            index_left += 1
-        index_right += 1
-    return True
+    # Strip the matching head and tail; whatever disagrees is left in the middle.
+    shortest = min(length_left, length_right)
+    head = 0
+    while head < shortest and left[head] == right[head]:
+        head += 1
+    tail = 0
+    while tail < shortest - head and left[length_left - 1 - tail] == right[length_right - 1 - tail]:
+        tail += 1
+    middle_left = left[head:length_left - tail]
+    middle_right = right[head:length_right - tail]
+    if length_left == length_right:
+        # One substitution leaves a single odd character; a swap leaves a reversed pair.
+        return len(middle_left) <= 1 or (len(middle_left) == 2 and middle_left == middle_right[::-1])
+    # One insert or delete: the shorter string's middle has to be empty.
+    return not (middle_left if length_left < length_right else middle_right)
 
 
 # --------------------------------------------------------------------------- grading
@@ -253,7 +261,7 @@ def teacher_summary(spec: dict) -> str:
         parts.append("or " + ", ".join(f'"{item}"' for item in extras))
     parts.append("— capitals and extra spaces are ignored")
     if spec.get("allow_typos"):
-        parts.append("and single-letter typos are forgiven")
+        parts.append("and a one-letter typo or a swapped pair is forgiven")
     return " ".join(parts) + "."
 
 
@@ -262,3 +270,36 @@ def _trim(number: Decimal) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text or "0"
+
+
+# --------------------------------------------------------------------------- scoring an attempt
+
+SELECT_ALL_TYPE = "Multiple choice - select all that apply"
+
+
+def is_correct(question: dict, given) -> bool:
+    """Mark one answer against a frozen attempt question.
+
+    `question` is an entry from an attempt's `answers_json` payload: it carries
+    the question type and the `correct` value that applied when the attempt was
+    built (a label, a list of labels, or a typed answer specification).
+    """
+    question_type = question.get("question_type")
+    if question_type == SELECT_ALL_TYPE:
+        correct = question.get("correct") or []
+        return bool(correct) and set(given or []) == set(correct)
+    if question_type in TEXT_QUESTION_TYPES:
+        correct = question.get("correct")
+        spec = correct if isinstance(correct, dict) else build_spec(str(correct or ""))
+        return grade(spec, given)
+    return given is not None and given == question.get("correct")
+
+
+def score_payload(payload: dict) -> float:
+    """Percentage score for an attempt payload, 0 when it holds no questions."""
+    questions = payload.get("questions") or []
+    if not questions:
+        return 0.0
+    answers = payload.get("answers") or {}
+    correct = sum(is_correct(question, answers.get(str(index))) for index, question in enumerate(questions))
+    return correct / len(questions) * 100

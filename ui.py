@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import streamlit as st
 
+import server_state
 from db import get_or_create_user
 from repository import PortalMismatch, admin_by_email, authenticate, set_user_role, user_by_email
 
@@ -190,6 +191,23 @@ def when(timestamp) -> str:
     return moment.astimezone().strftime("%b %d, %I:%M %p").replace(" 0", " ")
 
 
+def flash(slot: str, message: str) -> None:
+    """Queue a confirmation to show after the rerun that follows an action.
+
+    `st.success(...)` immediately before `st.rerun()` never reaches the screen:
+    the rerun throws away the half-drawn page, message and all. Stashing it here
+    and drawing it on the way back in is what makes the confirmation visible.
+    `slot` keeps each section's message next to the control that produced it, so
+    a confirmation never lands in a part of the page the reader isn't looking at.
+    """
+    st.session_state[f"_flash-{slot}"] = message
+
+
+def show_flash(slot: str) -> None:
+    if message := st.session_state.pop(f"_flash-{slot}", None):
+        st.success(message)
+
+
 def page_header(eyebrow: str, title: str, lede: str = "") -> None:
     """The standard heading block at the top of every page."""
     tail = f'<p class="lede">{lede}</p>' if lede else ""
@@ -244,6 +262,10 @@ def _login_panel(side: str, eyebrow: str, heading: str, blurb: str, google_ready
                     st.error("No account matches that name, email, or password.")
                 else:
                     st.session_state.user = user
+                    # Adopt the account's current epoch. Signing in deliberately
+                    # does *not* bump it: a teacher working in two tabs signs in
+                    # twice and should keep both. Only signing out invalidates.
+                    server_state.stamp_session(user)
                     st.rerun()
         if google_ready:
             if st.button("Continue with Google", key=f"google-{side}", width="stretch"):
@@ -408,9 +430,66 @@ def reset_session() -> None:
 
 def sign_out() -> None:
     google_session = getattr(st.user, "is_logged_in", False)
+    user = st.session_state.get("user")
+    if user:
+        # Every other tab signed in to this account is invalidated too.
+        server_state.revoke(server_state.account_key(user))
     reset_session()
     st.session_state.pop("signup_role", None)
     if google_session:
         st.logout()
     else:
         st.rerun()
+
+
+def enforce_session(user) -> bool:
+    """Sign this tab out if the account was signed out (or re-signed-in) elsewhere.
+
+    Returns True when the tab is still valid. When it isn't, the session is
+    cleared and the login page is shown with a short explanation, so a stale tab
+    can't keep using protected pages until someone happens to refresh it.
+    """
+    if not server_state.session_is_stale(user):
+        return True
+    reset_session()
+    st.session_state["signed_out_elsewhere"] = True
+    st.rerun()
+    return False
+
+
+def signed_out_elsewhere_notice() -> None:
+    if st.session_state.pop("signed_out_elsewhere", False):
+        st.warning("You were signed out because this account was signed out (or signed in again) in another tab or window.")
+
+
+def warn_before_leaving(active: bool) -> None:
+    """Ask the browser to confirm before a refresh or Back throws away unsaved work.
+
+    Streamlit hands us an iframe, so the handler is installed on the parent
+    document. The browser shows its own generic wording; the text below is only
+    a fallback for very old engines.
+    """
+    from streamlit.components.v1 import html
+
+    state = "true" if active else "false"
+    html(
+        f"""
+        <script>
+        (function () {{
+          const parentWindow = window.parent;
+          if (!parentWindow) return;
+          if (parentWindow.__mcqUnloadGuard === undefined) {{
+            parentWindow.__mcqUnloadGuard = false;
+            parentWindow.addEventListener('beforeunload', function (event) {{
+              if (!parentWindow.__mcqUnloadGuard) return;
+              event.preventDefault();
+              event.returnValue = 'You have an assessment in progress that has not been published yet.';
+              return event.returnValue;
+            }});
+          }}
+          parentWindow.__mcqUnloadGuard = {state};
+        }})();
+        </script>
+        """,
+        height=0,
+    )

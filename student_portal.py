@@ -222,6 +222,23 @@ def start_attempt(user, quiz) -> None:
     )
 
 
+def _answer_from_widget(question: dict, value):
+    """Normalise one answer widget's value into what the payload stores.
+
+    Returns `None` when the question should count as unanswered.
+    """
+    question_type = question.get("question_type")
+    if question_type in TEXT_ANSWER_TYPES:
+        typed = str(value or "").strip()
+        return typed or None
+    if question_type == SELECT_ALL_TYPE:
+        labels = [str(choice).split(")", 1)[0] for choice in (value or [])]
+        return labels or None
+    if not value:
+        return None
+    return str(value).split(")", 1)[0]
+
+
 # Re-runs on a timer so the countdown moves and time-up submits without the
 # student having to click anything.
 @st.fragment(run_every=5)
@@ -241,6 +258,24 @@ def take_attempt(user, attempt_id: int) -> None:
         st.session_state.pop("attempt_id", None)
         st.session_state.time_up_title = attempt["title"]
         st.rerun()
+
+    def _record(index: int, widget_key: str) -> None:
+        """Store one answer the moment it changes.
+
+        Answers used to live in an `st.form`, which meant nothing reached the
+        server until the student pressed a button. If the clock ran out first,
+        the automatic submission scored an empty attempt — a student could
+        answer every question, run out of time, and be marked zero. Saving on
+        each change means the stored attempt is always what is on screen.
+        """
+        stored = _answer_from_widget(questions[index], st.session_state.get(widget_key))
+        if stored is None:
+            answers.pop(str(index), None)
+        else:
+            answers[str(index)] = stored
+        payload["answers"] = answers
+        save_attempt_answers(attempt_id, json.dumps(payload))
+
     st.divider()
     heading, clock = st.columns([3, 1.4], vertical_alignment="center")
     with heading:
@@ -255,63 +290,39 @@ def take_attempt(user, attempt_id: int) -> None:
             f'<span class="clock">{total_seconds // 60}:{total_seconds % 60:02d}</span></div>',
             unsafe_allow_html=True,
         )
-    with st.form(f"attempt-{attempt_id}"):
-        for index, question in enumerate(questions):
-            labels = [f"{label}) {text}" for label, text in question["options"]]
-            if question.get("question_type") in TEXT_ANSWER_TYPES:
-                typed = st.text_input(
-                    f"{index + 1}. {question['text']}",
-                    value=answers.get(str(index), ""),
-                    max_chars=question.get("limit") or grading.MAX_TEXT_LIMIT,
-                    help=question.get("hint"),
-                    placeholder=question.get("hint", "Your answer"),
-                    key=f"q-{attempt_id}-{index}",
-                )
-                if typed.strip():
-                    answers[str(index)] = typed.strip()
-                else:
-                    answers.pop(str(index), None)
-            elif question.get("question_type") == SELECT_ALL_TYPE:
-                current = [f"{label}) {text}" for label, text in question["options"] if label in answers.get(str(index), [])]
-                choices = st.multiselect(f"{index + 1}. {question['text']}", labels, default=current, key=f"q-{attempt_id}-{index}")
-                if choices:
-                    answers[str(index)] = [choice.split(")", 1)[0] for choice in choices]
-                else:
-                    answers.pop(str(index), None)
-            else:
-                current = next((label for label in labels if label.startswith(f"{answers.get(str(index), '')})")), None)
-                choice = st.radio(f"{index + 1}. {question['text']}", labels, index=labels.index(current) if current in labels else None, key=f"q-{attempt_id}-{index}")
-                if choice: answers[str(index)] = choice.split(")", 1)[0]
-        st.divider()
-        save, submit = st.columns(2)
-        save_clicked = save.form_submit_button("Save progress", width="stretch")
-        submit_clicked = submit.form_submit_button("Submit quiz", type="primary", width="stretch")
-        st.caption("Saving lets you come back later. Submitting is final unless your teacher allowed retakes.")
-    if save_clicked:
-        payload["answers"] = answers; update_answers(attempt_id, payload); st.success("Progress saved."); st.rerun(scope="fragment")
-    if submit_clicked:
-        payload["answers"] = answers; submit_attempt(attempt, payload, False); st.session_state.pop("attempt_id", None); st.rerun()
-
-
-def update_answers(attempt_id: int, payload: dict) -> None:
-    save_attempt_answers(attempt_id, json.dumps(payload))
-
-
-def _is_correct(question: dict, given) -> bool:
-    question_type = question.get("question_type")
-    if question_type == SELECT_ALL_TYPE:
-        return set(given or []) == set(question["correct"])
-    if question_type in TEXT_ANSWER_TYPES:
-        correct = question.get("correct")
-        spec = correct if isinstance(correct, dict) else grading.build_spec(str(correct or ""))
-        return grading.grade(spec, given)
-    return given == question["correct"]
+    for index, question in enumerate(questions):
+        widget_key = f"q-{attempt_id}-{index}"
+        labels = [f"{label}) {text}" for label, text in question["options"]]
+        if question.get("question_type") in TEXT_ANSWER_TYPES:
+            st.text_input(
+                f"{index + 1}. {question['text']}",
+                value=answers.get(str(index), ""),
+                max_chars=question.get("limit") or grading.MAX_TEXT_LIMIT,
+                help=question.get("hint"),
+                placeholder=question.get("hint", "Your answer"),
+                key=widget_key, on_change=_record, args=(index, widget_key),
+            )
+        elif question.get("question_type") == SELECT_ALL_TYPE:
+            current = [f"{label}) {text}" for label, text in question["options"] if label in answers.get(str(index), [])]
+            st.multiselect(f"{index + 1}. {question['text']}", labels, default=current,
+                           key=widget_key, on_change=_record, args=(index, widget_key))
+        else:
+            current = next((label for label in labels if label.split(")", 1)[0] == answers.get(str(index))), None)
+            st.radio(f"{index + 1}. {question['text']}", labels,
+                     index=labels.index(current) if current in labels else None,
+                     key=widget_key, on_change=_record, args=(index, widget_key))
+    st.divider()
+    st.caption("Your answers save as you go, so you can come back later or run out of time without losing them. "
+               "Submitting is final unless your teacher allowed retakes.")
+    if st.button("Submit quiz", type="primary", width="stretch", key=f"submit-{attempt_id}"):
+        payload["answers"] = answers
+        submit_attempt(attempt, payload, False)
+        st.session_state.pop("attempt_id", None)
+        st.rerun()
 
 
 def submit_attempt(attempt, payload: dict, automatic: bool) -> None:
-    correct = sum(
-        _is_correct(question, payload["answers"].get(str(index)))
-        for index, question in enumerate(payload["questions"])
-    )
-    score = (correct / len(payload["questions"]) * 100) if payload["questions"] else 0
+    # `grading.score_payload` is the same marking the teacher-side regrade uses,
+    # so a rescored attempt can never disagree with its original submission.
+    score = grading.score_payload(payload)
     complete_attempt(attempt["id"], json.dumps(payload), score, int(score >= attempt["passing_score"]), int(automatic))

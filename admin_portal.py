@@ -5,7 +5,8 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from ui import page_header
+import server_state
+from ui import flash, page_header, show_flash
 from repository import (add_admin, admins_list, assign_role, create_user, remove_admin,
                         remove_user, update_admin, update_user, users_by_role)
 
@@ -28,22 +29,35 @@ def role_section() -> None:
         if not accounts:
             st.info("No accounts yet.")
             return
-        options = {row["id"]: f"{row['name']}  ·  {row['email']}  ·  {row['role']}" for row in accounts}
+        show_flash("role")
+        # The label deliberately leaves the role out. A selectbox keeps showing the
+        # label it was rendered with, so baking in a value that this very control
+        # changes would leave the closed box insisting on the old role.
+        options = {row["id"]: f"{row['name']}  ·  {row['email']}" for row in accounts}
+        by_id = {row["id"]: row for row in accounts}
         pick, choose = st.columns([3, 2])
         with pick:
             user_id = st.selectbox("Select account", list(options), format_func=options.get, key="role-select")
         with choose:
             role = st.selectbox("New role", ["student", "teacher", "admin"], key="role-new")
+        current = by_id[user_id]["role"]
+        st.caption(f"Currently a **{current}**.")
         if role == "admin":
             st.caption("Promoting to administrator moves the account into the administrators table; they sign in with Google.")
         if st.button("Change role", type="primary", key="role-assign", width="stretch"):
-            try:
-                assign_role(user_id, role)
-            except ValueError as exc:
-                st.error(str(exc))
+            if role == current:
+                st.info(f"{by_id[user_id]['name']} is already a {current}.")
             else:
-                st.success("Role updated.")
-                st.rerun()
+                try:
+                    assign_role(user_id, role)
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    # Any tab that account has open is now signed in under the old
+                    # role, so end those sessions and make them sign in again.
+                    server_state.revoke(server_state.account_key(by_id[user_id]))
+                    flash("role", f"{by_id[user_id]['name']} is now a {role}.")
+                    st.rerun()
 
 
 def user_section(title: str, caption: str, role: str, prefix: str) -> None:
@@ -51,6 +65,7 @@ def user_section(title: str, caption: str, role: str, prefix: str) -> None:
     with st.container(border=True):
         st.subheader(title)
         st.caption(caption)
+        show_flash(prefix)
         rows = users_by_role(role)
         if rows:
             st.dataframe(pd.DataFrame([{"Name": row["name"], "Email": row["email"]} for row in rows]), width="stretch", hide_index=True)
@@ -68,7 +83,7 @@ def user_section(title: str, caption: str, role: str, prefix: str) -> None:
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                st.success(f"{add_name.strip()} was added as a {singular}.")
+                flash(prefix, f"{add_name.strip()} was added as a {singular}.")
                 st.rerun()
         if rows:
             st.divider()
@@ -86,7 +101,7 @@ def user_section(title: str, caption: str, role: str, prefix: str) -> None:
                 except ValueError as exc:
                     st.error(str(exc))
                 else:
-                    st.success("Changes saved.")
+                    flash(prefix, f"Changes to {edit_options[edit_id]} saved.")
                     st.rerun()
             st.divider()
             st.markdown(f"**Remove {singular}**")
@@ -98,7 +113,9 @@ def user_section(title: str, caption: str, role: str, prefix: str) -> None:
                 except ValueError as exc:
                     st.error(str(exc))
                 else:
-                    st.success(f"{singular.title()} removed.")
+                    # Don't leave a deleted account signed in somewhere.
+                    server_state.revoke(server_state.account_key({"email": remove_options[remove_id]}))
+                    flash(prefix, f"{singular.title()} {remove_options[remove_id]} removed.")
                     st.rerun()
 
 
@@ -106,6 +123,7 @@ def admins_section(user) -> None:
     with st.container(border=True):
         st.subheader("Administrators")
         st.caption("Accounts that can log in and manage this workspace.")
+        show_flash("admins")
         rows = admins_list()
         if rows:
             st.dataframe(pd.DataFrame([{"Email": row["email"], "Name": row["name"]} for row in rows]), width="stretch", hide_index=True)
@@ -123,7 +141,7 @@ def admins_section(user) -> None:
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                st.success(f"{add_name.strip() or add_email.strip()} was added as an administrator.")
+                flash("admins", f"{add_name.strip() or add_email.strip()} was added as an administrator.")
                 st.rerun()
         if rows:
             st.divider()
@@ -141,7 +159,7 @@ def admins_section(user) -> None:
                 except ValueError as exc:
                     st.error(str(exc))
                 else:
-                    st.success("Changes saved.")
+                    flash("admins", f"Changes to {edit_options[edit_id]} saved.")
                     st.rerun()
             st.divider()
             st.markdown("**Remove administrator**")
@@ -156,5 +174,5 @@ def admins_section(user) -> None:
                     except ValueError as exc:
                         st.error(str(exc))
                     else:
-                        st.success("Administrator removed.")
+                        flash("admins", f"Administrator {remove_options[remove_id]} removed.")
                         st.rerun()

@@ -7,7 +7,9 @@ import hashlib
 import hmac
 import json
 import secrets
+from datetime import datetime, timedelta, timezone
 
+import grading
 from db import client, utc_now
 
 _PBKDF2_ITERATIONS = 200_000
@@ -281,7 +283,21 @@ def join_teacher(student_id: int, teacher_id: int) -> bool:
 
 
 def leave_teacher(student_id: int, teacher_id: int) -> None:
-    client().table("teacher_students").delete().eq("teacher_id", teacher_id).eq("student_id", student_id).execute()
+    """Leave a teacher's roster and give up their assessments with it.
+
+    Dropping only the roster row left the student assigned to that teacher's
+    quizzes, so they kept seeing them on their dashboard — and could still take
+    them — after leaving the class. Attempt history is untouched; only the
+    assignments go.
+    """
+    supabase = client()
+    supabase.table("teacher_students").delete().eq("teacher_id", teacher_id).eq("student_id", student_id).execute()
+    supabase.table("team_students").delete().eq("student_id", student_id).in_(
+        "team_id", [team["id"] for team in teams_for_teacher(teacher_id)] or [-1]
+    ).execute()
+    quiz_ids = [quiz["id"] for quiz in quizzes_for_teacher(teacher_id)]
+    if quiz_ids:
+        supabase.table("quiz_students").delete().eq("student_id", student_id).in_("quiz_id", quiz_ids).execute()
 
 
 def teams_for_teacher(teacher_id: int):
@@ -428,8 +444,33 @@ def set_quiz_assignments(quiz_id: int, student_ids: list[int]) -> None:
         ).execute()
 
 
+_DUPLICATE_PUBLISH_WINDOW_SECONDS = 30
+
+
+def recent_duplicate_quiz(owner_id: int, title: str) -> int | None:
+    """The id of an identically titled quiz this teacher created moments ago, if any.
+
+    A double-clicked Publish button queues a second run; the UI blocks that, and
+    this is the backstop for clicks that land in separate sessions or survive a
+    reconnect. Two deliberate quizzes with the same name half a minute apart is
+    not a thing teachers do.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_DUPLICATE_PUBLISH_WINDOW_SECONDS)).isoformat()
+    rows = _rows(
+        client().table("quizzes").select("id,created_at")
+        .eq("owner_id", owner_id).eq("title", title)
+        .gte("created_at", cutoff)
+        .order("created_at", desc=True).limit(1)
+        .execute()
+    )
+    return rows[0]["id"] if rows else None
+
+
 def create_quiz(owner_id: int, title: str, duration: int, passing: int, allow_retake: bool, show_average: bool, opening_time: str, closing_time: str, student_ids: list[int], opening_enabled: bool = True, closing_enabled: bool = True, randomize_questions: bool = True, randomize_answers: bool = True) -> int:
     supabase = client()
+    duplicate = recent_duplicate_quiz(owner_id, title)
+    if duplicate is not None:
+        return duplicate
     row = _rows(
         supabase.table("quizzes").insert(
             {
@@ -452,21 +493,33 @@ def create_quiz(owner_id: int, title: str, duration: int, passing: int, allow_re
 
 
 def save_question_bank(quiz_id: int, questions: list[dict]) -> None:
+    """Replace a quiz's questions with `questions`.
+
+    The new rows go in *before* the old ones come out, so a failed write leaves
+    the previous question bank intact rather than emptying the quiz. An empty
+    list is refused outright: every route into here is an editor saving work,
+    and "save" must never mean "delete everything".
+    """
+    if not questions:
+        raise ValueError("A quiz needs at least one question. Saving an empty question bank would erase the existing ones.")
     supabase = client()
-    supabase.table("questions").delete().eq("quiz_id", quiz_id).execute()
-    if questions:
-        records = [
-            {
-                "quiz_id": quiz_id, "question_text": q["question_text"],
-                "options_json": json.dumps(q["options"]),
-                "correct_label": json.dumps(q["correct_label"]) if isinstance(q["correct_label"], (list, dict)) else q["correct_label"],
-                "question_type": q.get("question_type", "Multiple choice"),
-                "position": i,
-            }
-            for i, q in enumerate(questions)
-        ]
-        supabase.table("questions").insert(records).execute()
-        supabase.table("quizzes").update({"status": "active"}).eq("id", quiz_id).execute()
+    previous_ids = [row["id"] for row in _rows(
+        supabase.table("questions").select("id").eq("quiz_id", quiz_id).execute()
+    )]
+    records = [
+        {
+            "quiz_id": quiz_id, "question_text": q["question_text"],
+            "options_json": json.dumps(q["options"]),
+            "correct_label": json.dumps(q["correct_label"]) if isinstance(q["correct_label"], (list, dict)) else q["correct_label"],
+            "question_type": q.get("question_type", "Multiple choice"),
+            "position": i,
+        }
+        for i, q in enumerate(questions)
+    ]
+    supabase.table("questions").insert(records).execute()
+    if previous_ids:
+        supabase.table("questions").delete().in_("id", previous_ids).execute()
+    supabase.table("quizzes").update({"status": "active"}).eq("id", quiz_id).execute()
 
 
 def update_quiz_settings(quiz_id: int, duration: int, passing: int, allow_retake: bool, show_average: bool, opening_time: str, closing_time: str, opening_enabled: bool, closing_enabled: bool, randomize_questions: bool = True, randomize_answers: bool = True) -> None:
@@ -639,14 +692,17 @@ def available_quizzes(student_id: int, owner_id: int | None = None):
 
 
 def quiz_average_score(quiz_id: int):
-    """Average score (percent) across completed attempts for a quiz, or None."""
-    rows = _rows(
-        client().table("attempts").select("score_percent")
-        .eq("quiz_id", quiz_id)
-        .not_.is_("submitted_at", None)
-        .execute()
-    )
-    scores = [row.get("score_percent") for row in rows if row.get("score_percent") is not None]
+    """Average score (percent) across completed student attempts for a quiz, or None.
+
+    The teacher's own preview attempts are excluded. They are already left out
+    of the teacher's analytics, and leaving them in here meant the "class
+    average" shown to students moved every time their teacher tried the quiz.
+    """
+    quiz = get_quiz(quiz_id)
+    query = client().table("attempts").select("score_percent").eq("quiz_id", quiz_id).not_.is_("submitted_at", None)
+    if quiz:
+        query = query.neq("student_id", quiz["owner_id"])
+    scores = [row.get("score_percent") for row in _rows(query.execute()) if row.get("score_percent") is not None]
     return (sum(scores) / len(scores)) if scores else None
 
 
@@ -720,6 +776,80 @@ def quiz_has_attempts(quiz_id: int, exclude_student_id: int | None = None) -> bo
     if exclude_student_id is not None:
         query = query.neq("student_id", exclude_student_id)
     return bool(_rows(query.limit(1).execute()))
+
+
+def quiz_attempt_counts(quiz_id: int, exclude_student_id: int | None = None) -> dict:
+    """How many attempts on this quiz are still open, and how many are submitted."""
+    query = client().table("attempts").select("id,submitted_at").eq("quiz_id", quiz_id)
+    if exclude_student_id is not None:
+        query = query.neq("student_id", exclude_student_id)
+    rows = _rows(query.execute())
+    submitted = sum(1 for row in rows if row.get("submitted_at"))
+    return {"open": len(rows) - submitted, "submitted": submitted}
+
+
+def _refreshed_correct(question_row: dict):
+    """The answer key for a question row, in the shape a frozen attempt stores it."""
+    question_type = question_row.get("question_type", "Multiple choice")
+    if question_type in grading.TEXT_QUESTION_TYPES:
+        return grading.answer_spec(question_row)
+    if question_type == grading.SELECT_ALL_TYPE:
+        try:
+            return json.loads(question_row["correct_label"])
+        except (TypeError, ValueError):
+            return []
+    return question_row["correct_label"]
+
+
+def regrade_quiz(quiz_id: int, exclude_student_id: int | None = None) -> dict:
+    """Re-mark every submitted attempt against the quiz's current answer key.
+
+    Attempts freeze the questions they were built from, so correcting a wrong
+    answer key only helps students who start afterwards. This walks the frozen
+    copies, matches each one to a live question by its text, refreshes the stored
+    answer key and rescores. Questions the teacher has since reworded or deleted
+    keep the key they were graded under, because there is nothing to match them
+    to and guessing would be worse than leaving them alone.
+
+    Returns a summary: attempts looked at, attempts whose score moved, and how
+    many frozen questions could not be matched.
+    """
+    current = questions_for_quiz(quiz_id)
+    by_text: dict[str, dict] = {}
+    for row in current:
+        by_text.setdefault(grading.normalise_text(row["question_text"]), row)
+
+    query = client().table("attempts").select("*").eq("quiz_id", quiz_id).not_.is_("submitted_at", None)
+    if exclude_student_id is not None:
+        query = query.neq("student_id", exclude_student_id)
+    attempts = _rows(query.execute())
+
+    quiz = get_quiz(quiz_id)
+    passing_score = quiz["passing_score"] if quiz else 0
+    changed, unmatched = 0, 0
+    for attempt in attempts:
+        try:
+            payload = json.loads(attempt["answers_json"])
+        except (TypeError, ValueError):
+            continue
+        frozen = payload.get("questions") or []
+        if not frozen:
+            continue
+        for question in frozen:
+            match = by_text.get(grading.normalise_text(question.get("text", "")))
+            if match is None or match.get("question_type") != question.get("question_type"):
+                unmatched += 1
+                continue
+            question["correct"] = _refreshed_correct(match)
+        score = grading.score_payload(payload)
+        passed = int(score >= passing_score)
+        if abs((attempt.get("score_percent") or 0) - score) < 1e-9 and attempt.get("passed") == passed:
+            continue
+        changed += 1
+        client().table("attempts").update(
+            {"answers_json": json.dumps(payload), "score_percent": score, "passed": passed}
+        ).eq("id", attempt["id"]).execute()
+    return {"attempts": len(attempts), "changed": changed, "unmatched": unmatched}
 
 
 def _admin_row(email: str) -> dict | None:
@@ -810,18 +940,25 @@ def assign_role(user_id: int, role: str) -> None:
     user = user_rows[0]
     if role == "admin":
         existing = _rows(supabase.table("admins").select("*").ilike("email", user["email"]).limit(1).execute())
+        created_admin_id = None
         if existing:
             supabase.table("admins").update({"name": user["name"]}).eq("id", existing[0]["id"]).execute()
         else:
             # Random password keeps the universal-login form locked; Google is
             # the intended sign-in for promoted administrators.
-            supabase.table("admins").insert(
+            created = _rows(supabase.table("admins").insert(
                 {"email": user["email"].lower(), "password": hash_password(secrets.token_hex(16)),
                  "name": user["name"], "created_at": utc_now()}
-            ).execute()
+            ).select("id").execute())
+            created_admin_id = created[0]["id"] if created else None
         try:
             supabase.table("users").delete().eq("id", user_id).execute()
         except Exception:
+            # The promotion failed half-way. Take the new administrator back out
+            # again, or the account would end up holding admin access *and* its
+            # original teacher/student role.
+            if created_admin_id is not None:
+                supabase.table("admins").delete().eq("id", created_admin_id).execute()
             raise ValueError("That account has existing activity and can't be converted to an administrator.")
     else:
         supabase.table("users").update({"role": role}).eq("id", user_id).execute()
