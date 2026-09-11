@@ -92,9 +92,13 @@ def user_section(title: str, caption: str, role: str, prefix: str) -> None:
             edit_id = st.selectbox(f"Select {singular}", list(edit_options), format_func=edit_options.get, key=f"{prefix}-edit-select")
             selected = next(row for row in rows if row["id"] == edit_id)
             edit_cols = st.columns(3)
-            with edit_cols[0]: edit_name = st.text_input("Name", value=selected["name"], key=f"{prefix}-edit-name")
-            with edit_cols[1]: edit_email = st.text_input("Email", value=selected["email"], key=f"{prefix}-edit-email")
-            with edit_cols[2]: edit_password = st.text_input("New password", type="password", key=f"{prefix}-edit-password")
+            # The key carries the account id. A text box keeps whatever its key
+            # already holds and ignores `value`, so a shared key left the boxes
+            # showing the previously selected person after the picker moved on --
+            # and saving then wrote their name onto this account.
+            with edit_cols[0]: edit_name = st.text_input("Name", value=selected["name"], key=f"{prefix}-edit-name-{edit_id}")
+            with edit_cols[1]: edit_email = st.text_input("Email", value=selected["email"], key=f"{prefix}-edit-email-{edit_id}")
+            with edit_cols[2]: edit_password = st.text_input("New password", type="password", key=f"{prefix}-edit-password-{edit_id}")
             if st.button("Save changes", key=f"{prefix}-edit-save", width="stretch"):
                 try:
                     update_user(edit_id, edit_name, edit_email, edit_password or None)
@@ -150,9 +154,10 @@ def admins_section(user) -> None:
             edit_id = st.selectbox("Select administrator", list(edit_options), format_func=edit_options.get, key="admins-edit-select")
             selected = next(row for row in rows if row["id"] == edit_id)
             edit_cols = st.columns(3)
-            with edit_cols[0]: edit_email = st.text_input("Email", value=selected["email"], key="admins-edit-email")
-            with edit_cols[1]: edit_name = st.text_input("Name", value=selected["name"], key="admins-edit-name")
-            with edit_cols[2]: edit_password = st.text_input("New password", type="password", key="admins-edit-password")
+            # Keyed by admin id for the same reason as the accounts above.
+            with edit_cols[0]: edit_email = st.text_input("Email", value=selected["email"], key=f"admins-edit-email-{edit_id}")
+            with edit_cols[1]: edit_name = st.text_input("Name", value=selected["name"], key=f"admins-edit-name-{edit_id}")
+            with edit_cols[2]: edit_password = st.text_input("New password", type="password", key=f"admins-edit-password-{edit_id}")
             if st.button("Save changes", key="admins-edit-save", width="stretch"):
                 try:
                     update_admin(edit_id, edit_email, edit_name, edit_password or None)
