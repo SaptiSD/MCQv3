@@ -12,8 +12,8 @@ import grading
 from repository import (all_teachers, attempt_with_quiz, attempts_for_student, available_quizzes,
                         complete_attempt, create_attempt, join_teacher, leave_teacher,
                         open_attempt, questions_for_quiz, quiz_average_score,
-                        save_attempt_answers, search_teachers, teachers_for_student)
-from ui import empty_state, metric_row, page_header, pill, sign_out
+                        save_attempt_answers, search_teachers, submitted_attempt, teachers_for_student)
+from ui import empty_state, metric_row, page_header, percent, pill, require_session, sign_out
 
 
 SELECT_ALL_TYPE = "Multiple choice - select all that apply"
@@ -87,6 +87,9 @@ def dashboard(user) -> None:
     timed_out = st.session_state.pop("time_up_title", None)
     if timed_out:
         st.warning(f"Time ran out on **{timed_out}**. Your answers were submitted automatically.")
+    blocked = st.session_state.pop("retake_blocked", None)
+    if blocked:
+        st.warning(f"**{blocked}** has already been submitted and your teacher didn't allow retakes.")
 
     quizzes = available_quizzes(user["id"], user["id"] if previewing else None)
     attempts = attempts_for_student(user["id"])
@@ -139,7 +142,7 @@ def dashboard(user) -> None:
                         class_average = quiz_average_score(quiz["id"])
                         if class_average is not None:
                             average = f"  ·  class average {class_average:.0f}%"
-                    st.markdown(f"Your score: **{attempt['score_percent']:.0f}%**{average}")
+                    st.markdown(f"Your score: **{percent(attempt['score_percent'])}**{average}")
             with action:
                 if submitted and not quiz["allow_retake"]:
                     st.caption("Completed — no retakes")
@@ -186,6 +189,12 @@ def start_attempt(user, quiz) -> None:
     existing = open_attempt(quiz["id"], user["id"])
     if existing:
         st.session_state.attempt_id = existing["id"]; return
+    if not quiz["allow_retake"] and submitted_attempt(quiz["id"], user["id"]):
+        # "Completed — no retakes" is only a rendering decision on the dashboard,
+        # so a second tab still showing "Start quiz" (or a stale card in this
+        # one) could open a fresh attempt on a quiz with retakes switched off.
+        st.session_state.retake_blocked = quiz["title"]
+        return
     questions = list(questions_for_quiz(quiz["id"]))
     if quiz["randomize_questions"]: random.shuffle(questions)
     frozen = []
@@ -243,11 +252,26 @@ def _answer_from_widget(question: dict, value):
 # student having to click anything.
 @st.fragment(run_every=5)
 def take_attempt(user, attempt_id: int) -> None:
+    # This fragment re-runs on a timer as well as on every answer, and neither
+    # re-executes the main script body, so it has to check for itself that the
+    # account is still signed in here.
+    if not require_session(user):
+        return
     attempt = attempt_with_quiz(attempt_id, user["id"])
     if not attempt:
         st.session_state.pop("attempt_id", None)
         return
-    payload = json.loads(attempt["answers_json"]); questions = payload["questions"]; answers = payload["answers"]
+    try:
+        payload = json.loads(attempt["answers_json"] or "{}")
+        questions = payload["questions"]
+        answers = payload.setdefault("answers", {})
+    except (ValueError, TypeError, KeyError):
+        # An attempt row whose frozen question list never made it to the
+        # database. Left unhandled this raised on every five-second refresh and
+        # the student had no way past it.
+        st.session_state.pop("attempt_id", None)
+        st.error("This attempt could not be opened. Ask your teacher to reset it for you.")
+        return
     if attempt["submitted_at"]:
         # Already scored (time ran out, or another tab submitted it).
         st.session_state.pop("attempt_id", None)
@@ -269,6 +293,16 @@ def take_attempt(user, attempt_id: int) -> None:
         each change means the stored attempt is always what is on screen.
         """
         stored = _answer_from_widget(questions[index], st.session_state.get(widget_key))
+        # Re-read before writing. The whole payload goes back on every change, so
+        # a second tab holding an older copy of `answers` used to erase whatever
+        # had been answered in this one.
+        latest = attempt_with_quiz(attempt_id, user["id"])
+        if latest:
+            try:
+                stored_payload = json.loads(latest["answers_json"] or "{}")
+                answers.update(stored_payload.get("answers") or {})
+            except (ValueError, TypeError):
+                pass
         if stored is None:
             answers.pop(str(index), None)
         else:

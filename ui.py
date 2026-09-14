@@ -191,6 +191,19 @@ def when(timestamp) -> str:
     return moment.astimezone().strftime("%b %d, %I:%M %p").replace(" 0", " ")
 
 
+def percent(value) -> str:
+    """Format a score so rounding can't contradict the pass mark.
+
+    Two right out of three is 66.66...%, which `:.0f` renders as "67%" -- beside
+    a "Try again" badge on a quiz that passes at 67. Keeping the decimal when
+    there is one removes the contradiction without changing anybody's grade.
+    """
+    if value is None:
+        return "-"
+    rounded = round(float(value), 1)
+    return f"{rounded:.0f}%" if rounded == int(rounded) else f"{rounded:.1f}%"
+
+
 def flash(slot: str, message: str) -> None:
     """Queue a confirmation to show after the rerun that follows an action.
 
@@ -255,12 +268,12 @@ def _login_panel(side: str, eyebrow: str, heading: str, blurb: str, google_ready
             try:
                 user = authenticate(identifier, password, expected_role=side)
             except PortalMismatch as mismatch:
-                other = "Students" if mismatch.role == "student" else "Teachers & administrators"
-                st.error(f"That's {'an' if mismatch.role == 'admin' else 'a'} {ROLE_LABELS[mismatch.role]} account — sign in under **{other}**.")
+                st.error(portal_mismatch_message(mismatch.role))
             else:
                 if user is None:
                     st.error("No account matches that name, email, or password.")
                 else:
+                    st.session_state.pop("needs_sign_in", None)
                     st.session_state.user = user
                     # Adopt the account's current epoch. Signing in deliberately
                     # does *not* bump it: a teacher working in two tabs signs in
@@ -269,9 +282,16 @@ def _login_panel(side: str, eyebrow: str, heading: str, blurb: str, google_ready
                     st.rerun()
         if google_ready:
             if st.button("Continue with Google", key=f"google-{side}", width="stretch"):
+                st.session_state.pop("needs_sign_in", None)
                 st.session_state.signup_role = side
                 st.login("google")
             st.caption(f"New here? Signing in with Google from this side creates a {ROLE_LABELS[side]} account.")
+
+
+def portal_mismatch_message(role: str) -> str:
+    other = "Students" if role == "student" else "Teachers & administrators"
+    article = "an" if role == "admin" else "a"
+    return f"That's {article} {ROLE_LABELS[role]} account — sign in under **{other}**."
 
 
 def login_page() -> None:
@@ -367,12 +387,16 @@ def workspace_nav(user, selected_page: str | None = None) -> str:
 
 @st.dialog("Discard unsaved changes?")
 def confirm_discard_dialog() -> None:
-    st.write("You have an assessment in progress. Your questions and settings **won't be saved** if you leave now.")
+    st.write("You have an assessment in progress. It hasn't been published, so students can't see it yet.")
+    st.caption("Leaving keeps the draft — you'll find it waiting under **Create quiz**. Use **Discard draft** there to throw it away.")
     leave, cancel = st.columns(2)
     if leave.button("Continue", key="confirm-discard-leave", type="primary", width="stretch"):
         target = st.session_state.pop("create_nav_request", None)
         st.session_state.pop("create_nav_guard", None)
         st.session_state.pop("create_dirty", None)
+        # Leaving mid-publish must not carry the guard to the next page, where
+        # nothing would ever clear it.
+        st.session_state.pop("publish_in_flight", None)
         if target == "Sign out":
             sign_out()
             return
@@ -397,15 +421,23 @@ def google_user():
     email = (st.user.email or "").lower()
     if not email:
         return None
+    panel = st.session_state.get("signup_role")
     admin = admin_by_email(email)
     if admin:
+        # Administrators belong on the teacher side, the same rule the password
+        # login enforces. Without this an admin could click Google under
+        # "Students" and land in the admin console anyway.
+        if panel == "student":
+            raise PortalMismatch("admin")
         return admin
     existing = user_by_email(email)
     if existing and existing["role"] in ("teacher", "student"):
+        if panel in ("teacher", "student") and existing["role"] != panel:
+            raise PortalMismatch(existing["role"])
         session = dict(existing)
         session.pop("password", None)
         return session
-    role = st.session_state.get("signup_role")
+    role = panel
     if role not in ("teacher", "student"):
         return None
     name = st.user.name or email.split("@")[0]
@@ -419,7 +451,10 @@ def google_user():
     return session
 
 
-PRESERVED_KEYS = {"signup_role"}
+# Nothing survives a session reset. `signup_role` used to, which meant a tab
+# whose account had just been removed re-created it -- with the role from the
+# panel that tab had signed in through -- on its very next interaction.
+PRESERVED_KEYS: set[str] = set()
 
 
 def reset_session() -> None:
@@ -448,13 +483,33 @@ def enforce_session(user) -> bool:
     Returns True when the tab is still valid. When it isn't, the session is
     cleared and the login page is shown with a short explanation, so a stale tab
     can't keep using protected pages until someone happens to refresh it.
+
+    `scope="app"` matters: this is also called from inside fragments and dialogs,
+    and a fragment-scoped rerun would redraw the fragment while leaving the
+    signed-out tab exactly where it was.
     """
     if not server_state.session_is_stale(user):
         return True
     reset_session()
     st.session_state["signed_out_elsewhere"] = True
-    st.rerun()
+    # Until someone signs in deliberately, a still-valid Google cookie must not
+    # be allowed to re-seat the session on the next rerun -- that turned a
+    # sign-out (or an account removal) into a no-op.
+    st.session_state["needs_sign_in"] = True
+    st.rerun(scope="app")
     return False
+
+
+def require_session(user) -> bool:
+    """`enforce_session` for code that runs inside a fragment or a dialog.
+
+    A fragment rerun never re-executes the main script body, so the check in
+    `main()` is skipped entirely once a fragment owns the interaction. The quiz
+    manager, the delete dialog and the student attempt are all fragments, so
+    without this a tab signed out in another window could go on editing,
+    publishing, regrading and deleting indefinitely.
+    """
+    return enforce_session(user)
 
 
 def signed_out_elsewhere_notice() -> None:
@@ -462,32 +517,62 @@ def signed_out_elsewhere_notice() -> None:
         st.warning("You were signed out because this account was signed out (or signed in again) in another tab or window.")
 
 
-def warn_before_leaving(active: bool) -> None:
+def warn_before_leaving(active: bool, arm_on_typing: bool = False) -> None:
     """Ask the browser to confirm before a refresh or Back throws away unsaved work.
 
-    Streamlit hands us an iframe, so the handler is installed on the parent
-    document. The browser shows its own generic wording; the text below is only
-    a fallback for very old engines.
+    Two things make this fiddlier than it looks.
+
+    Streamlit runs the snippet inside a component iframe that it tears down and
+    rebuilds on every rerun. A listener registered from inside that iframe is
+    registered with a function belonging to the iframe's realm, and the browser
+    quietly stops calling it once the iframe is gone -- so the guard worked for
+    exactly one rerun and then silently did nothing. The handlers are therefore
+    injected into the parent page's own realm, once, and afterwards the iframe
+    only sets two flags on the parent window.
+
+    The second is timing: a Streamlit input reaches the server only when it
+    loses focus, so a teacher who is still typing has set no "unsaved" flag and
+    used to get no warning at all -- exactly the moment it is worth most. With
+    `arm_on_typing`, the first keystroke arms the guard in the browser, with no
+    round trip.
     """
     from streamlit.components.v1 import html
 
     state = "true" if active else "false"
+    arm = "true" if arm_on_typing else "false"
     html(
         f"""
         <script>
         (function () {{
           const parentWindow = window.parent;
           if (!parentWindow) return;
-          if (parentWindow.__mcqUnloadGuard === undefined) {{
+          if (!parentWindow.__mcqGuardInstalled) {{
+            parentWindow.__mcqGuardInstalled = true;
             parentWindow.__mcqUnloadGuard = false;
-            parentWindow.addEventListener('beforeunload', function (event) {{
-              if (!parentWindow.__mcqUnloadGuard) return;
-              event.preventDefault();
-              event.returnValue = 'You have an assessment in progress that has not been published yet.';
-              return event.returnValue;
-            }});
+            parentWindow.__mcqArmOnInput = false;
+            // Injected so the handlers belong to the page, not to this iframe.
+            const installer = parentWindow.document.createElement('script');
+            installer.textContent = [
+              "(function () {{",
+              "  window.addEventListener('beforeunload', function (event) {{",
+              "    if (!window.__mcqUnloadGuard) return;",
+              "    event.preventDefault();",
+              "    event.returnValue = 'You have an assessment in progress that has not been published yet.';",
+              "    return event.returnValue;",
+              "  }});",
+              "  document.addEventListener('input', function () {{",
+              "    if (window.__mcqArmOnInput) window.__mcqUnloadGuard = true;",
+              "  }}, true);",
+              "}})();"
+            ].join('\\n');
+            parentWindow.document.head.appendChild(installer);
           }}
-          parentWindow.__mcqUnloadGuard = {state};
+          parentWindow.__mcqArmOnInput = {arm};
+          if ({state}) {{
+            parentWindow.__mcqUnloadGuard = true;
+          }} else if (!{arm}) {{
+            parentWindow.__mcqUnloadGuard = false;
+          }}
         }})();
         </script>
         """,

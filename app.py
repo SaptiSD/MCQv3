@@ -11,9 +11,11 @@ from student_portal import choose_teacher_page, dashboard as student_dashboard
 from student_portal import my_teachers_page, needs_a_teacher
 from teacher_portal import create as create_quiz
 from teacher_portal import analytics_page, dashboard as teacher_dashboard
-from teacher_portal import roster_page
+from teacher_portal import has_unpublished_draft, roster_page
+from repository import PortalMismatch
 from ui import (choose_role_page, confirm_discard_dialog, enforce_session, google_user, login_page,
-                signed_out_elsewhere_notice, styles, warn_before_leaving, workspace_nav)
+                portal_mismatch_message, signed_out_elsewhere_notice, styles, warn_before_leaving,
+                workspace_nav)
 
 
 st.set_page_config(page_title="MCQ | Assessment studio", page_icon="M", layout="wide")
@@ -43,17 +45,28 @@ except (httpx.HTTPError, RuntimeError) as exc:
 
 
 def main() -> None:
-    if "user" not in st.session_state:
-        authenticated_user = google_user()
+    mismatch_message = None
+    # A live Google cookie must not silently re-seat a session that was just
+    # signed out (or whose account was removed) elsewhere -- that made the
+    # sign-out invisible. Signing in from the login page clears the gate.
+    if "user" not in st.session_state and not st.session_state.get("needs_sign_in"):
+        try:
+            authenticated_user = google_user()
+        except PortalMismatch as mismatch:
+            authenticated_user = None
+            mismatch_message = portal_mismatch_message(mismatch.role)
+            st.session_state.pop("signup_role", None)
         if authenticated_user:
             st.session_state.user = authenticated_user
             server_state.stamp_session(authenticated_user)
-        elif getattr(st.user, "is_logged_in", False):
+        elif getattr(st.user, "is_logged_in", False) and mismatch_message is None:
             # Signed in with Google but we don't know which side they came from.
             choose_role_page()
             return
     if "user" not in st.session_state:
         signed_out_elsewhere_notice()
+        if mismatch_message:
+            st.error(mismatch_message)
         login_page()
         return
     user = st.session_state.user
@@ -62,6 +75,16 @@ def main() -> None:
     if user["role"] == "student" and needs_a_teacher(user):
         choose_teacher_page(user)
         return
+    if (
+        user["role"] == "teacher"
+        and "current_page" not in st.session_state
+        and "page_override" not in st.session_state
+        and has_unpublished_draft(user)
+    ):
+        # A refresh or a Back button starts a brand-new browser session, which
+        # used to land on the Dashboard with no hint that the half-built quiz
+        # had been kept. Come back to it instead, where the banner explains.
+        st.session_state.page_override = "Create quiz"
     pending_page = st.session_state.get("page_override")
     page = workspace_nav(user, pending_page)
     page = st.session_state.pop("page_override", page)
@@ -110,7 +133,8 @@ def main() -> None:
         confirm_discard_dialog()
     # Refreshing or navigating away mid-build now costs a browser confirmation
     # rather than the whole draft (which is also mirrored server-side).
-    warn_before_leaving(bool(st.session_state.get("create_dirty")))
+    warn_before_leaving(bool(st.session_state.get("create_dirty")),
+                        arm_on_typing=(page == "Create quiz"))
 
 
 try:

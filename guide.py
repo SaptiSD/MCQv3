@@ -281,16 +281,22 @@ def page(user) -> None:
 
     download, spacer = st.columns([2, 5])
     with download:
+        # A callable, not bytes: the PDF embeds its creation time, so building it
+        # on every rerun gave the button a new URL each time and Streamlit
+        # collected the one it replaced -- leaving the browser holding a link
+        # that 404'd. Deferring the render also keeps it off the page load.
         st.download_button(
-            "Download this guide (PDF)", to_pdf(sections, title, subtitle),
-            filename, "application/pdf", type="primary", width="stretch", key="guide-pdf",
+            "Download this guide (PDF)", lambda: to_pdf(sections, title, subtitle),
+            filename, "application/pdf", type="primary", width="stretch",
+            on_click="ignore", key="guide-pdf",
         )
     if not is_student:
         with spacer:
             st.download_button(
                 "Download the student guide (PDF)",
-                to_pdf(STUDENT_GUIDE, "MCQ - Student guide", "How to take assessments on MCQ"),
-                "mcq-student-guide.pdf", "application/pdf", width="stretch", key="guide-pdf-student",
+                lambda: to_pdf(STUDENT_GUIDE, "MCQ - Student guide", "How to take assessments on MCQ"),
+                "mcq-student-guide.pdf", "application/pdf", width="stretch",
+                on_click="ignore", key="guide-pdf-student",
             )
     st.divider()
     render(sections)

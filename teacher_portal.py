@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import uuid
 from datetime import datetime, time, timedelta, timezone
 
 import pandas as pd
@@ -13,8 +14,9 @@ from fpdf import FPDF
 
 import grading
 import server_state
-from ingestion import extract_upload, parse_bank
-from ui import empty_state, flash, metric_row, page_header, pill, show_flash, when
+from ingestion import extract_upload, parse_report
+from ui import (empty_state, flash, metric_row, page_header, percent, pill, require_session,
+                show_flash, when)
 from repository import (add_student_to_roster, assigned_student_ids, create_quiz,
                         delete_quiz, move_question, questions_for_quiz, quiz_attempt_counts,
                         quiz_counts_for_teacher, quiz_for_teacher, quizzes_for_teacher,
@@ -47,6 +49,9 @@ def _question_errors(questions: list[dict]) -> list[str]:
             elif spec.get("format") == grading.NUMBER and grading._to_number(spec["value"]) is None:
                 errors.append(f"Question {index} has a Number answer that isn't a number.")
             continue
+        texts = [str(value).strip().casefold() for _, value in question["options"]]
+        if len(set(texts)) != len(texts):
+            errors.append(f"Question {index} lists the same option text more than once.")
         if len(question["options"]) < 2:
             errors.append(f"Question {index} needs at least two options.")
         labels = question["correct_label"] if question_type == SELECT_ALL_TYPE else [question["correct_label"]]
@@ -78,6 +83,17 @@ DRAFT_NAME = "new_quiz"
 
 def _draft_key() -> str:
     return server_state.account_key(st.session_state.get("user") or {})
+
+
+def has_unpublished_draft(user) -> bool:
+    """Whether this account left a quiz half-built somewhere.
+
+    A refresh throws the browser session away, so the app used to come back on
+    the Dashboard and the teacher had no reason to think their work had survived.
+    `main()` uses this to land them back on Create quiz instead, where the
+    recovery banner is.
+    """
+    return bool(server_state.load_draft(server_state.account_key(user), DRAFT_NAME))
 
 
 def _mirror_draft(form: dict) -> None:
@@ -155,6 +171,10 @@ def typed_answer_editor(prefix: str, read, write=None) -> dict:
 
 @st.dialog("Delete assessment?")
 def delete_quiz_dialog(user, quiz_id: int, title: str) -> None:
+    # A dialog body is a fragment, so `main()`'s session check never re-runs for
+    # the clicks inside it -- and the click inside this one destroys a quiz.
+    if not require_session(user):
+        return
     st.write(f"Delete **{title}** and all its questions, assignments, and results?")
     confirm, cancel = st.columns(2)
     if confirm.button("Yes, delete", key=f"confirm-delete-{quiz_id}", type="primary", width="stretch"):
@@ -251,7 +271,7 @@ def analytics_page(user) -> None:
                 progress = [row for row in progress if search.lower() in row["student"].lower() or search.lower() in row["email"].lower()]
             counts = {status: sum(row["status"] == status for row in progress) for status in ("Not started", "In progress", "Completed")}
             metric_row([(counts["Not started"], "Not started"), (counts["In progress"], "In progress"), (counts["Completed"], "Completed")], per_row=3)
-            st.dataframe(pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": f"{row['score']:.1f}%" if row["score"] is not None else "-", "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress]), width="stretch", hide_index=True)
+            st.dataframe(pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": percent(row["score"]), "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress]), width="stretch", hide_index=True)
         else:
             st.info("No students are assigned to this exam yet.")
 
@@ -264,6 +284,198 @@ def _create_save_setting(key: str) -> None:
     _mirror_draft(st.session_state["new_quiz_data"])
 
 
+def _forget_question(form: dict, index: int) -> None:
+    """Drop every field belonging to question `index` from the draft.
+
+    Removing a question only shrank the count. Streamlit collects the widget
+    state for the rows that stop rendering, but this mirror kept them, so
+    re-adding a question brought the deleted one's text, options and answer
+    back -- and published them.
+    """
+    exact = {f"new-type-{index}", f"new-text-{index}", f"new-correct-{index}",
+             f"new-correct-mc-{index}", f"new-correct-tf-{index}", f"new-correct-all-{index}"}
+    prefixes = (f"new-option-{index}-", f"new-typed-{index}-")
+    for key in [key for key in form if key in exact or key.startswith(prefixes)]:
+        form.pop(key, None)
+
+
+# A publish that never finishes -- a dropped socket, a reload mid-write -- used
+# to leave the guard set and both Publish buttons permanently disabled, with
+# nothing on screen to explain it.
+PUBLISH_GUARD_SECONDS = 30
+
+
+def _publish_in_flight() -> bool:
+    started = st.session_state.get("publish_in_flight")
+    if not started:
+        return False
+    if datetime.now(timezone.utc).timestamp() - float(started) > PUBLISH_GUARD_SECONDS:
+        st.session_state.pop("publish_in_flight", None)
+        return False
+    return True
+
+
+def _clear_new_quiz_state() -> None:
+    """Forget a draft completely, widgets included.
+
+    Popping only `new_quiz_data` left every box on screen still filled in,
+    because a Streamlit widget key outranks the `value=` it is re-rendered with
+    -- so the next keystroke rebuilt the draft that was just discarded.
+    """
+    st.session_state.pop("new_quiz_data", None)
+    st.session_state.pop("create_dirty", None)
+    st.session_state.pop("new-quiz-section", None)
+    st.session_state.pop("publish_in_flight", None)
+    for key in [key for key in st.session_state if key.startswith("new-")]:
+        st.session_state.pop(key, None)
+    server_state.clear_draft(_draft_key(), DRAFT_NAME)
+
+
+@st.fragment
+def _create_questions_section(form: dict) -> None:
+    """The question editor, in its own fragment.
+
+    Every field commits on blur, and each commit used to re-run the whole
+    script: the page scrolled back to the top, the navigation redrew and the
+    settings tab's roster query went back to Supabase. That is what teachers
+    described as the editor "reloading" while they were adding a question. A
+    fragment redraws only this block instead, and because `form` is the same
+    dict the rest of the page reads, publishing still sees every value.
+    """
+    with st.container(border=True):
+        st.subheader("Questions")
+        question_modes = ["Create manually", "Upload question bank"]
+        stored_mode = form.get("new-quiz-mode", question_modes[0])
+        # Without an explicit index a recovered draft always came back on
+        # "Create manually", and the next interaction wrote that choice over
+        # the real one -- so an uploaded bank published as an empty quiz.
+        question_mode = st.radio("Add questions", question_modes, horizontal=True,
+                                 index=question_modes.index(stored_mode) if stored_mode in question_modes else 0,
+                                 key="new-quiz-mode", on_change=_create_save_setting, args=("new-quiz-mode",))
+        if question_mode == "Upload question bank":
+            upload = st.file_uploader("Question bank (.txt or .docx)", type=["txt", "docx"], key="new-quiz-upload")
+            if upload and st.button("Read question bank", key="new-quiz-parse"):
+                try:
+                    questions, skipped = parse_report(extract_upload(upload))
+                    form["new-uploaded-questions"] = questions
+                    form["new-skipped-questions"] = skipped
+                except Exception as exc:
+                    form["new-uploaded-questions"] = []
+                    form["new-skipped-questions"] = []
+                    st.error(f"Could not read this question bank: {exc}")
+                st.session_state["create_dirty"] = True
+                # Everything else reaches the mirror through an on_change
+                # hook; this is the one write that has to ask for itself.
+                _mirror_draft(form)
+            uploaded_questions = form.get("new-uploaded-questions", [])
+            if not isinstance(uploaded_questions, list):
+                uploaded_questions = []
+            st.write(f"Questions ready: **{len(uploaded_questions)}**")
+            skipped = form.get("new-skipped-questions") or []
+            if skipped:
+                with st.expander(f"{len(skipped)} question{'s were' if len(skipped) != 1 else ' was'} skipped"):
+                    for note in skipped:
+                        st.write(f"- {note}")
+            if upload and not uploaded_questions:
+                st.warning("No valid questions found. Include numbered questions, options, and an Answer Key before publishing.")
+        else:
+            count_key = "new-manual-count"
+            if count_key not in form:
+                form[count_key] = 1
+            count = form[count_key]
+            add_col, remove_col = st.columns(2)
+            st.write(f"**{int(count)}** question{'s' if int(count) != 1 else ''} in this quiz")
+
+            # `on_click` rather than an explicit `st.rerun()`: a button click
+            # already causes a rerun, so calling it again ran the page twice and
+            # threw the scroll position away a second time. Callbacks also run
+            # before the body, so the loop below already sees the new count.
+            def _add_question() -> None:
+                form[count_key] = int(form.get(count_key, 1)) + 1
+                st.session_state["create_dirty"] = True
+                _mirror_draft(form)
+
+            def _remove_question() -> None:
+                current = int(form.get(count_key, 1))
+                if current <= 1:
+                    return
+                form[count_key] = current - 1
+                _forget_question(form, current - 1)
+                st.session_state["create_dirty"] = True
+                _mirror_draft(form)
+
+            add_col.button("Add another question", key="new-manual-add", width="stretch",
+                           on_click=_add_question)
+            remove_col.button("Remove last question", key="new-manual-remove", width="stretch",
+                              disabled=int(count) <= 1, on_click=_remove_question)
+            for index in range(int(count)):
+                with st.container(border=True):
+                    st.markdown(f"**Question {index + 1}**")
+                    current_type = form.get(f"new-type-{index}", "Multiple choice")
+                    question_type = st.selectbox("Question type", QUESTION_TYPES, index=QUESTION_TYPES.index(current_type) if current_type in QUESTION_TYPES else 0, key=f"new-type-{index}", on_change=_create_save_setting, args=(f"new-type-{index}",))
+                    st.text_area("Question text", key=f"new-text-{index}", height=80, value=form.get(f"new-text-{index}", ""), on_change=_create_save_setting, args=(f"new-text-{index}",))
+                    if question_type in {"Multiple choice", SELECT_ALL_TYPE}:
+                        option_cols = st.columns(4)
+                        for option_index, label in enumerate(("A", "B", "C", "D")):
+                            with option_cols[option_index]:
+                                st.text_input(f"Option {label}", key=f"new-option-{index}-{label}", value=form.get(f"new-option-{index}-{label}", ""), on_change=_create_save_setting, args=(f"new-option-{index}-{label}",))
+                        if question_type == SELECT_ALL_TYPE:
+                            st.multiselect("Correct answers", ["A", "B", "C", "D"], key=f"new-correct-all-{index}", default=form.get(f"new-correct-all-{index}", []), on_change=_create_save_setting, args=(f"new-correct-all-{index}",))
+                        else:
+                            # One key per question type. Sharing a single key meant a
+                            # multiple-choice "C" survived a switch to True / False,
+                            # where it displayed as "True" but published as the stale
+                            # letter -- a silently wrong answer key.
+                            correct_cfg = ["A", "B", "C", "D"]
+                            correct_val = form.get(f"new-correct-mc-{index}")
+                            st.selectbox("Correct answer", correct_cfg, index=(correct_cfg.index(correct_val) if correct_val in correct_cfg else 0), key=f"new-correct-mc-{index}", on_change=_create_save_setting, args=(f"new-correct-mc-{index}",))
+                    elif question_type == "True / False":
+                        tf_val = form.get(f"new-correct-tf-{index}")
+                        st.selectbox("Correct answer", ["True", "False"], index=(0 if tf_val != "False" else 1), key=f"new-correct-tf-{index}", on_change=_create_save_setting, args=(f"new-correct-tf-{index}",))
+                    else:
+                        typed_answer_editor(
+                            f"new-typed-{index}",
+                            lambda name, default, i=index: form.get(f"new-typed-{i}-{name}", default),
+                            _create_save_typed,
+                        )
+
+
+@st.fragment
+def _create_settings_section(user, form: dict) -> None:
+    """Quiz settings, in their own fragment for the same reason."""
+    with st.container(border=True):
+        st.subheader("Quiz settings")
+        st.text_input("Quiz title", placeholder="e.g. Foundations of Computing", key="new-title",
+                      value=form.get("new-title", ""), on_change=_create_save_setting, args=("new-title",))
+        first, second = st.columns(2)
+        with first: st.number_input("Time allowed (minutes)", 1, 480, form.get("new-duration", 30), key="new-duration", on_change=_create_save_setting, args=("new-duration",))
+        with second: st.number_input("Passing score (%)", 0, 100, form.get("new-passing", 70), key="new-passing", on_change=_create_save_setting, args=("new-passing",))
+        st.checkbox("Allow retakes", form.get("new-retakes", False), key="new-retakes", on_change=_create_save_setting, args=("new-retakes",))
+        st.checkbox("Show class average to students", form.get("new-average", False), key="new-average", on_change=_create_save_setting, args=("new-average",))
+        st.checkbox("Randomize question order", form.get("new-randomize-questions", True), key="new-randomize-questions", on_change=_create_save_setting, args=("new-randomize-questions",))
+        st.checkbox("Randomize answer order", form.get("new-randomize-answers", True), key="new-randomize-answers", on_change=_create_save_setting, args=("new-randomize-answers",))
+        today = datetime.now().date()
+        tomorrow = today + timedelta(days=1)
+        opening_enabled = form.get("new-opening-enabled", True)
+        st.checkbox("Enable opening date and time", opening_enabled, key="new-opening-enabled", on_change=_create_save_setting, args=("new-opening-enabled",))
+        opening_date, opening_time = st.columns(2)
+        with opening_date: st.date_input("Opens on", form.get("new-opening-day", today), key="new-opening-day", disabled=not opening_enabled, on_change=_create_save_setting, args=("new-opening-day",))
+        with opening_time: st.time_input("Opening time", form.get("new-opening-clock", time(8, 0)), key="new-opening-clock", disabled=not opening_enabled, on_change=_create_save_setting, args=("new-opening-clock",))
+        closing_enabled = form.get("new-closing-enabled", True)
+        st.checkbox("Enable closing date and time", closing_enabled, key="new-closing-enabled", on_change=_create_save_setting, args=("new-closing-enabled",))
+        closing_date, closing_time = st.columns(2)
+        with closing_date: st.date_input("Closes on", form.get("new-closing-day", tomorrow), key="new-closing-day", disabled=not closing_enabled, on_change=_create_save_setting, args=("new-closing-day",))
+        with closing_time: st.time_input("Closing time", form.get("new-closing-clock", time(17, 0)), key="new-closing-clock", disabled=not closing_enabled, on_change=_create_save_setting, args=("new-closing-clock",))
+        st.divider(); st.subheader("Audience")
+        audience_mode = st.radio("Assign to", ["All", "Students", "Teams"], horizontal=True, key="new-audience-mode",
+                                 index=0 if form.get("new-audience-mode") != "Students" and form.get("new-audience-mode") != "Teams" else 1 if form.get("new-audience-mode") == "Students" else 2,
+                                 on_change=_create_save_setting, args=("new-audience-mode",))
+        if audience_mode == "Students":
+            st.multiselect("Assign to students", options=students(user["id"]), default=form.get("new-selected", []), format_func=lambda row: f"{row['name']}  ·  {row['email']}", key="new-selected", on_change=_create_save_setting, args=("new-selected",))
+        elif audience_mode == "Teams":
+            st.multiselect("Assign to teams", options=teams_for_teacher(user["id"]), default=form.get("new-team-selected", []), format_func=lambda team: team["name"], key="new-team-selected", on_change=_create_save_setting, args=("new-team-selected",))
+
+
 def create(user) -> None:
     if "new_quiz_data" not in st.session_state:
         recovered = server_state.load_draft(_draft_key(), DRAFT_NAME)
@@ -274,11 +486,19 @@ def create(user) -> None:
         else:
             st.session_state["new_quiz_data"] = {}
     form = st.session_state["new_quiz_data"]
+    # One token per draft, minted here and carried in the mirror. Two Publish
+    # clicks from the same draft -- in this tab, another tab, or after a
+    # reconnect -- present the same token, and only the first one wins.
+    if not form.get("new-publish-token"):
+        form["new-publish-token"] = uuid.uuid4().hex
     page_header("New assessment", "Build an assessment", "Set it up first, then write the questions, and publish when everything is ready.")
     if st.session_state.pop("draft_recovered", False):
         st.info("Picked up where you left off — this quiz was still unpublished. Use **Discard draft** below if you'd rather start fresh.")
+    publishing = _publish_in_flight()
     top_publish = st.button("Publish quiz", key="new-quiz-publish-top", type="primary", width="stretch",
-                            disabled=bool(st.session_state.get("publish_in_flight")))
+                            disabled=publishing)
+    if publishing:
+        st.caption("Publishing this quiz...")
     section = st.session_state.get("new-quiz-section", "settings")
     settings_button, questions_button = st.columns(2)
     if settings_button.button("Quiz settings", key="new-quiz-settings", type="primary" if section == "settings" else "secondary", width="stretch"):
@@ -289,107 +509,20 @@ def create(user) -> None:
         st.rerun()
 
     if section == "questions":
-        with st.container(border=True):
-            st.subheader("Questions")
-            question_mode = st.radio("Add questions", ["Create manually", "Upload question bank"], horizontal=True, key="new-quiz-mode", on_change=_create_save_setting, args=("new-quiz-mode",))
-            if question_mode == "Upload question bank":
-                upload = st.file_uploader("Question bank (.txt or .docx)", type=["txt", "docx"], key="new-quiz-upload")
-                if upload and st.button("Read question bank", key="new-quiz-parse"):
-                    try:
-                        form["new-uploaded-questions"] = parse_bank(extract_upload(upload))
-                    except Exception as exc:
-                        form["new-uploaded-questions"] = []
-                        st.error(f"Could not read this question bank: {exc}")
-                    st.session_state["create_dirty"] = True
-                uploaded_questions = form.get("new-uploaded-questions", [])
-                if not isinstance(uploaded_questions, list):
-                    uploaded_questions = []
-                st.write(f"Questions ready: **{len(uploaded_questions)}**")
-                if upload and not uploaded_questions:
-                    st.warning("No valid questions found. Include numbered questions, options, and an Answer Key before publishing.")
-            else:
-                count_key = "new-manual-count"
-                if count_key not in form:
-                    form[count_key] = 1
-                count = form[count_key]
-                add_col, remove_col = st.columns(2)
-                st.write(f"**{int(count)}** question{'s' if int(count) != 1 else ''} in this quiz")
-                if add_col.button("Add another question", key="new-manual-add", width="stretch"):
-                    form[count_key] = int(count) + 1
-                    st.session_state["create_dirty"] = True
-                    st.rerun()
-                if remove_col.button("Remove last question", key="new-manual-remove", width="stretch", disabled=int(count) <= 1):
-                    form[count_key] = int(count) - 1
-                    st.session_state["create_dirty"] = True
-                    st.rerun()
-                for index in range(int(count)):
-                    with st.container(border=True):
-                        st.markdown(f"**Question {index + 1}**")
-                        current_type = form.get(f"new-type-{index}", "Multiple choice")
-                        question_type = st.selectbox("Question type", QUESTION_TYPES, index=QUESTION_TYPES.index(current_type) if current_type in QUESTION_TYPES else 0, key=f"new-type-{index}", on_change=_create_save_setting, args=(f"new-type-{index}",))
-                        st.text_area("Question text", key=f"new-text-{index}", height=80, value=form.get(f"new-text-{index}", ""), on_change=_create_save_setting, args=(f"new-text-{index}",))
-                        if question_type in {"Multiple choice", SELECT_ALL_TYPE}:
-                            option_cols = st.columns(4)
-                            for option_index, label in enumerate(("A", "B", "C", "D")):
-                                with option_cols[option_index]:
-                                    st.text_input(f"Option {label}", key=f"new-option-{index}-{label}", value=form.get(f"new-option-{index}-{label}", ""), on_change=_create_save_setting, args=(f"new-option-{index}-{label}",))
-                            if question_type == SELECT_ALL_TYPE:
-                                st.multiselect("Correct answers", ["A", "B", "C", "D"], key=f"new-correct-all-{index}", default=form.get(f"new-correct-all-{index}", []), on_change=_create_save_setting, args=(f"new-correct-all-{index}",))
-                            else:
-                                correct_cfg = ["A", "B", "C", "D"]
-                                correct_val = form.get(f"new-correct-{index}")
-                                st.selectbox("Correct answer", correct_cfg, index=(correct_cfg.index(correct_val) if correct_val in correct_cfg else 0), key=f"new-correct-{index}", on_change=_create_save_setting, args=(f"new-correct-{index}",))
-                        elif question_type == "True / False":
-                            tf_val = form.get(f"new-correct-{index}")
-                            st.selectbox("Correct answer", ["True", "False"], index=(0 if tf_val != "False" else 1), key=f"new-correct-{index}", on_change=_create_save_setting, args=(f"new-correct-{index}",))
-                        else:
-                            typed_answer_editor(
-                                f"new-typed-{index}",
-                                lambda name, default, i=index: form.get(f"new-typed-{i}-{name}", default),
-                                _create_save_typed,
-                            )
+        _create_questions_section(form)
     else:
-        with st.container(border=True):
-            st.subheader("Quiz settings")
-            st.text_input("Quiz title", placeholder="e.g. Foundations of Computing", key="new-title",
-                          value=form.get("new-title", ""), on_change=_create_save_setting, args=("new-title",))
-            first, second = st.columns(2)
-            with first: st.number_input("Time allowed (minutes)", 1, 480, form.get("new-duration", 30), key="new-duration", on_change=_create_save_setting, args=("new-duration",))
-            with second: st.number_input("Passing score (%)", 0, 100, form.get("new-passing", 70), key="new-passing", on_change=_create_save_setting, args=("new-passing",))
-            st.checkbox("Allow retakes", form.get("new-retakes", False), key="new-retakes", on_change=_create_save_setting, args=("new-retakes",))
-            st.checkbox("Show class average to students", form.get("new-average", False), key="new-average", on_change=_create_save_setting, args=("new-average",))
-            st.checkbox("Randomize question order", form.get("new-randomize-questions", True), key="new-randomize-questions", on_change=_create_save_setting, args=("new-randomize-questions",))
-            st.checkbox("Randomize answer order", form.get("new-randomize-answers", True), key="new-randomize-answers", on_change=_create_save_setting, args=("new-randomize-answers",))
-            today = datetime.now().date()
-            tomorrow = today + timedelta(days=1)
-            opening_enabled = form.get("new-opening-enabled", True)
-            st.checkbox("Enable opening date and time", opening_enabled, key="new-opening-enabled", on_change=_create_save_setting, args=("new-opening-enabled",))
-            opening_date, opening_time = st.columns(2)
-            with opening_date: st.date_input("Opens on", form.get("new-opening-day", today), key="new-opening-day", disabled=not opening_enabled, on_change=_create_save_setting, args=("new-opening-day",))
-            with opening_time: st.time_input("Opening time", form.get("new-opening-clock", time(8, 0)), key="new-opening-clock", disabled=not opening_enabled, on_change=_create_save_setting, args=("new-opening-clock",))
-            closing_enabled = form.get("new-closing-enabled", True)
-            st.checkbox("Enable closing date and time", closing_enabled, key="new-closing-enabled", on_change=_create_save_setting, args=("new-closing-enabled",))
-            closing_date, closing_time = st.columns(2)
-            with closing_date: st.date_input("Closes on", form.get("new-closing-day", tomorrow), key="new-closing-day", disabled=not closing_enabled, on_change=_create_save_setting, args=("new-closing-day",))
-            with closing_time: st.time_input("Closing time", form.get("new-closing-clock", time(17, 0)), key="new-closing-clock", disabled=not closing_enabled, on_change=_create_save_setting, args=("new-closing-clock",))
-            st.divider(); st.subheader("Audience")
-            roster = students(user["id"])
-            audience_mode = st.radio("Assign to", ["All", "Students", "Teams"], horizontal=True, key="new-audience-mode",
-                                     index=0 if form.get("new-audience-mode") != "Students" and form.get("new-audience-mode") != "Teams" else 1 if form.get("new-audience-mode") == "Students" else 2,
-                                     on_change=_create_save_setting, args=("new-audience-mode",))
-            if audience_mode == "Students":
-                st.multiselect("Assign to students", options=roster, default=form.get("new-selected", []), format_func=lambda row: f"{row['name']}  ·  {row['email']}", key="new-selected", on_change=_create_save_setting, args=("new-selected",))
-            elif audience_mode == "Teams":
-                st.multiselect("Assign to teams", options=teams_for_teacher(user["id"]), default=form.get("new-team-selected", []), format_func=lambda team: team["name"], key="new-team-selected", on_change=_create_save_setting, args=("new-team-selected",))
+        _create_settings_section(user, form)
 
-    publishing = bool(st.session_state.get("publish_in_flight"))
     bottom_publish = st.button("Publish quiz", key="new-quiz-publish-bottom", type="primary",
                                width="stretch", disabled=publishing)
-    if form and st.button("Discard draft", key="new-quiz-discard", width="stretch"):
-        st.session_state.pop("new_quiz_data", None)
-        st.session_state.pop("create_dirty", None)
-        st.session_state.pop("new-quiz-section", None)
-        server_state.clear_draft(_draft_key(), DRAFT_NAME)
+    # Scaffolding is not a draft: the publish token and the default question
+    # count are written just by opening the page, and neither should make this
+    # button offer to throw away work nobody has done yet.
+    scaffolding = ("new-publish-token", "new-manual-count")
+    has_draft = (any(key not in scaffolding for key in form)
+                 or int(form.get("new-manual-count", 1) or 1) > 1)
+    if has_draft and st.button("Discard draft", key="new-quiz-discard", width="stretch"):
+        _clear_new_quiz_state()
         st.rerun()
     # A second click that arrives while the first is still being processed is a
     # double-click, not a second quiz.
@@ -408,10 +541,10 @@ def create(user) -> None:
             if question_type in {"Multiple choice", SELECT_ALL_TYPE}:
                 options = [(label, form.get(f"new-option-{index}-{label}", "").strip()) for label in ("A", "B", "C", "D")]
                 options = [(label, value) for label, value in options if value]
-                correct = form.get(f"new-correct-all-{index}", []) if question_type == SELECT_ALL_TYPE else form.get(f"new-correct-{index}", "A")
+                correct = form.get(f"new-correct-all-{index}", []) if question_type == SELECT_ALL_TYPE else form.get(f"new-correct-mc-{index}", "A")
             elif question_type == "True / False":
                 options = [("A", "True"), ("B", "False")]
-                correct = "A" if form.get(f"new-correct-{index}", "True") != "False" else "B"
+                correct = "A" if form.get(f"new-correct-tf-{index}", "True") != "False" else "B"
             else:
                 correct = _typed_spec_from(form, f"new-typed-{index}")
                 options = []
@@ -443,32 +576,62 @@ def create(user) -> None:
     else:
         assigned_students = {row["id"] for row in form.get("new-selected", [])}
         assigned_students.update(student_ids_for_teams(user["id"], [team["id"] for team in form.get("new-team-selected", [])]))
-    st.session_state["publish_in_flight"] = True
+    token = form.get("new-publish-token")
+    claim = server_state.claim_publish(_draft_key(), token)
+    if claim == "done":
+        # Already published from another tab, or by a click that outlived its
+        # session. Finish the navigation rather than making a second quiz.
+        _clear_new_quiz_state()
+        st.session_state.pop("manage_quiz", None)
+        st.session_state.page_override = "Dashboard"
+        st.session_state.quiz_created = title
+        st.rerun()
+    if claim == "in_flight":
+        st.info("This quiz is already being published. Give it a moment.")
+        return
+    st.session_state["publish_in_flight"] = datetime.now(timezone.utc).timestamp()
+    quiz_id = None
     try:
         quiz_id = create_quiz(user["id"], title, form.get("new-duration", 30), form.get("new-passing", 70), form.get("new-retakes", False), form.get("new-average", False), opening.isoformat(), closing.isoformat(), list(assigned_students), opening_enabled, closing_enabled, form.get("new-randomize-questions", True), form.get("new-randomize-answers", True))
         save_question_bank(quiz_id, questions)
     except Exception as exc:
         # Publishing failed, so let the teacher try again with their work intact.
+        # The quiz row goes in first and only becomes "active" once its questions
+        # land, so a failure in between used to leave a questionless Draft on the
+        # dashboard that nothing could finish. Take it back out again.
+        if quiz_id is not None:
+            try:
+                delete_quiz(quiz_id, user["id"])
+            except Exception:
+                pass
+        server_state.release_publish(_draft_key(), token)
         st.session_state.pop("publish_in_flight", None)
         st.error(f"The quiz could not be published: {exc}")
         return
-    server_state.clear_draft(_draft_key(), DRAFT_NAME)
+    server_state.finish_publish(_draft_key(), token, quiz_id)
+    _clear_new_quiz_state()
+    st.session_state.pop("manage_quiz", None)
     st.session_state.page_override = "Dashboard"
     st.session_state.quiz_created = title
-    st.session_state.pop("create_dirty", None)
-    st.session_state.pop("manage_quiz", None)
-    st.session_state.pop("new-quiz-section", None)
-    st.session_state.pop("new_quiz_data", None)
     st.rerun()
 
 
 def _quiz_downloads(quiz, questions: list | None = None) -> None:
     """Export controls (CSV / DOCX / PDF / results) for the quiz manager.
 
-    Everything here is built on demand. Rendering a PDF and a DOCX takes long
-    enough to be felt, and an expander's body still runs while collapsed, so
-    leaving these unguarded meant regenerating all three exports on every single
-    edit in the question editor — each of which re-runs the manager fragment.
+    Every export is handed to `st.download_button` as a *callable*, so the file
+    is built when someone clicks rather than on every rerun. That is not only
+    cheaper — an expander's body still runs while collapsed, so each keystroke
+    in the question editor used to re-render all three files — it is what makes
+    the buttons work at all. A PDF and a DOCX both embed their creation time, so
+    rebuilding them produced different bytes every rerun, and Streamlit derives
+    a download's URL from its bytes. The link therefore moved on every rerun and
+    Streamlit garbage-collected the one it replaced, so the URL the browser was
+    still holding had usually 404'd by the time anyone clicked it: the first
+    click on a freshly chosen format did nothing, and only the second worked.
+
+    `on_click="ignore"` keeps a download from re-running the fragment, which
+    would otherwise start that churn all over again on every click.
     """
     ready_key = f"downloads-ready-{quiz['id']}"
     if not st.session_state.get(ready_key):
@@ -479,8 +642,7 @@ def _quiz_downloads(quiz, questions: list | None = None) -> None:
         return
     progress = student_progress_for_quiz(quiz["owner_id"], quiz["id"])
     if progress:
-        results_frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": row["score"], "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress])
-        st.download_button("Download results CSV", results_frame.to_csv(index=False), "student-results.csv", "text/csv", key=f"results-download-{quiz['id']}")
+        st.download_button("Download results CSV", lambda: _results_csv(progress), "student-results.csv", "text/csv", on_click="ignore", key=f"results-download-{quiz['id']}")
     else:
         st.info("No students are assigned to this exam yet.")
     if questions is None:
@@ -493,27 +655,58 @@ def _quiz_downloads(quiz, questions: list | None = None) -> None:
         "Questions with correct answers": "questions-answers",
         "Questions with correct answers and quiz settings": "questions-answers-settings",
     }
-    pdf_bytes = _render_quiz_pdf(quiz, questions, format_map[pdf_format])
-    st.download_button("Download PDF", pdf_bytes, "quiz.pdf", "application/pdf", type="primary", key=f"pdf-{quiz['id']}")
+    format_key = format_map[pdf_format]
+    st.download_button("Download PDF", lambda: _render_quiz_pdf(quiz, questions, format_key), "quiz.pdf", "application/pdf", type="primary", on_click="ignore", key=f"pdf-{quiz['id']}")
+    st.download_button("Download question bank CSV", lambda: _question_bank_csv(questions), "question-bank.csv", "text/csv", on_click="ignore", key=f"bank-csv-{quiz['id']}")
+    st.download_button("Download printable DOCX", lambda: _render_quiz_docx(quiz, questions), "quiz.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", on_click="ignore", key=f"docx-{quiz['id']}")
+
+
+def _results_csv(progress) -> bytes:
+    # One decimal, the same as the screen: a raw 33.33333333333333 in a
+    # spreadsheet column helps nobody and still sorts correctly rounded.
+    frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": round(row["score"], 1) if row["score"] is not None else None, "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress])
+    return frame.to_csv(index=False).encode("utf-8")
+
+
+def _question_bank_csv(questions) -> bytes:
     frame = pd.DataFrame([{"Question": q["question_text"], "Correct": q["correct_label"], **dict(json.loads(q["options_json"]))} for q in questions])
-    st.download_button("Download question bank CSV", frame.to_csv(index=False), "question-bank.csv", "text/csv", key=f"bank-csv-{quiz['id']}")
+    return frame.to_csv(index=False).encode("utf-8")
+
+
+def _render_quiz_docx(quiz, questions) -> bytes:
     document = Document(); document.add_heading(quiz["title"], 0)
     for index, q in enumerate(questions, 1):
         document.add_paragraph(f"{index}. {q['question_text']}")
         for label, text in json.loads(q["options_json"]): document.add_paragraph(f"{label}) {text}", style="List Bullet")
     output = io.BytesIO(); document.save(output)
-    st.download_button("Download printable DOCX", output.getvalue(), "quiz.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"docx-{quiz['id']}")
+    return output.getvalue()
 
 
 @st.fragment
 def manage_quiz(user, quiz_id: int) -> None:
+    # Everything in here -- editing questions, publishing, changing settings,
+    # reassigning students, regrading -- happens on fragment reruns, which never
+    # re-execute the main script body. Without this check a tab signed out in
+    # another window kept full write access to the quiz until someone refreshed.
+    if not require_session(user):
+        return
     with st.container(border=True):
         quiz = quiz_for_teacher(quiz_id, user["id"])
         if not quiz: return
         st.divider(); st.markdown(f"### Manage: {quiz['title']}")
-        if st.session_state.pop(f"saved-questions-{quiz_id}", False):
+        just_saved = st.session_state.pop(f"saved-questions-{quiz_id}", False)
+        if just_saved:
             st.success("Test saved and published. The questions below are what students will now see.")
         attempts = quiz_attempt_counts(quiz_id, exclude_student_id=user["id"])
+        if just_saved and attempts["submitted"]:
+            # Attempts are marked against the key that applied when the student
+            # started, so correcting one only helps whoever comes next unless the
+            # teacher is told the earlier results are now out of date.
+            st.warning(
+                f"{attempts['submitted']} already-submitted attempt{'s were' if attempts['submitted'] != 1 else ' was'} "
+                "marked against the previous answer key. Use **Regrade submitted attempts** below to apply this version to them."
+            )
+            st.session_state[f"regrade-prompt-{quiz_id}"] = True
         if attempts["open"]:
             st.warning(
                 f"{attempts['open']} student{'s have' if attempts['open'] != 1 else ' has'} this assessment open right now. "
@@ -557,7 +750,9 @@ def regrade_controls(quiz, user, submitted_count: int) -> None:
     # Clicking a button inside an expander re-runs the fragment, which closes the
     # expander again — so hold the outcome across that rerun and force it open.
     pending = st.session_state.get(result_key)
-    with st.expander("Regrade submitted attempts", expanded=bool(pending)):
+    prompted = st.session_state.pop(f"regrade-prompt-{quiz_id}", False)
+    confirming = bool(st.session_state.get(f"regrade-confirm-{quiz_id}"))
+    with st.expander("Regrade submitted attempts", expanded=bool(pending) or prompted or confirming):
         if pending:
             st.success(pending)
             st.session_state.pop(result_key, None)
@@ -570,14 +765,34 @@ def regrade_controls(quiz, user, submitted_count: int) -> None:
             "since corrected a wrong answer, use this to apply the correction to results already recorded."
         )
         st.caption("Questions you have reworded or deleted since keep the marking they were graded under.")
-        if st.button("Regrade now", key=f"regrade-{quiz_id}", type="primary", width="stretch"):
+        confirm_key = f"regrade-confirm-{quiz_id}"
+        if not st.session_state.get(confirm_key):
+            if st.button("Regrade now", key=f"regrade-{quiz_id}", type="primary", width="stretch"):
+                st.session_state[confirm_key] = True
+                st.rerun(scope="fragment")
+            return
+        # Regrading rewrites every recorded score and cannot be undone, so the
+        # button that does it is not the same button the teacher first clicked.
+        st.warning(
+            f"This rewrites the score and pass/fail result of all {submitted_count} submitted "
+            f"attempt{'s' if submitted_count != 1 else ''}, and cannot be undone."
+        )
+        go, cancel = st.columns(2)
+        if cancel.button("Cancel", key=f"regrade-cancel-{quiz_id}", width="stretch"):
+            st.session_state.pop(confirm_key, None)
+            st.rerun(scope="fragment")
+        if go.button("Yes, regrade them", key=f"regrade-go-{quiz_id}", type="primary", width="stretch"):
+            st.session_state.pop(confirm_key, None)
             summary = regrade_quiz(quiz_id, exclude_student_id=user["id"])
             message = (
                 f"Regraded {summary['attempts']} attempt{'s' if summary['attempts'] != 1 else ''}; "
                 f"{summary['changed']} score{'s' if summary['changed'] != 1 else ''} changed."
             )
             if summary["unmatched"]:
-                message += f" {summary['unmatched']} question(s) no longer match a current question and were left as they were."
+                message += (
+                    f" {summary['unmatched']} question{'s' if summary['unmatched'] != 1 else ''} could not be matched "
+                    "to the current quiz and kept the answer key they were marked against."
+                )
             st.session_state[result_key] = message
             st.rerun(scope="fragment")
 
@@ -672,8 +887,11 @@ def question_bank(quiz) -> None:
     if questions:
         with st.expander("Reorder questions"):
             question_options = {question["id"]: f"{index}. {question['question_text']}" for index, question in enumerate(questions, 1)}
-            selected_id = st.selectbox("Question", list(question_options), format_func=question_options.get, key=f"reorder-question-{quiz['id']}")
-            selected_index = next(index for index, question in enumerate(questions) if question["id"] == selected_id)
+            selected_id = st.selectbox("Question", list(question_options), format_func=question_options.get, key=f"reorder-question-{quiz['id']}-{editor_epoch(quiz['id'])}")
+            # A saved quiz replaces every question row, so a remembered id can be
+            # gone. Falling back to the first question beats a StopIteration that
+            # would take the whole manager down with it.
+            selected_index = next((index for index, question in enumerate(questions) if question["id"] == selected_id), 0)
             move_up, move_down = st.columns(2)
             if move_up.button("Move up", key=f"move-up-{quiz['id']}", disabled=selected_index == 0, width="stretch"):
                 move_question(quiz["id"], selected_id, -1)
@@ -690,15 +908,23 @@ def question_bank(quiz) -> None:
     upload = st.file_uploader("Upload question bank (.txt or .docx)", type=["txt", "docx"], key=f"upload-{quiz['id']}")
     if upload and st.button("Parse question bank", type="primary", key=f"parse-{quiz['id']}"):
         try:
-            st.session_state[f"draft-{quiz['id']}"] = parse_bank(extract_upload(upload))
+            parsed, skipped = parse_report(extract_upload(upload))
+            st.session_state[f"draft-{quiz['id']}"] = parsed
+            st.session_state[f"draft-skipped-{quiz['id']}"] = skipped
         except Exception as exc:
             st.session_state[f"draft-{quiz['id']}"] = []
+            st.session_state[f"draft-skipped-{quiz['id']}"] = []
             st.error(f"Could not read this question bank: {exc}")
     draft = st.session_state.get(f"draft-{quiz['id']}")
     if draft is not None:
         if not draft:
             st.warning("No valid questions found. Include numbered questions, options, and an Answer Key before publishing.")
             return
+        skipped = st.session_state.get(f"draft-skipped-{quiz['id']}") or []
+        if skipped:
+            with st.expander(f"{len(skipped)} question{'s were' if len(skipped) != 1 else ' was'} skipped"):
+                for note in skipped:
+                    st.write(f"- {note}")
         st.write("Review extracted questions before publishing")
         table = pd.DataFrame([
             {
@@ -730,9 +956,14 @@ def question_bank(quiz) -> None:
                     st.error(str(exc))
                 else:
                     st.session_state.pop(f"draft-{quiz['id']}", None)
+                    st.session_state.pop(f"draft-skipped-{quiz['id']}", None)
                     reset_editor_state(quiz["id"])
                     st.session_state[f"saved-questions-{quiz['id']}"] = True
-                    st.rerun(scope="fragment")
+                    # A full rerun, not a fragment one: the quiz card above the
+                    # manager shows the question count and the Draft/Published
+                    # badge, and neither is redrawn by a fragment rerun -- which
+                    # is why a save looked like it had not taken until a refresh.
+                    st.rerun()
         return
     st.caption(f"Question bank: {len(questions)} questions")
     for index, question in enumerate(questions, 1):
@@ -827,6 +1058,19 @@ def editor_state_key(quiz_id: int) -> str:
     return f"question-editor-{quiz_id}"
 
 
+def editor_epoch(quiz_id: int) -> int:
+    """A number folded into every editor widget key, bumped on every reset.
+
+    Deleting a widget's key from `st.session_state` does not clear the value:
+    the browser still holds it and sends it back with the next rerun, and
+    Streamlit restores it. Changing the *key* is the only thing that gives a
+    widget a genuinely fresh start -- which is what a reordered or reloaded
+    question bank needs, or the boxes keep showing the pre-edit version and the
+    next save writes that back to the database.
+    """
+    return int(st.session_state.get(f"editor-epoch-{quiz_id}", 0))
+
+
 def reset_editor_state(quiz_id: int) -> None:
     """Forget the working copy so the editor reloads from the database.
 
@@ -834,12 +1078,30 @@ def reset_editor_state(quiz_id: int) -> None:
     editor kept showing whatever the browser session happened to hold the first
     time it ran, which is how saved edits appeared to vanish until a refresh.
 
+    The working copy is only half of what the editor remembers. Every field also
+    has a Streamlit widget, whose value beats the `value=`/`index=` the reloaded
+    draft passes in -- so a reordered question came straight back on the next
+    render, and the next save wrote that stale order back to the database.
+    Dropping the keys is not enough on its own, because the browser still holds
+    the values and re-sends them; bumping `editor_epoch` renames every widget,
+    which is the only thing that really gives them a fresh start. The keys are
+    dropped as well so a long editing session doesn't accumulate dead state.
+
     Prepared exports are dropped at the same time: they were built from the old
     questions, and rebuilding them on every keystroke is what made the editor
     feel like it was reloading.
     """
     st.session_state.pop(editor_state_key(quiz_id), None)
     st.session_state.pop(f"downloads-ready-{quiz_id}", None)
+    st.session_state[f"editor-epoch-{quiz_id}"] = editor_epoch(quiz_id) + 1
+    field_keys = (
+        f"reorder-question-{quiz_id}-",
+        f"manual-type-{quiz_id}-", f"manual-text-{quiz_id}-", f"manual-option-{quiz_id}-",
+        f"manual-correct-mc-{quiz_id}-", f"manual-correct-tf-{quiz_id}-",
+        f"manual-correct-all-{quiz_id}-", f"manual-typed-{quiz_id}-",
+    )
+    for key in [key for key in st.session_state if key.startswith(field_keys)]:
+        st.session_state.pop(key, None)
 
 
 def _editor_draft(quiz) -> list[dict]:
@@ -891,6 +1153,7 @@ def manual_question_editor(quiz) -> None:
     st.caption("Create the test directly. Each question needs text, at least two options, and one correct answer.")
     draft = _editor_draft(quiz)
     quiz_id = quiz["id"]
+    epoch = editor_epoch(quiz_id)
 
     def _write(field: str, index: int, widget_key: str, sub: str | None = None) -> None:
         """Copy a widget's value back into the working copy it was rendered from."""
@@ -916,34 +1179,34 @@ def manual_question_editor(quiz) -> None:
     for index, entry in enumerate(draft):
         with st.container(border=True):
             st.markdown(f"**Question {index + 1}**")
-            type_key = f"manual-type-{quiz_id}-{index}"
+            type_key = f"manual-type-{quiz_id}-{epoch}-{index}"
             question_type = st.selectbox(
                 "Question type", QUESTION_TYPES,
                 index=QUESTION_TYPES.index(entry["type"]) if entry["type"] in QUESTION_TYPES else 0,
                 key=type_key, on_change=_write, args=("type", index, type_key),
             )
             entry["type"] = question_type
-            text_key = f"manual-text-{quiz_id}-{index}"
+            text_key = f"manual-text-{quiz_id}-{epoch}-{index}"
             entry["text"] = st.text_area("Question text", value=entry["text"], height=80,
                                          key=text_key, on_change=_write, args=("text", index, text_key))
             if question_type in {"Multiple choice", SELECT_ALL_TYPE}:
                 columns = st.columns(4)
                 for option_index, label in enumerate(("A", "B", "C", "D")):
                     with columns[option_index]:
-                        option_key = f"manual-option-{quiz_id}-{index}-{label}"
+                        option_key = f"manual-option-{quiz_id}-{epoch}-{index}-{label}"
                         entry["options"][label] = st.text_input(
                             f"Option {label}", value=entry["options"].get(label, ""),
                             key=option_key, on_change=_write, args=("options", index, option_key, label),
                         )
             if question_type == "True / False":
-                tf_key = f"manual-correct-tf-{quiz_id}-{index}"
+                tf_key = f"manual-correct-tf-{quiz_id}-{epoch}-{index}"
                 entry["correct"] = st.selectbox(
                     "Correct answer", ["A", "B"], format_func=lambda value: "True" if value == "A" else "False",
                     index=1 if entry.get("correct") == "B" else 0,
                     key=tf_key, on_change=_write, args=("correct", index, tf_key),
                 )
             elif question_type == SELECT_ALL_TYPE:
-                all_key = f"manual-correct-all-{quiz_id}-{index}"
+                all_key = f"manual-correct-all-{quiz_id}-{epoch}-{index}"
                 entry["correct_all"] = st.multiselect(
                     "Correct answers", ["A", "B", "C", "D"],
                     default=[label for label in (entry.get("correct_all") or []) if label in ("A", "B", "C", "D")],
@@ -952,14 +1215,14 @@ def manual_question_editor(quiz) -> None:
             elif question_type == "Multiple choice":
                 available = [label for label in ("A", "B", "C", "D") if entry["options"].get(label, "").strip()] or ["A", "B", "C", "D"]
                 stored = entry.get("correct")
-                mc_key = f"manual-correct-mc-{quiz_id}-{index}"
+                mc_key = f"manual-correct-mc-{quiz_id}-{epoch}-{index}"
                 entry["correct"] = st.selectbox(
                     "Correct answer", available,
                     index=available.index(stored) if stored in available else 0,
                     key=mc_key, on_change=_write, args=("correct", index, mc_key),
                 )
             else:
-                prefix = f"manual-typed-{quiz_id}-{index}"
+                prefix = f"manual-typed-{quiz_id}-{epoch}-{index}"
 
                 def _write_typed(widget_key: str, i=index, p=prefix) -> None:
                     draft[i]["typed"][widget_key[len(p) + 1:]] = st.session_state[widget_key]
@@ -988,7 +1251,9 @@ def manual_question_editor(quiz) -> None:
             return
         reset_editor_state(quiz_id)
         st.session_state[f"saved-questions-{quiz_id}"] = True
-        st.rerun(scope="fragment")
+        # Full rerun: the card above the manager carries the question count and
+        # the Draft/Published badge, and a fragment rerun leaves both stale.
+        st.rerun()
 
 
 def settings_editor(quiz) -> None:
@@ -1147,6 +1412,8 @@ def roster_page(user) -> None:
 
 @st.dialog("Student analytics", width="large")
 def student_detail_dialog(user, student_id: int) -> None:
+    if not require_session(user):
+        return
     detail = student_detail_analytics(user["id"], student_id)
     if not detail:
         st.error("Student is not in your roster.")
@@ -1160,7 +1427,7 @@ def student_detail_dialog(user, student_id: int) -> None:
             "Test": row["title"],
             # A quiz with no attempt at all is "Not started", not "In progress".
             "Status": "Completed" if row["submitted_at"] else ("In progress" if row["started_at"] else "Not started"),
-            "Score": f"{row['score_percent']:.0f}%" if row["score_percent"] is not None else "-",
+            "Score": percent(row["score_percent"]),
             "Result": "Passed" if row["passed"] else ("Failed" if row["passed"] is not None else "-"),
             "Last activity": when(row["submitted_at"] or row["started_at"]),
         }

@@ -105,6 +105,11 @@ def user_section(title: str, caption: str, role: str, prefix: str) -> None:
                 except ValueError as exc:
                     st.error(str(exc))
                 else:
+                    # A new password or address has to end the sessions it
+                    # replaces -- including any tab still signed in under the
+                    # old address, which is a different revocation key.
+                    server_state.revoke(server_state.account_key(selected))
+                    server_state.revoke(server_state.account_key({"email": edit_email}))
                     flash(prefix, f"Changes to {edit_options[edit_id]} saved.")
                     st.rerun()
             st.divider()

@@ -45,7 +45,9 @@ def verify_password(stored: str, given: str) -> bool:
         except Exception:
             return False
         return hmac.compare_digest(digest, base64.b64decode(digest_b64))
-    return hmac.compare_digest(stored, given)
+    # Bytes, not str: compare_digest rejects non-ASCII str arguments outright,
+    # and a legacy plaintext row is exactly where one shows up.
+    return hmac.compare_digest(stored.encode("utf-8"), given.encode("utf-8"))
 
 
 def _needs_rehash(stored: str) -> bool:
@@ -444,33 +446,13 @@ def set_quiz_assignments(quiz_id: int, student_ids: list[int]) -> None:
         ).execute()
 
 
-_DUPLICATE_PUBLISH_WINDOW_SECONDS = 30
-
-
-def recent_duplicate_quiz(owner_id: int, title: str) -> int | None:
-    """The id of an identically titled quiz this teacher created moments ago, if any.
-
-    A double-clicked Publish button queues a second run; the UI blocks that, and
-    this is the backstop for clicks that land in separate sessions or survive a
-    reconnect. Two deliberate quizzes with the same name half a minute apart is
-    not a thing teachers do.
-    """
-    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_DUPLICATE_PUBLISH_WINDOW_SECONDS)).isoformat()
-    rows = _rows(
-        client().table("quizzes").select("id,created_at")
-        .eq("owner_id", owner_id).eq("title", title)
-        .gte("created_at", cutoff)
-        .order("created_at", desc=True).limit(1)
-        .execute()
-    )
-    return rows[0]["id"] if rows else None
-
-
 def create_quiz(owner_id: int, title: str, duration: int, passing: int, allow_retake: bool, show_average: bool, opening_time: str, closing_time: str, student_ids: list[int], opening_enabled: bool = True, closing_enabled: bool = True, randomize_questions: bool = True, randomize_answers: bool = True) -> int:
+    # Publishing the same draft twice is stopped by the claim in `server_state`,
+    # which every tab on this server shares. Matching on the title used to do
+    # that job here, and it was wrong in both directions: it collapsed two
+    # deliberately same-named quizzes into one *and* silently dropped the
+    # second one's student assignments.
     supabase = client()
-    duplicate = recent_duplicate_quiz(owner_id, title)
-    if duplicate is not None:
-        return duplicate
     row = _rows(
         supabase.table("quizzes").insert(
             {
@@ -516,7 +498,16 @@ def save_question_bank(quiz_id: int, questions: list[dict]) -> None:
         }
         for i, q in enumerate(questions)
     ]
-    supabase.table("questions").insert(records).execute()
+    # Read back what the insert actually wrote. Without this a request that
+    # returned 2xx but stored nothing would still take the delete below with it,
+    # and the editor would report "saved and published" over an emptied quiz.
+    written = _rows(supabase.table("questions").insert(records).select("id").execute())
+    if len(written) != len(records):
+        if written:
+            supabase.table("questions").delete().in_("id", [row["id"] for row in written]).execute()
+        raise ValueError(
+            f"Only {len(written)} of {len(records)} questions were saved, so nothing was changed. Please try again."
+        )
     if previous_ids:
         supabase.table("questions").delete().in_("id", previous_ids).execute()
     supabase.table("quizzes").update({"status": "active"}).eq("id", quiz_id).execute()
@@ -731,6 +722,20 @@ def open_attempt(quiz_id: int, student_id: int):
     return rows[0] if rows else None
 
 
+def submitted_attempt(quiz_id: int, student_id: int):
+    """The student's most recent finished attempt at this quiz, if any."""
+    rows = _rows(
+        client().table("attempts").select("*")
+        .eq("quiz_id", quiz_id)
+        .eq("student_id", student_id)
+        .not_.is_("submitted_at", None)
+        .order("submitted_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return rows[0] if rows else None
+
+
 def create_attempt(quiz_id: int, student_id: int, started_at: str, deadline_at: str, answers_json: str) -> int:
     return _rows(
         client().table("attempts").insert(
@@ -801,6 +806,39 @@ def _refreshed_correct(question_row: dict):
     return question_row["correct_label"]
 
 
+def _rekeyed_choice(frozen: dict, live_row: dict, live_correct):
+    """Express a live answer key in the labels the frozen attempt actually showed.
+
+    A, B, C, D are fixed slots in the editor, so a teacher who corrects a
+    question by rewriting what sits in each slot reuses the same letters for
+    different text. Copying the live letter straight across would then mark a
+    different option correct than the one the teacher chose. Matching on the
+    option *text* survives that; `None` means this question can't be rekeyed
+    safely and should keep the key it was graded under.
+    """
+    try:
+        live_options = dict(json.loads(live_row["options_json"]))
+    except (TypeError, ValueError):
+        return None
+    frozen_labels = {
+        grading.normalise_text(text): label
+        for label, text in (frozen.get("options") or [])
+    }
+    wanted = live_correct if isinstance(live_correct, list) else [live_correct]
+    mapped = []
+    for label in wanted:
+        text = live_options.get(label)
+        if text is None:
+            return None
+        frozen_label = frozen_labels.get(grading.normalise_text(text))
+        if frozen_label is None:
+            return None
+        mapped.append(frozen_label)
+    if isinstance(live_correct, list):
+        return mapped
+    return mapped[0] if mapped else None
+
+
 def regrade_quiz(quiz_id: int, exclude_student_id: int | None = None) -> dict:
     """Re-mark every submitted attempt against the quiz's current answer key.
 
@@ -826,7 +864,10 @@ def regrade_quiz(quiz_id: int, exclude_student_id: int | None = None) -> dict:
 
     quiz = get_quiz(quiz_id)
     passing_score = quiz["passing_score"] if quiz else 0
-    changed, unmatched = 0, 0
+    changed = 0
+    # Counted per question, not per attempt: one deleted question across thirty
+    # attempts is one problem to tell the teacher about, not thirty.
+    unmatched: set[str] = set()
     for attempt in attempts:
         try:
             payload = json.loads(attempt["answers_json"])
@@ -836,11 +877,20 @@ def regrade_quiz(quiz_id: int, exclude_student_id: int | None = None) -> dict:
         if not frozen:
             continue
         for question in frozen:
-            match = by_text.get(grading.normalise_text(question.get("text", "")))
+            text = question.get("text", "")
+            match = by_text.get(grading.normalise_text(text))
             if match is None or match.get("question_type") != question.get("question_type"):
-                unmatched += 1
+                unmatched.add(text)
                 continue
-            question["correct"] = _refreshed_correct(match)
+            refreshed = _refreshed_correct(match)
+            if question.get("question_type") in grading.TEXT_QUESTION_TYPES:
+                question["correct"] = refreshed
+                continue
+            rekeyed = _rekeyed_choice(question, match, refreshed)
+            if rekeyed is None:
+                unmatched.add(text)
+                continue
+            question["correct"] = rekeyed
         score = grading.score_payload(payload)
         passed = int(score >= passing_score)
         if abs((attempt.get("score_percent") or 0) - score) < 1e-9 and attempt.get("passed") == passed:
@@ -849,7 +899,7 @@ def regrade_quiz(quiz_id: int, exclude_student_id: int | None = None) -> dict:
         client().table("attempts").update(
             {"answers_json": json.dumps(payload), "score_percent": score, "passed": passed}
         ).eq("id", attempt["id"]).execute()
-    return {"attempts": len(attempts), "changed": changed, "unmatched": unmatched}
+    return {"attempts": len(attempts), "changed": changed, "unmatched": len(unmatched)}
 
 
 def _admin_row(email: str) -> dict | None:
