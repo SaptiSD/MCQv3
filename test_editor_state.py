@@ -5,8 +5,6 @@ an uploaded file quietly losing questions, a score disagreeing with its own
 pass/fail badge.
 """
 
-import io
-
 import teacher_portal as TP
 import ui
 from ingestion import extract_upload, parse_report
@@ -133,7 +131,7 @@ check("the displayed value never rounds up past the pass mark",
 
 print()
 print("== a corrected answer key is rekeyed by option text, not by letter ==")
-import repository
+import attempt_sync
 
 # The teacher fixed the question by swapping what sits in each slot, so the live
 # key "A" now means Paris while the student's frozen copy still has A = London.
@@ -142,20 +140,20 @@ frozen = {"options": [("A", "London"), ("B", "Paris")], "correct": "A",
 live = {"options_json": '[["A", "Paris"], ["B", "London"]]', "correct_label": "A",
         "question_type": "Multiple choice"}
 check("the frozen label follows the option text",
-      repository._rekeyed_choice(frozen, live, "A") == "B")
+      attempt_sync.rekey_choice(frozen, live, "A") == "B")
 
 frozen_all = {"options": [("A", "One"), ("B", "Two"), ("C", "Three")],
               "question_type": "Multiple choice - select all that apply"}
 live_all = {"options_json": '[["A", "Three"], ["B", "One"], ["C", "Two"]]',
             "question_type": "Multiple choice - select all that apply"}
 check("select-all keys are remapped one by one",
-      sorted(repository._rekeyed_choice(frozen_all, live_all, ["A", "B"])) == ["A", "C"])
+      sorted(attempt_sync.rekey_choice(frozen_all, live_all, ["A", "B"])) == ["A", "C"])
 
 gone = {"options": [("A", "London"), ("B", "Lyon")], "question_type": "Multiple choice"}
 check("a correct option the student never saw is refused",
-      repository._rekeyed_choice(gone, live, "A") is None)
+      attempt_sync.rekey_choice(gone, live, "A") is None)
 check("an unreadable live options list is refused",
-      repository._rekeyed_choice(frozen, {"options_json": "not json"}, "A") is None)
+      attempt_sync.rekey_choice(frozen, {"options_json": "not json"}, "A") is None)
 
 print()
 print("== a draft can only be published once, from any tab ==")

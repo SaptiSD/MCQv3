@@ -16,7 +16,7 @@ import grading
 import server_state
 from ingestion import extract_upload, parse_report
 from ui import (empty_state, flash, metric_row, page_header, percent, pill, require_session,
-                show_flash, when)
+                show_flash, text, when)
 from repository import (add_student_to_roster, assigned_student_ids, create_quiz,
                         delete_quiz, move_question, questions_for_quiz, quiz_attempt_counts,
                         quiz_counts_for_teacher, quiz_for_teacher, quizzes_for_teacher,
@@ -225,7 +225,7 @@ def dashboard(user) -> None:
                     badge = pill("Not assigned", "amber")
                 else:
                     badge = pill("Published", "green")
-                st.markdown(f"### {quiz['title']} &nbsp;{badge}", unsafe_allow_html=True)
+                st.markdown(f"### {text(quiz['title'])} &nbsp;{badge}", unsafe_allow_html=True)
                 audience = f"{assigned} assigned student{'s' if assigned != 1 else ''}" if assigned else "Not assigned"
                 question_count = summary["questions"]
                 st.caption(f"{question_count} question{'s' if question_count != 1 else ''}  ·  {quiz['duration_minutes']} minutes  ·  pass at {quiz['passing_score']}%  ·  {audience}")
@@ -677,7 +677,7 @@ def _render_quiz_docx(quiz, questions) -> bytes:
     document = Document(); document.add_heading(quiz["title"], 0)
     for index, q in enumerate(questions, 1):
         document.add_paragraph(f"{index}. {q['question_text']}")
-        for label, text in json.loads(q["options_json"]): document.add_paragraph(f"{label}) {text}", style="List Bullet")
+        for label, option_text in json.loads(q["options_json"]): document.add_paragraph(f"{label}) {option_text}", style="List Bullet")
     output = io.BytesIO(); document.save(output)
     return output.getvalue()
 
@@ -699,18 +699,20 @@ def manage_quiz(user, quiz_id: int) -> None:
             st.success("Test saved and published. The questions below are what students will now see.")
         attempts = quiz_attempt_counts(quiz_id, exclude_student_id=user["id"])
         if just_saved and attempts["submitted"]:
-            # Attempts are marked against the key that applied when the student
-            # started, so correcting one only helps whoever comes next unless the
-            # teacher is told the earlier results are now out of date.
+            # An attempt is marked against the key that was live when it was
+            # handed in, so anyone who has already finished keeps the old marks
+            # unless the teacher is told the earlier results are now out of date.
             st.warning(
-                f"{attempts['submitted']} already-submitted attempt{'s were' if attempts['submitted'] != 1 else ' was'} "
-                "marked against the previous answer key. Use **Regrade submitted attempts** below to apply this version to them."
+                f"{attempts['submitted']} attempt{'s were' if attempts['submitted'] != 1 else ' was'} "
+                "handed in under the previous answer key. Use **Regrade submitted attempts** below to re-mark "
+                "them against this version."
             )
             st.session_state[f"regrade-prompt-{quiz_id}"] = True
         if attempts["open"]:
             st.warning(
                 f"{attempts['open']} student{'s have' if attempts['open'] != 1 else ' has'} this assessment open right now. "
-                "They keep the version they started, so edits you make here won't reach them mid-attempt."
+                "Editing it tells them their paper is out of date and pauses their Submit button until they load "
+                "your changes, so their answers are kept but they will notice."
             )
         with st.expander("Download"):
             _quiz_downloads(quiz)
@@ -739,11 +741,10 @@ def manage_quiz(user, quiz_id: int) -> None:
 def regrade_controls(quiz, user, submitted_count: int) -> None:
     """Re-mark already-submitted attempts against the quiz's current answer key.
 
-    Every attempt is graded against the answer key that applied when the student
-    started it, which is what keeps a mid-attempt edit from moving the goalposts.
-    The cost is that fixing a wrong answer key only helps students who start
-    afterwards, so a teacher needs a deliberate way to apply the correction
-    backwards.
+    An attempt is marked against the key that was live when it was handed in, so
+    fixing a wrong answer afterwards leaves everyone who has already finished
+    scored under the mistake. This is the deliberate way to apply the correction
+    backwards to them.
     """
     quiz_id = quiz["id"]
     result_key = f"regrade-result-{quiz_id}"
@@ -870,8 +871,8 @@ def _render_quiz_pdf(quiz, questions, format_key: str) -> bytes:
         pdf.multi_cell(0, 6, _pdf_text(f"{index}. {question['question_text']}"), new_x="LMARGIN", new_y="NEXT")
         pdf.ln(1)
         pdf.set_font("Helvetica", "", 11)
-        for label, text in json.loads(question["options_json"]):
-            pdf.multi_cell(0, 5.5, _pdf_text(f"{label}) {text}"), new_x="LMARGIN", new_y="NEXT")
+        for label, option_text in json.loads(question["options_json"]):
+            pdf.multi_cell(0, 5.5, _pdf_text(f"{label}) {option_text}"), new_x="LMARGIN", new_y="NEXT")
         if format_key in ("questions-answers", "questions-answers-settings"):
             pdf.set_font("Helvetica", "I", 10)
             pdf.set_text_color(23, 107, 82)

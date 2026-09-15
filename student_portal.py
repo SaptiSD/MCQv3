@@ -3,21 +3,22 @@
 from __future__ import annotations
 
 import json
-import random
 from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 
+import attempt_sync
 import grading
 from repository import (all_teachers, attempt_with_quiz, attempts_for_student, available_quizzes,
                         complete_attempt, create_attempt, join_teacher, leave_teacher,
-                        open_attempt, questions_for_quiz, quiz_average_score,
-                        save_attempt_answers, search_teachers, submitted_attempt, teachers_for_student)
-from ui import empty_state, metric_row, page_header, percent, pill, require_session, sign_out
+                        open_attempt, questions_for_quiz, quiz_average_score, quiz_paper_fingerprint,
+                        refresh_attempt_key, resync_attempt, save_attempt_answers, search_teachers,
+                        submitted_attempt, teachers_for_student)
+from ui import empty_state, metric_row, page_header, percent, pill, require_session, sign_out, text
 
 
-SELECT_ALL_TYPE = "Multiple choice - select all that apply"
-TEXT_ANSWER_TYPES = {"Fill in the blank", "Short answer"}
+SELECT_ALL_TYPE = attempt_sync.SELECT_ALL_TYPE
+TEXT_ANSWER_TYPES = attempt_sync.TEXT_ANSWER_TYPES
 
 
 def current_time() -> datetime:
@@ -127,7 +128,7 @@ def dashboard(user) -> None:
                     tone, label = "amber", "In progress"
                 else:
                     tone, label = "grey", "Not started"
-                st.markdown(f"### {quiz['title']} &nbsp;{pill(label, tone)}", unsafe_allow_html=True)
+                st.markdown(f"### {text(quiz['title'])} &nbsp;{pill(label, tone)}", unsafe_allow_html=True)
                 closes = (
                     f"closes {datetime.fromisoformat(quiz['closing_time']).astimezone().strftime('%b %d, %I:%M %p')}"
                     if quiz["closing_enabled"] else "no closing date"
@@ -185,49 +186,51 @@ def my_teachers_page(user) -> None:
                 st.rerun(scope="fragment")
 
 
+def _paper_id(payload: dict) -> str:
+    """Which version of the questions a payload holds.
+
+    This goes in the answer widgets' keys, so a paper that changes shape gets a
+    fresh set of widgets rather than the previous paper's selections redrawn
+    against different questions. Deleting the old keys instead looks like the
+    same thing and is not: Streamlit fires a deleted widget's `on_change`, and
+    the callback then wrote its own copy of the old paper back over the new one.
+    """
+    return attempt_sync.payload_fingerprint(payload, include_key=False)[:10]
+
+
+def _announce(attempt_id: int, message: str) -> None:
+    """Leave a note for the student at the top of their paper."""
+    st.session_state[f"attempt-news-{attempt_id}"] = message
+
+
 def start_attempt(user, quiz) -> None:
     existing = open_attempt(quiz["id"], user["id"])
     if existing:
-        st.session_state.attempt_id = existing["id"]; return
+        # Picking a saved attempt back up is the moment to catch it up with the
+        # quiz. The student is between questions rather than mid-thought, so a
+        # question their teacher has added since they saved can be slotted in
+        # without pulling the paper around under them -- and resuming into a
+        # version of the assessment nobody else is sitting is worse.
+        summary = resync_attempt(existing["id"], user["id"])
+        if summary:
+            _announce(existing["id"], attempt_sync.describe(summary))
+        st.session_state.attempt_id = existing["id"]
+        return
     if not quiz["allow_retake"] and submitted_attempt(quiz["id"], user["id"]):
         # "Completed — no retakes" is only a rendering decision on the dashboard,
         # so a second tab still showing "Start quiz" (or a stale card in this
         # one) could open a fresh attempt on a quiz with retakes switched off.
         st.session_state.retake_blocked = quiz["title"]
         return
-    questions = list(questions_for_quiz(quiz["id"]))
-    if quiz["randomize_questions"]: random.shuffle(questions)
-    frozen = []
-    for question in questions:
-        options = json.loads(question["options_json"])
-        question_type = question["question_type"]
-        if question_type in TEXT_ANSWER_TYPES:
-            # The answer specification never leaves the server: the frozen copy
-            # keeps only what the student's answer box needs to render.
-            spec = grading.answer_spec(question)
-            correct = spec
-            options = []
-        elif question_type == SELECT_ALL_TYPE:
-            correct = json.loads(question["correct_label"])
-            if quiz["randomize_answers"]: random.shuffle(options)
-        else:
-            correct = question["correct_label"]
-            # True/False keeps its natural order; shuffling it just reads oddly.
-            if quiz["randomize_answers"] and question_type != "True / False":
-                random.shuffle(options)
-        entry = {"text": question["question_text"], "options": options,
-                 "correct": correct, "question_type": question_type}
-        if question_type in TEXT_ANSWER_TYPES:
-            entry["hint"] = grading.student_hint(correct)
-            entry["limit"] = grading.input_limit(correct)
-        frozen.append(entry)
+    frozen = attempt_sync.freeze_all(questions_for_quiz(quiz["id"]),
+                                     quiz["randomize_questions"], quiz["randomize_answers"])
     started = current_time()
     deadline = started + timedelta(minutes=quiz["duration_minutes"])
     if quiz["closing_enabled"]:
         deadline = min(deadline, datetime.fromisoformat(quiz["closing_time"]))
     st.session_state.attempt_id = create_attempt(
         quiz["id"], user["id"], started.isoformat(), deadline.isoformat(),
-        json.dumps({"questions": frozen, "answers": {}})
+        json.dumps({"questions": frozen, "answers": {}, "revision": 0})
     )
 
 
@@ -276,8 +279,44 @@ def take_attempt(user, attempt_id: int) -> None:
         # Already scored (time ran out, or another tab submitted it).
         st.session_state.pop("attempt_id", None)
         st.rerun()
+
+    # Every save stamps the attempt with a number that only goes up, and each tab
+    # remembers the one it last saw. A tab that has been sitting open while the
+    # student worked in another one is therefore recognisable — and, crucially,
+    # is repainted from what is stored rather than being left showing answers the
+    # server does not have and writing them back on the next click.
+    seen_key = f"attempt-seen-{attempt_id}"
+    paint_key = f"attempt-paint-{attempt_id}"
+    paint = int(st.session_state.get(paint_key, 0))
+    if attempt_sync.overtaken(payload, st.session_state.get(seen_key)):
+        # Draw the answers again under fresh widget keys. The stored answers have
+        # moved on and a widget's key outranks the `value=`/`index=` it is
+        # re-rendered with, so the only way to show what is really saved is to
+        # ask for different widgets.
+        st.session_state[seen_key] = attempt_sync.revision(payload)
+        st.session_state[paint_key] = paint + 1
+        _announce(attempt_id, "You had this assessment open in more than one place. "
+                              "The answers below are the ones that were saved most recently.")
+        st.rerun(scope="fragment")
+    st.session_state[seen_key] = attempt_sync.revision(payload)
+    paper = _paper_id(payload)
+
+    # Has the teacher changed what this paper *looks like* since it was frozen?
+    # A corrected answer key deliberately does not count: it is invisible here
+    # and is applied when the paper is marked, so it is no reason to interrupt.
+    # `None` means the question bank came back empty — a half-finished save, not
+    # an empty quiz — and nothing should be concluded from it.
+    live_fingerprint = quiz_paper_fingerprint(attempt["quiz_id"])
+    out_of_date = bool(live_fingerprint) and live_fingerprint != attempt_sync.payload_fingerprint(payload, include_key=False)
+
     remaining = datetime.fromisoformat(attempt["deadline_at"]) - current_time()
     if remaining.total_seconds() <= 0:
+        if out_of_date:
+            # Time is up. Catch the paper up and hand it in, rather than making
+            # the student choose between the two with no clock left to do it in.
+            caught_up = resync_attempt(attempt_id, user["id"])
+            if caught_up:
+                payload = caught_up["payload"]
         submit_attempt(attempt, payload, True)
         st.session_state.pop("attempt_id", None)
         st.session_state.time_up_title = attempt["title"]
@@ -291,29 +330,40 @@ def take_attempt(user, attempt_id: int) -> None:
         the automatic submission scored an empty attempt — a student could
         answer every question, run out of time, and be marked zero. Saving on
         each change means the stored attempt is always what is on screen.
+
+        What goes back is the *stored* attempt with this one answer changed, not
+        the copy this run was drawn from. Writing the drawn copy back meant a tab
+        that had been open a while restored its own questions and answers over
+        whatever had happened since — another tab's work, or a teacher's edit.
         """
-        stored = _answer_from_widget(questions[index], st.session_state.get(widget_key))
-        # Re-read before writing. The whole payload goes back on every change, so
-        # a second tab holding an older copy of `answers` used to erase whatever
-        # had been answered in this one.
+        given = _answer_from_widget(questions[index], st.session_state.get(widget_key))
         latest = attempt_with_quiz(attempt_id, user["id"])
-        if latest:
-            try:
-                stored_payload = json.loads(latest["answers_json"] or "{}")
-                answers.update(stored_payload.get("answers") or {})
-            except (ValueError, TypeError):
-                pass
-        if stored is None:
-            answers.pop(str(index), None)
+        if not latest or latest["submitted_at"]:
+            return
+        try:
+            stored = json.loads(latest["answers_json"] or "{}")
+        except (TypeError, ValueError):
+            return
+        if _paper_id(stored) != paper:
+            # This box was drawn against a version of the paper that has since
+            # been replaced. Its value cannot be placed on the new one, and its
+            # index would land on a different question.
+            return
+        saved_answers = stored.get("answers") or {}
+        if given is None:
+            saved_answers.pop(str(index), None)
         else:
-            answers[str(index)] = stored
-        payload["answers"] = answers
-        save_attempt_answers(attempt_id, json.dumps(payload))
+            saved_answers[str(index)] = given
+        stored["answers"] = saved_answers
+        stored["revision"] = attempt_sync.revision(stored) + 1
+        save_attempt_answers(attempt_id, json.dumps(stored))
+        st.session_state[seen_key] = stored["revision"]
+        st.session_state.pop(f"attempt-news-{attempt_id}", None)
 
     st.divider()
     heading, clock = st.columns([3, 1.4], vertical_alignment="center")
     with heading:
-        st.markdown(f"### {attempt['title']}")
+        st.markdown(f"### {text(attempt['title'])}", unsafe_allow_html=True)
         st.progress(min(1.0, len(answers) / len(questions)) if questions else 0,
                     text=f"{len(answers)} of {len(questions)} answered")
     with clock:
@@ -324,9 +374,25 @@ def take_attempt(user, attempt_id: int) -> None:
             f'<span class="clock">{total_seconds // 60}:{total_seconds % 60:02d}</span></div>',
             unsafe_allow_html=True,
         )
+    if news := st.session_state.get(f"attempt-news-{attempt_id}"):
+        st.info(news)
+    if out_of_date:
+        # The alternative — swapping the questions out from under someone who is
+        # mid-answer — is worse than asking. What is not an option is letting
+        # them hand in a paper that no longer exists, so Submit waits.
+        st.warning(
+            "Your teacher changed this assessment while you had it open, so what you see below is "
+            "no longer the current version. Load the update to carry on — the answers you have "
+            "already given are kept."
+        )
+        if st.button("Load the updated version", key=f"resync-{attempt_id}", type="primary", width="stretch"):
+            summary = resync_attempt(attempt_id, user["id"])
+            _announce(attempt_id, attempt_sync.describe(summary) if summary
+                      else "This assessment is already up to date.")
+            st.rerun(scope="fragment")
     for index, question in enumerate(questions):
-        widget_key = f"q-{attempt_id}-{index}"
-        labels = [f"{label}) {text}" for label, text in question["options"]]
+        widget_key = f"q-{attempt_id}-{paper}-{paint}-{index}"
+        labels = [f"{label}) {option_text}" for label, option_text in question["options"]]
         if question.get("question_type") in TEXT_ANSWER_TYPES:
             st.text_input(
                 f"{index + 1}. {question['text']}",
@@ -337,7 +403,8 @@ def take_attempt(user, attempt_id: int) -> None:
                 key=widget_key, on_change=_record, args=(index, widget_key),
             )
         elif question.get("question_type") == SELECT_ALL_TYPE:
-            current = [f"{label}) {text}" for label, text in question["options"] if label in answers.get(str(index), [])]
+            current = [f"{label}) {option_text}" for label, option_text in question["options"]
+                       if label in (answers.get(str(index)) or [])]
             st.multiselect(f"{index + 1}. {question['text']}", labels, default=current,
                            key=widget_key, on_change=_record, args=(index, widget_key))
         else:
@@ -346,9 +413,14 @@ def take_attempt(user, attempt_id: int) -> None:
                      index=labels.index(current) if current in labels else None,
                      key=widget_key, on_change=_record, args=(index, widget_key))
     st.divider()
-    st.caption("Your answers save as you go, so you can come back later or run out of time without losing them. "
-               "Submitting is final unless your teacher allowed retakes.")
-    if st.button("Submit quiz", type="primary", width="stretch", key=f"submit-{attempt_id}"):
+    if out_of_date:
+        st.caption("Submitting is paused until you load your teacher's update, so that you are "
+                   "marked on the same assessment as everyone else.")
+    else:
+        st.caption("Your answers save as you go, so you can come back later or run out of time without losing them. "
+                   "Submitting is final unless your teacher allowed retakes.")
+    if st.button("Submit quiz", type="primary", width="stretch", key=f"submit-{attempt_id}",
+                 disabled=out_of_date):
         payload["answers"] = answers
         submit_attempt(attempt, payload, False)
         st.session_state.pop("attempt_id", None)
@@ -356,6 +428,12 @@ def take_attempt(user, attempt_id: int) -> None:
 
 
 def submit_attempt(attempt, payload: dict, automatic: bool) -> None:
+    # Mark against the answer key as it stands now, not the copy that was frozen
+    # when the attempt started. A student who began before their teacher fixed a
+    # wrong answer used to be marked against the mistake, and the teacher's own
+    # Regrade button — which does exactly this — then disagreed with the score
+    # the student had already been shown.
+    refresh_attempt_key(payload, attempt["quiz_id"])
     # `grading.score_payload` is the same marking the teacher-side regrade uses,
     # so a rescored attempt can never disagree with its original submission.
     score = grading.score_payload(payload)

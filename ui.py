@@ -3,12 +3,28 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from html import escape
 
 import streamlit as st
 
 import server_state
 from db import get_or_create_user
 from repository import PortalMismatch, admin_by_email, authenticate, set_user_role, user_by_email
+
+
+def text(value) -> str:
+    """Escape a value for dropping into one of this module's HTML fragments.
+
+    Streamlit escapes HTML for you everywhere except `unsafe_allow_html=True`,
+    and every heading, tile and badge below is drawn that way. Without this an
+    assessment called "Understanding <div> and <p> Tags" reached the screen as
+    "Understanding and Tags" — the browser swallowed both tags as markup — and a
+    title carrying a <script> tag would have been rather worse than swallowed.
+
+    Anything a person typed goes through here. Anything this module composes
+    itself does not, or the markup would escape its own tags.
+    """
+    return escape("" if value is None else str(value))
 
 
 def styles() -> None:
@@ -223,8 +239,8 @@ def show_flash(slot: str) -> None:
 
 def page_header(eyebrow: str, title: str, lede: str = "") -> None:
     """The standard heading block at the top of every page."""
-    tail = f'<p class="lede">{lede}</p>' if lede else ""
-    st.markdown(f'<div class="eyebrow">{eyebrow}</div><h1>{title}</h1>{tail}', unsafe_allow_html=True)
+    tail = f'<p class="lede">{text(lede)}</p>' if lede else ""
+    st.markdown(f'<div class="eyebrow">{text(eyebrow)}</div><h1>{text(title)}</h1>{tail}', unsafe_allow_html=True)
 
 
 def metric_row(items: list[tuple], per_row: int = 4) -> None:
@@ -233,16 +249,16 @@ def metric_row(items: list[tuple], per_row: int = 4) -> None:
         chunk = items[start:start + per_row]
         for column, (value, label) in zip(st.columns(per_row), chunk):
             with column:
-                st.markdown(f'<div class="metric"><strong>{value}</strong><small>{label}</small></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric"><strong>{text(value)}</strong><small>{text(label)}</small></div>', unsafe_allow_html=True)
 
 
-def pill(text: str, tone: str = "grey") -> str:
+def pill(label: str, tone: str = "grey") -> str:
     """Inline status badge. Returns markup so it can sit inside another string."""
-    return f'<span class="pill pill-{tone}">{text}</span>'
+    return f'<span class="pill pill-{tone}">{text(label)}</span>'
 
 
 def empty_state(title: str, body: str) -> None:
-    st.markdown(f'<div class="empty"><h3>{title}</h3><p>{body}</p></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="empty"><h3>{text(title)}</h3><p>{text(body)}</p></div>', unsafe_allow_html=True)
 
 
 ROLE_LABELS = {"teacher": "teacher", "student": "student", "admin": "administrator"}
@@ -258,7 +274,7 @@ def _oidc_configured() -> bool:
 def _login_panel(side: str, eyebrow: str, heading: str, blurb: str, google_ready: bool) -> None:
     """One half of the split login. `side` is "teacher" or "student"."""
     with st.container(border=True):
-        st.markdown(f'<div class="eyebrow">{eyebrow}</div><h3>{heading}</h3>', unsafe_allow_html=True)
+        st.markdown(f'<div class="eyebrow">{text(eyebrow)}</div><h3>{text(heading)}</h3>', unsafe_allow_html=True)
         st.caption(blurb)
         with st.form(f"login-{side}"):
             identifier = st.text_input("Email or full name", key=f"login-id-{side}")
@@ -323,7 +339,7 @@ def login_page() -> None:
 def choose_role_page() -> None:
     """Shown once when a Google sign-in arrives without a known role (e.g. the redirect dropped it)."""
     name = (getattr(st.user, "name", "") or "").split()[0] if getattr(st.user, "name", "") else "there"
-    st.markdown(f'<div class="eyebrow">One quick thing</div><h1>Welcome, {name}.</h1>', unsafe_allow_html=True)
+    st.markdown(f'<div class="eyebrow">One quick thing</div><h1>Welcome, {text(name)}.</h1>', unsafe_allow_html=True)
     st.caption("Tell us how you'll use MCQ and we'll set your workspace up right away.")
     teacher_side, student_side = st.columns(2, gap="large")
     with teacher_side:
@@ -352,8 +368,8 @@ def workspace_nav(user, selected_page: str | None = None) -> str:
         f"<div class='topbar'><span class='mark'>MCQ</span>"
         f"<span><span class='name'>Assessment studio</span>"
         f"<span class='sub'>Quizzes for teachers and students</span></span>"
-        f"<span class='who'><span class='avatar'>{initials}</span>"
-        f"<span>{name}<br><span class='role'>{user['role'].title()}</span></span></span></div>",
+        f"<span class='who'><span class='avatar'>{text(initials)}</span>"
+        f"<span>{text(name)}<br><span class='role'>{text(user['role'].title())}</span></span></span></div>",
         unsafe_allow_html=True,
     )
     if user["role"] == "teacher":

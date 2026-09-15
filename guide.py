@@ -128,7 +128,9 @@ TEACHER_GUIDE = [
         ("p", "Open Manage on a quiz, then Assign by students or teams. You can switch between All, specific students, and teams at any time."),
         ("h3", "While students are working"),
         ("p", "Analytics shows every student's status on a given exam - Not started, In progress or Completed - along with their score and last activity. The same table appears under Manage."),
-        ("note", "Once a real student starts an assessment its settings become read-only, so the paper cannot change underneath them. Your own preview attempts from Student view do not count."),
+        ("note", "Once a real student starts an assessment its settings - timing, passing score, retakes - become read-only. Your own preview attempts from Student view do not count."),
+        ("p", "Questions can still be corrected while students are working, and nothing changes under anyone silently. A student whose paper no longer matches is told so, and their Submit button waits until they load your change; their answers so far are kept and carried across. A student who has saved and left picks the new version up when they press Resume."),
+        ("note", "Correcting an answer key is the exception, because there is nothing for the student to see. Attempts are marked against the key as it stands when they are handed in, so the correction simply applies. Attempts already submitted keep their old marks until you use Regrade submitted attempts."),
         ("h3", "Downloads"),
         ("ul", [
             "Download PDF - the paper itself, optionally with the answer key and the quiz settings.",
@@ -143,7 +145,7 @@ TEACHER_GUIDE = [
         ("ul", [
             "A student cannot see my assessment - check they are on your roster, that the quiz is assigned to them, and that the opening time has passed and the closing time has not.",
             "A student ran out of time - their answers are submitted automatically when the timer reaches zero, and whatever they had answered is marked.",
-            "I need to fix a published question - open Manage, edit it, and save. If a student has already started, the settings lock; delete and republish instead.",
+            "I need to fix a published question - open Manage, edit it, and save. Students partway through are told and can pick the correction up without losing their answers; anyone who has already submitted is re-marked by Regrade submitted attempts.",
             "A student joined the wrong teacher - they can leave you from My teachers, and you can remove them from your roster.",
         ]),
     ]),
@@ -159,7 +161,9 @@ STUDENT_GUIDE = [
         ("p", "Your dashboard lists everything your teachers have assigned and that is currently open. Press Start quiz to begin."),
         ("ul", [
             "The countdown starts when you press Start and keeps running - it does not pause if you close the tab.",
-            "Save progress stores your answers so you can come back and Resume.",
+            "Your answers save as you go, so you can leave and come back with Resume.",
+            "If your teacher changes the assessment while you have it open, you will see a note and a Load the updated version button. Submitting waits until you press it, and the answers you have already given are kept.",
+            "Opening the same assessment in two tabs is safe: whichever answers were saved most recently are the ones you will see and the ones that are marked.",
             "When the timer reaches zero your answers are submitted automatically and marked as they stand.",
             "Submit quiz finishes the attempt. If your teacher allowed retakes you will see a Retake button afterwards.",
         ]),

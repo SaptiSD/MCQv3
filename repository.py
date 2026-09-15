@@ -7,8 +7,8 @@ import hashlib
 import hmac
 import json
 import secrets
-from datetime import datetime, timedelta, timezone
 
+import attempt_sync
 import grading
 from db import client, utc_now
 
@@ -438,11 +438,26 @@ def assigned_student_ids(quiz_id: int) -> set[int]:
 
 
 def set_quiz_assignments(quiz_id: int, student_ids: list[int]) -> None:
+    """Make the quiz's audience exactly `student_ids`.
+
+    Written as "add what is missing, drop what is left over" rather than "delete
+    everything, then insert it back". Saving the same assignment twice is then
+    simply the second one finding nothing to do, instead of two runs racing
+    between the delete and the insert -- one of which hit the primary key and
+    lost its write, while for the moment in between the quiz belonged to nobody
+    and vanished from every student's dashboard mid-refresh. It also leaves
+    `assigned_at` alone for students who were already assigned, so re-saving an
+    audience no longer backdates everyone to now.
+    """
     supabase = client()
-    supabase.table("quiz_students").delete().eq("quiz_id", quiz_id).execute()
-    if student_ids:
-        supabase.table("quiz_students").insert(
-            [{"quiz_id": quiz_id, "student_id": student_id, "assigned_at": utc_now()} for student_id in student_ids]
+    wanted = {int(student_id) for student_id in student_ids}
+    current = assigned_student_ids(quiz_id)
+    if leaving := current - wanted:
+        supabase.table("quiz_students").delete().eq("quiz_id", quiz_id).in_("student_id", sorted(leaving)).execute()
+    if joining := wanted - current:
+        supabase.table("quiz_students").upsert(
+            [{"quiz_id": quiz_id, "student_id": student_id, "assigned_at": utc_now()} for student_id in sorted(joining)],
+            on_conflict="quiz_id,student_id",
         ).execute()
 
 
@@ -793,70 +808,89 @@ def quiz_attempt_counts(quiz_id: int, exclude_student_id: int | None = None) -> 
     return {"open": len(rows) - submitted, "submitted": submitted}
 
 
-def _refreshed_correct(question_row: dict):
-    """The answer key for a question row, in the shape a frozen attempt stores it."""
-    question_type = question_row.get("question_type", "Multiple choice")
-    if question_type in grading.TEXT_QUESTION_TYPES:
-        return grading.answer_spec(question_row)
-    if question_type == grading.SELECT_ALL_TYPE:
-        try:
-            return json.loads(question_row["correct_label"])
-        except (TypeError, ValueError):
-            return []
-    return question_row["correct_label"]
+def quiz_paper_fingerprint(quiz_id: int) -> str | None:
+    """A digest of what the quiz's questions currently *look like*, or `None`.
+
+    The answer key is deliberately left out: this is the comparison that decides
+    whether to interrupt a student mid-attempt, and a teacher correcting an
+    answer changes nothing on their screen. Grading picks the corrected key up
+    on its own when the paper is marked.
+
+    `None` is deliberately not a fingerprint either: a quiz with no questions is
+    a half-finished save, and nothing should conclude from it that every attempt
+    in flight has gone stale.
+    """
+    rows = _rows(
+        client().table("questions")
+        .select("question_text,question_type,options_json,correct_label")
+        .eq("quiz_id", quiz_id)
+        .execute()
+    )
+    return attempt_sync.bank_fingerprint(rows, include_key=False) if rows else None
 
 
-def _rekeyed_choice(frozen: dict, live_row: dict, live_correct):
-    """Express a live answer key in the labels the frozen attempt actually showed.
+def refresh_attempt_key(payload: dict, quiz_id: int) -> list[str]:
+    """Re-read `payload`'s answer key from the question bank before marking it.
 
-    A, B, C, D are fixed slots in the editor, so a teacher who corrects a
-    question by rewriting what sits in each slot reuses the same letters for
-    different text. Copying the live letter straight across would then mark a
-    different option correct than the one the teacher chose. Matching on the
-    option *text* survives that; `None` means this question can't be rekeyed
-    safely and should keep the key it was graded under.
+    Marking against the key as it stands at submission is the one rule that
+    makes every score on a quiz mean the same thing. Freezing the key instead
+    meant a student who started before the teacher fixed a wrong answer was
+    marked against the mistake -- and the teacher's own Regrade button, which
+    does exactly this, then disagreed with the score the student was shown.
+
+    Falls back to the frozen key if the bank cannot be read: a student's
+    submission must never be lost to a query that failed.
     """
     try:
-        live_options = dict(json.loads(live_row["options_json"]))
+        rows = questions_for_quiz(quiz_id)
+    except Exception:
+        return []
+    return attempt_sync.refresh_answer_key(payload, rows) if rows else []
+
+
+def resync_attempt(attempt_id: int, student_id: int) -> dict | None:
+    """Bring an unsubmitted attempt up to the quiz's current questions.
+
+    Returns a summary of what moved (with the new payload under "payload"), or
+    `None` when the attempt was already current, has been submitted, or there is
+    nothing safe to sync it to.
+    """
+    attempt = attempt_with_quiz(attempt_id, student_id)
+    if not attempt or attempt.get("submitted_at"):
+        return None
+    try:
+        payload = json.loads(attempt["answers_json"] or "{}")
     except (TypeError, ValueError):
         return None
-    frozen_labels = {
-        grading.normalise_text(text): label
-        for label, text in (frozen.get("options") or [])
-    }
-    wanted = live_correct if isinstance(live_correct, list) else [live_correct]
-    mapped = []
-    for label in wanted:
-        text = live_options.get(label)
-        if text is None:
-            return None
-        frozen_label = frozen_labels.get(grading.normalise_text(text))
-        if frozen_label is None:
-            return None
-        mapped.append(frozen_label)
-    if isinstance(live_correct, list):
-        return mapped
-    return mapped[0] if mapped else None
+    if not payload.get("questions"):
+        return None
+    rows = questions_for_quiz(attempt["quiz_id"])
+    if not rows:
+        return None
+    if attempt_sync.payload_fingerprint(payload) == attempt_sync.bank_fingerprint(rows):
+        return None
+    quiz = get_quiz(attempt["quiz_id"]) or {}
+    fresh, summary = attempt_sync.resync(payload, rows, randomize_answers=bool(quiz.get("randomize_answers")))
+    fresh["revision"] = int(payload.get("revision") or 0) + 1
+    save_attempt_answers(attempt_id, json.dumps(fresh))
+    summary["payload"] = fresh
+    return summary
 
 
 def regrade_quiz(quiz_id: int, exclude_student_id: int | None = None) -> dict:
     """Re-mark every submitted attempt against the quiz's current answer key.
 
-    Attempts freeze the questions they were built from, so correcting a wrong
-    answer key only helps students who start afterwards. This walks the frozen
-    copies, matches each one to a live question by its text, refreshes the stored
-    answer key and rescores. Questions the teacher has since reworded or deleted
-    keep the key they were graded under, because there is nothing to match them
-    to and guessing would be worse than leaving them alone.
+    Attempts are marked against the key that was live when they were handed in,
+    so a teacher who corrects a wrong answer afterwards still needs a deliberate
+    way to apply the correction backwards. This walks each attempt's frozen
+    questions, matches them to live ones by text, refreshes the stored key and
+    rescores. Questions the teacher has since reworded or deleted keep the key
+    they were graded under, because there is nothing to match them to.
 
     Returns a summary: attempts looked at, attempts whose score moved, and how
     many frozen questions could not be matched.
     """
     current = questions_for_quiz(quiz_id)
-    by_text: dict[str, dict] = {}
-    for row in current:
-        by_text.setdefault(grading.normalise_text(row["question_text"]), row)
-
     query = client().table("attempts").select("*").eq("quiz_id", quiz_id).not_.is_("submitted_at", None)
     if exclude_student_id is not None:
         query = query.neq("student_id", exclude_student_id)
@@ -873,24 +907,9 @@ def regrade_quiz(quiz_id: int, exclude_student_id: int | None = None) -> dict:
             payload = json.loads(attempt["answers_json"])
         except (TypeError, ValueError):
             continue
-        frozen = payload.get("questions") or []
-        if not frozen:
+        if not payload.get("questions"):
             continue
-        for question in frozen:
-            text = question.get("text", "")
-            match = by_text.get(grading.normalise_text(text))
-            if match is None or match.get("question_type") != question.get("question_type"):
-                unmatched.add(text)
-                continue
-            refreshed = _refreshed_correct(match)
-            if question.get("question_type") in grading.TEXT_QUESTION_TYPES:
-                question["correct"] = refreshed
-                continue
-            rekeyed = _rekeyed_choice(question, match, refreshed)
-            if rekeyed is None:
-                unmatched.add(text)
-                continue
-            question["correct"] = rekeyed
+        unmatched.update(attempt_sync.refresh_answer_key(payload, current))
         score = grading.score_payload(payload)
         passed = int(score >= passing_score)
         if abs((attempt.get("score_percent") or 0) - score) < 1e-9 and attempt.get("passed") == passed:
