@@ -128,9 +128,10 @@ TEACHER_GUIDE = [
         ("p", "Open Manage on a quiz, then Assign by students or teams. You can switch between All, specific students, and teams at any time."),
         ("h3", "While students are working"),
         ("p", "Analytics shows every student's status on a given exam - Not started, In progress or Completed - along with their score and last activity. The same table appears under Manage."),
-        ("note", "Once a real student starts an assessment its settings - timing, passing score, retakes - become read-only. Your own preview attempts from Student view do not count."),
-        ("p", "Questions can still be corrected while students are working, and nothing changes under anyone silently. A student whose paper no longer matches is told so, and their Submit button waits until they load your change; their answers so far are kept and carried across. A student who has saved and left picks the new version up when they press Resume."),
-        ("note", "Correcting an answer key is the exception, because there is nothing for the student to see. Attempts are marked against the key as it stands when they are handed in, so the correction simply applies. Attempts already submitted keep their old marks until you use Regrade submitted attempts."),
+        ("note", "Once a real student starts an assessment, both its settings and its questions become read-only. Your own preview attempts from Student view do not count."),
+        ("p", "Students have to sit the same paper for their results to mean anything next to each other, so the paper is fixed the moment the first one starts. Get the questions right before you assign it - Student view lets you sit your own quiz and check it reads correctly."),
+        ("note", "An answer key is the exception and stays correctable, because a mis-keyed question is a mistake rather than a change of paper, and fixing it alters nothing the student sees. Anyone still working is marked against the corrected key when they hand in; for results already recorded, use Regrade submitted attempts."),
+        ("p", "To change the questions themselves after students have started, delete the assessment and publish a new one."),
         ("h3", "Downloads"),
         ("ul", [
             "Download PDF - the paper itself, optionally with the answer key and the quiz settings.",
@@ -145,7 +146,7 @@ TEACHER_GUIDE = [
         ("ul", [
             "A student cannot see my assessment - check they are on your roster, that the quiz is assigned to them, and that the opening time has passed and the closing time has not.",
             "A student ran out of time - their answers are submitted automatically when the timer reaches zero, and whatever they had answered is marked.",
-            "I need to fix a published question - open Manage, edit it, and save. Students partway through are told and can pick the correction up without losing their answers; anyone who has already submitted is re-marked by Regrade submitted attempts.",
+            "I need to fix a published question - if nobody has started it yet, open Manage, edit it and save. Once a student has started, only the answer key can change: correct it, then use Regrade submitted attempts for results already recorded. To change the question itself, delete the assessment and publish a new one.",
             "A student joined the wrong teacher - they can leave you from My teachers, and you can remove them from your roster.",
         ]),
     ]),
@@ -162,7 +163,7 @@ STUDENT_GUIDE = [
         ("ul", [
             "The countdown starts when you press Start and keeps running - it does not pause if you close the tab.",
             "Your answers save as you go, so you can leave and come back with Resume.",
-            "If your teacher changes the assessment while you have it open, you will see a note and a Load the updated version button. Submitting waits until you press it, and the answers you have already given are kept.",
+            "Once you start, the questions cannot change under you. If your teacher corrects a wrong answer afterwards, your paper is marked against the correction.",
             "Opening the same assessment in two tabs is safe: whichever answers were saved most recently are the ones you will see and the ones that are marked.",
             "When the timer reaches zero your answers are submitted automatically and marked as they stand.",
             "Submit quiz finishes the attempt. If your teacher allowed retakes you will see a Retake button afterwards.",

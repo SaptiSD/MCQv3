@@ -392,9 +392,11 @@ def take_attempt(user, attempt_id: int) -> None:
     if news := st.session_state.get(f"attempt-news-{attempt_id}"):
         st.info(news)
     if out_of_date:
-        # The alternative — swapping the questions out from under someone who is
-        # mid-answer — is worse than asking. What is not an option is letting
-        # them hand in a paper that no longer exists, so Submit waits.
+        # A backstop, not a routine path: a quiz's questions are fixed once anyone
+        # starts it, so the only ways to get here are an attempt that was already
+        # open before that rule existed, or the database being changed underneath
+        # the app. Either way, handing in a paper that no longer exists is not an
+        # option, so Submit waits until the student has the current one.
         st.warning(
             "Your teacher changed this assessment while you had it open, so what you see below is "
             "no longer the current version. Load the update to carry on — the answers you have "

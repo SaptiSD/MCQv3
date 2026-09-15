@@ -499,6 +499,15 @@ def create_quiz(owner_id: int, title: str, duration: int, passing: int, allow_re
     return quiz_id
 
 
+# What a teacher is told when they try to change a paper students are sitting.
+PAPER_IS_FIXED = (
+    "A student has already started this assessment, so its questions are fixed: "
+    "the wording, the options and how many there are can no longer change. You can "
+    "still correct an answer key. To change the questions themselves, delete this "
+    "assessment and publish a new one."
+)
+
+
 def save_question_bank(quiz_id: int, questions: list[dict]) -> None:
     """Replace a quiz's questions with `questions`.
 
@@ -506,6 +515,18 @@ def save_question_bank(quiz_id: int, questions: list[dict]) -> None:
     the previous question bank intact rather than emptying the quiz. An empty
     list is refused outright: every route into here is an editor saving work,
     and "save" must never mean "delete everything".
+
+    Once a real student has started, the **paper** is fixed -- the same rule the
+    quiz's settings have always followed, and for the same reason: two students
+    sitting different papers cannot be compared to each other. The **answer key**
+    is deliberately not part of that. A mis-keyed question is a mistake, it has to
+    stay correctable, and correcting it changes nothing the student sees; marking
+    picks the correction up at submission, and `regrade_quiz` applies it to
+    results already in.
+
+    The check lives here rather than in the editor because a disabled widget is
+    only a rendering decision -- a second tab, or a replayed click, reaches this
+    function all the same.
     """
     if not questions:
         raise ValueError("A quiz needs at least one question. Saving an empty question bank would erase the existing ones.")
@@ -523,6 +544,14 @@ def save_question_bank(quiz_id: int, questions: list[dict]) -> None:
         }
         for i, q in enumerate(questions)
     ]
+    stored = questions_for_quiz(quiz_id)
+    quiz = get_quiz(quiz_id)
+    if stored and quiz_has_attempts(quiz_id, exclude_student_id=quiz["owner_id"] if quiz else None):
+        # `include_key=False` is the comparison that asks "would a student notice?",
+        # which is exactly the line between a fixed paper and a correctable key.
+        if (attempt_sync.bank_fingerprint(records, include_key=False)
+                != attempt_sync.bank_fingerprint(stored, include_key=False)):
+            raise ValueError(PAPER_IS_FIXED)
     # Read back what the insert actually wrote. Without this a request that
     # returned 2xx but stored nothing would still take the delete below with it,
     # and the editor would report "saved and published" over an emptied quiz.

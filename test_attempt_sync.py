@@ -249,6 +249,35 @@ check("which leaves a fresh tab on it unbehind",
       sync.overtaken({"revision": "nonsense"}, 0) is False)
 
 
+print("== the paper is fixed once a student starts; the key is not ==")
+# This is the rule `repository.save_question_bank` enforces. The decision is
+# whether the *visible* fingerprint moved, so it can be checked without a
+# database: an unchanged fingerprint means the save is allowed through.
+LIVE = [CAPITALS, SUMS]
+
+
+def allowed(proposed):
+    """Would `save_question_bank` let this through once a student has started?"""
+    return (sync.bank_fingerprint(proposed, include_key=False)
+            == sync.bank_fingerprint(LIVE, include_key=False))
+
+
+check("correcting an answer key is allowed",
+      allowed([row(0, "Capital of France?", [["A", "Paris"], ["B", "Rome"], ["C", "Madrid"]], "C"), SUMS]))
+check("re-ordering the questions is allowed", allowed([SUMS, CAPITALS]))
+check("adding a question is refused", not allowed([CAPITALS, SUMS, COLOURS]))
+check("removing a question is refused", not allowed([CAPITALS]))
+check("rewording a question is refused",
+      not allowed([row(0, "Which city is the capital of France?", [["A", "Paris"], ["B", "Rome"], ["C", "Madrid"]], "A"), SUMS]))
+check("rewriting an option is refused",
+      not allowed([row(0, "Capital of France?", [["A", "Lyon"], ["B", "Rome"], ["C", "Madrid"]], "A"), SUMS]))
+check("dropping an option is refused",
+      not allowed([row(0, "Capital of France?", [["A", "Paris"], ["B", "Rome"]], "A"), SUMS]))
+check("widening what a typed answer accepts is allowed",
+      sync.bank_fingerprint([TYPED_WIDER], include_key=False) == sync.bank_fingerprint([TYPED], include_key=False))
+
+
+print()
 print("== MCQ-BUG-017: angle brackets survive to the screen ==")
 title = "HTML Basics: Understanding <div> and <p> Tags"
 rendered = ui.text(title)

@@ -80,6 +80,15 @@ Keep `attempt_sync` and `grading` free of Streamlit and of the database.
 
 ## Invariants worth not breaking
 
+**A quiz's paper is fixed once a real student starts it; its answer key is not.**
+This is the same rule the settings have always followed (`settings_editor`), and
+it is the reason most of the "a teacher edited mid-attempt" reports cannot happen
+any more rather than being reconciled after the fact. Enforced in
+`repository.save_question_bank` -- not in the editor, because a disabled widget is
+only a rendering decision -- by comparing `bank_fingerprint(..., include_key=False)`
+before and after. A teacher's own preview attempts do not count. The way out of a
+genuinely wrong paper is to delete the assessment and publish a new one.
+
 **An attempt freezes its questions.** `attempts.answers_json` holds
 `{"questions": [...], "answers": {...}, "revision": n}`. The frozen copy is why
 each student gets a differently shuffled paper and why a typed question's answer
@@ -93,8 +102,11 @@ edits the quiz, which is what `attempt_sync` exists to manage:
   crediting the wrong one.
 - Two fingerprints, and the difference matters. `include_key=True` answers "is
   this attempt marking against the right answers?"; `include_key=False` answers
-  "would the student notice?" — only the latter may interrupt someone
-  mid-attempt.
+  "would the student notice?" -- which is also exactly the line between the fixed
+  paper and the correctable key, so it is what `save_question_bank` enforces.
+- The student-side "Load the updated version" flow is a **backstop**, not a
+  feature. With the paper fixed it should never appear; it exists for attempts
+  older than the rule and for drift introduced outside the app.
 - A question bank that reads back **empty** is a half-finished save, not an
   empty quiz. Never sync an attempt to it.
 

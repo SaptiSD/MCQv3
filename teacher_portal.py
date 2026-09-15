@@ -729,10 +729,9 @@ def manage_quiz(user, quiz_id: int) -> None:
             )
             st.session_state[f"regrade-prompt-{quiz_id}"] = True
         if attempts["open"]:
-            st.warning(
+            st.info(
                 f"{attempts['open']} student{'s have' if attempts['open'] != 1 else ' has'} this assessment open right now. "
-                "Editing it tells them their paper is out of date and pauses their Submit button until they load "
-                "your changes, so their answers are kept but they will notice."
+                "Its questions are fixed while anyone is taking it; an answer key you correct is applied when they hand in."
             )
         with st.expander("Download"):
             _quiz_downloads(quiz)
@@ -906,6 +905,17 @@ def _render_quiz_pdf(quiz, questions, format_key: str) -> bytes:
 
 def question_bank(quiz) -> None:
     questions = questions_for_quiz(quiz["id"])
+    # The same rule the settings follow, for the same reason. `save_question_bank`
+    # is what enforces it; this only keeps the teacher from typing out an edit
+    # that would be refused, and says why.
+    locked = bool(questions) and quiz_has_attempts(quiz["id"], exclude_student_id=quiz["owner_id"])
+    if locked:
+        st.info(
+            "A student has started this assessment, so its **questions are now fixed** \u2014 the same way its "
+            "settings are. You can still correct an answer key below, and **Regrade submitted attempts** applies "
+            "the correction to results already recorded. To change the questions themselves, delete this "
+            "assessment and publish a new one. Your own preview attempts from Student view don't count."
+        )
     if questions:
         with st.expander("Reorder questions"):
             question_options = {question["id"]: f"{index}. {question['question_text']}" for index, question in enumerate(questions, 1)}
@@ -923,6 +933,11 @@ def question_bank(quiz) -> None:
                 move_question(quiz["id"], selected_id, 1)
                 reset_editor_state(quiz["id"])
                 st.rerun(scope="fragment")
+    if locked:
+        # An upload replaces the whole paper, so there is nothing it could do here
+        # that the lock would allow.
+        manual_question_editor(quiz, locked=True)
+        return
     mode = st.radio("How would you like to add questions?", ["Create manually", "Upload question bank"], horizontal=True, key=f"question-mode-{quiz['id']}")
     if mode == "Create manually":
         manual_question_editor(quiz)
@@ -1207,8 +1222,11 @@ def _draft_to_questions(draft: list[dict]) -> list[dict]:
     return questions
 
 
-def manual_question_editor(quiz) -> None:
-    st.caption("Create the test directly. Each question needs text, at least two options, and one correct answer.")
+def manual_question_editor(quiz, locked: bool = False) -> None:
+    if locked:
+        st.caption("Correct an answer below and save. The questions and their options are fixed.")
+    else:
+        st.caption("Create the test directly. Each question needs text, at least two options, and one correct answer.")
     draft = _editor_draft(quiz)
     quiz_id = quiz["id"]
     epoch = editor_epoch(quiz_id)
@@ -1230,9 +1248,10 @@ def manual_question_editor(quiz) -> None:
 
     st.write(f"**{len(draft)}** question{'s' if len(draft) != 1 else ''} in this quiz")
     add_col, remove_col = st.columns(2)
-    add_col.button("Add another question", key=f"manual-add-{quiz_id}", width="stretch", on_click=_add_question)
+    add_col.button("Add another question", key=f"manual-add-{quiz_id}", width="stretch",
+                   on_click=_add_question, disabled=locked)
     remove_col.button("Remove last question", key=f"manual-remove-{quiz_id}", width="stretch",
-                      on_click=_remove_question, disabled=len(draft) <= 1)
+                      on_click=_remove_question, disabled=locked or len(draft) <= 1)
 
     for index, entry in enumerate(draft):
         with st.container(border=True):
@@ -1241,12 +1260,13 @@ def manual_question_editor(quiz) -> None:
             question_type = st.selectbox(
                 "Question type", QUESTION_TYPES,
                 index=QUESTION_TYPES.index(entry["type"]) if entry["type"] in QUESTION_TYPES else 0,
-                key=type_key, on_change=_write, args=("type", index, type_key),
+                key=type_key, on_change=_write, args=("type", index, type_key), disabled=locked,
             )
             entry["type"] = question_type
             text_key = f"manual-text-{quiz_id}-{epoch}-{index}"
             entry["text"] = st.text_area("Question text", value=entry["text"], height=80,
-                                         key=text_key, on_change=_write, args=("text", index, text_key))
+                                         key=text_key, on_change=_write, args=("text", index, text_key),
+                                         disabled=locked)
             if question_type in {"Multiple choice", SELECT_ALL_TYPE}:
                 columns = st.columns(4)
                 for option_index, label in enumerate(("A", "B", "C", "D")):
@@ -1255,6 +1275,7 @@ def manual_question_editor(quiz) -> None:
                         entry["options"][label] = st.text_input(
                             f"Option {label}", value=entry["options"].get(label, ""),
                             key=option_key, on_change=_write, args=("options", index, option_key, label),
+                            disabled=locked,
                         )
             if question_type == "True / False":
                 tf_key = f"manual-correct-tf-{quiz_id}-{epoch}-{index}"
@@ -1297,7 +1318,8 @@ def manual_question_editor(quiz) -> None:
                         entry["typed"][field] = st.session_state[f"{prefix}-{field}"]
 
     questions = _draft_to_questions(draft)
-    if st.button("Save manually created test", type="primary", key=f"manual-save-{quiz_id}", width="stretch"):
+    save_label = "Save answer key" if locked else "Save manually created test"
+    if st.button(save_label, type="primary", key=f"manual-save-{quiz_id}", width="stretch"):
         errors = _question_errors(questions)
         if errors:
             st.error(" ".join(errors))
