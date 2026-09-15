@@ -12,11 +12,21 @@ def extract_upload(upload) -> str:
     if upload.name.lower().endswith(".docx"):
         return "\n".join(p.text for p in Document(io.BytesIO(upload.getvalue())).paragraphs)
     raw = upload.getvalue()
-    # Notepad and Excel write a byte-order mark. Decoded as plain utf-8 it stays
-    # on the front of the first line, where it is not whitespace to `re`, so
-    # question 1 never matched and was dropped without a word. utf-8-sig eats it,
-    # and utf-16 covers the other thing "Save as Unicode" produces.
-    for encoding in ("utf-8-sig", "utf-16"):
+    # A byte-order mark says outright what the encoding is, so trust it. Without
+    # one, utf-16 must never be guessed at: `bytes.decode("utf-16")` succeeds on
+    # almost any even-length input by pairing bytes up, so a Windows ANSI file --
+    # what "Save as plain text" writes the moment the document contains a curly
+    # apostrophe -- came back as CJK noise and parsed as nothing at all. Because
+    # it turned on the file's length being even, adding a space to the end could
+    # fix or break it, which made it look intermittent.
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    # utf-8-sig also eats the utf-8 BOM, which is not whitespace to `re` and so
+    # kept question 1 from ever matching. cp1252 is the Windows ANSI fallback.
+    for encoding in ("utf-8-sig", "cp1252"):
         try:
             return raw.decode(encoding)
         except (UnicodeDecodeError, LookupError):
@@ -31,7 +41,12 @@ def parse_bank(raw: str) -> list[dict]:
 
 def _parse(raw: str) -> tuple[list[dict], dict]:
     marker = re.compile(r"^\s*answer\s*key\s*:?-?\s*(.*)$", re.I)
-    question = re.compile(r"^\s*(\d+)[.)]\s+(.+)$")
+    # `\s*`, not `\s+`, for the same reason as the options below: "1.What is
+    # 2+2?" is still question 1, and reading it as prose dropped the question and
+    # its options without a word -- the very thing `parse_report` exists to stop.
+    # The lookahead keeps a wrapped line like "1.5 grams of salt" from being
+    # mistaken for question 1.
+    question = re.compile(r"^\s*(\d+)[.)](?:\s+|(?=\D))\s*(.+)$")
     # `\s*`, not `\s+`: "A.Paris" with no space is still an option, and treating
     # it as prose folded it into the question text and then dropped the question.
     option = re.compile(r"^\s*([A-F])[.)]\s*(.+)$", re.I)

@@ -342,11 +342,21 @@ def student_ids_for_teams(teacher_id: int, team_ids: list[int]) -> set[int]:
 
 
 def set_team_members(team_id: int, student_ids: list[int]) -> None:
+    """Make the team's membership exactly `student_ids`.
+
+    Add-what-is-missing, drop-what-is-left-over, for the same reasons as
+    `set_quiz_assignments`: saving twice is then a no-op rather than a race, and
+    a failed insert cannot leave the team empty, since writes are not retried.
+    """
     supabase = client()
-    supabase.table("team_students").delete().eq("team_id", team_id).execute()
-    if student_ids:
-        supabase.table("team_students").insert(
-            [{"team_id": team_id, "student_id": student_id, "added_at": utc_now()} for student_id in student_ids]
+    wanted = {int(student_id) for student_id in student_ids}
+    current = team_student_ids(team_id)
+    if leaving := current - wanted:
+        supabase.table("team_students").delete().eq("team_id", team_id).in_("student_id", sorted(leaving)).execute()
+    if joining := wanted - current:
+        supabase.table("team_students").upsert(
+            [{"team_id": team_id, "student_id": student_id, "added_at": utc_now()} for student_id in sorted(joining)],
+            on_conflict="team_id,student_id",
         ).execute()
 
 
@@ -645,13 +655,24 @@ def student_progress_for_quiz(teacher_id: int, quiz_id: int):
     if not quiz:
         return []
     roster = students(teacher_id)
-    assigned = _rows(
-        supabase.table("quiz_students").select("student_id").eq("quiz_id", quiz_id).execute()
-    )
-    if not assigned:
+    assigned_ids = {
+        row["student_id"]
+        for row in _rows(supabase.table("quiz_students").select("student_id").eq("quiz_id", quiz_id).execute())
+    }
+    # Someone unassigned after they sat the quiz still has a result, and this is
+    # the only place the teacher can read it: the results table, the exam
+    # participation table and the results CSV all come from here. Listing only
+    # the currently assigned made narrowing a quiz's audience delete the teacher's
+    # access to scores that the workspace totals -- counted straight off
+    # `attempts` -- carried on including.
+    attempted_ids = {
+        row["student_id"]
+        for row in _rows(supabase.table("attempts").select("student_id").eq("quiz_id", quiz_id).execute())
+    }
+    students_rows = [student for student in roster
+                     if student["id"] in assigned_ids or student["id"] in attempted_ids]
+    if not students_rows:
         return []
-    assigned_ids = {row["student_id"] for row in assigned}
-    students_rows = [student for student in roster if student["id"] in assigned_ids]
 
     attempt_rows = []
     if students_rows and quiz_id:
@@ -674,6 +695,7 @@ def student_progress_for_quiz(teacher_id: int, quiz_id: int):
             "student": student["name"],
             "email": student["email"],
             "status": status,
+            "assigned": student["id"] in assigned_ids,
             "score": attempt.get("score_percent") if attempt and attempt.get("score_percent") is not None else None,
             "result": ("Passed" if attempt.get("passed") else "Failed") if attempt and attempt.get("passed") is not None else "-",
             "last_activity": (attempt.get("submitted_at") or attempt.get("started_at")) if attempt else "-",
@@ -1079,7 +1101,12 @@ def create_user(name: str, email: str, role: str, password: str) -> dict:
         raise ValueError("Enter a name and a valid email address.")
     if not password:
         raise ValueError("Set a password for this account.")
-    email = email.lower()
+    # Strip as well as lower-case, the way the admin accounts already do. An
+    # address pasted with a trailing space -- the usual result of copying out of
+    # a spreadsheet -- stored fine and then matched nothing, because every lookup
+    # strips what the person typed before comparing. The account existed, was
+    # listed in the console, and could not be signed in to.
+    email = email.strip().lower()
     existing = _rows(client().table("users").select("id").eq("email", email).limit(1).execute())
     if existing:
         raise ValueError("A user with that email already exists.")
@@ -1096,10 +1123,10 @@ def update_user(user_id: int, name: str = None, email: str = None, password: str
     if not user_rows:
         raise ValueError("That user no longer exists.")
     user = user_rows[0]
-    new_email = (email or user["email"]).lower()
+    new_email = (email or user["email"]).strip().lower()
     if email and "@" not in email:
         raise ValueError("Enter a valid email address.")
-    if email and email.lower() != user["email"]:
+    if email and new_email != user["email"]:
         duplicates = _rows(supabase.table("users").select("id").eq("email", new_email).neq("id", user_id).limit(1).execute())
         if duplicates:
             raise ValueError("Another user already uses that email.")

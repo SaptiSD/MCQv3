@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import uuid
 from datetime import datetime, time, timedelta, timezone
 
@@ -49,7 +50,11 @@ def _question_errors(questions: list[dict]) -> list[str]:
             elif spec.get("format") == grading.NUMBER and grading._to_number(spec["value"]) is None:
                 errors.append(f"Question {index} has a Number answer that isn't a number.")
             continue
-        texts = [str(value).strip().casefold() for _, value in question["options"]]
+        # The same comparison marking uses. `.strip().casefold()` was weaker, so
+        # "Paris" and "Paris." passed validation and were then indistinguishable
+        # to `attempt_sync.rekey_choice`, which kept whichever the shuffle put
+        # last -- two students giving the same answer could be marked differently.
+        texts = [grading.normalise_text(value) for _, value in question["options"]]
         if len(set(texts)) != len(texts):
             errors.append(f"Question {index} lists the same option text more than once.")
         if len(question["options"]) < 2:
@@ -176,6 +181,17 @@ def delete_quiz_dialog(user, quiz_id: int, title: str) -> None:
     if not require_session(user):
         return
     st.write(f"Delete **{title}** and all its questions, assignments, and results?")
+    # Deleting takes every attempt with it, papers being written right now
+    # included. The manager warns about those; the button that actually destroys
+    # them said nothing at all.
+    attempts = quiz_attempt_counts(quiz_id, exclude_student_id=user["id"])
+    losses = []
+    if attempts["open"]:
+        losses.append(f"{attempts['open']} student{'s are' if attempts['open'] != 1 else ' is'} taking it right now")
+    if attempts["submitted"]:
+        losses.append(f"{attempts['submitted']} recorded result{'s' if attempts['submitted'] != 1 else ''} will be lost")
+    if losses:
+        st.warning(" and ".join(losses).capitalize() + ". This cannot be undone.")
     confirm, cancel = st.columns(2)
     if confirm.button("Yes, delete", key=f"confirm-delete-{quiz_id}", type="primary", width="stretch"):
         delete_quiz(quiz_id, user["id"])
@@ -228,7 +244,8 @@ def dashboard(user) -> None:
                 st.markdown(f"### {text(quiz['title'])} &nbsp;{badge}", unsafe_allow_html=True)
                 audience = f"{assigned} assigned student{'s' if assigned != 1 else ''}" if assigned else "Not assigned"
                 question_count = summary["questions"]
-                st.caption(f"{question_count} question{'s' if question_count != 1 else ''}  ·  {quiz['duration_minutes']} minutes  ·  pass at {quiz['passing_score']}%  ·  {audience}")
+                minutes = quiz["duration_minutes"]
+                st.caption(f"{question_count} question{'s' if question_count != 1 else ''}  ·  {minutes} minute{'s' if minutes != 1 else ''}  ·  pass at {quiz['passing_score']}%  ·  {audience}")
             with action:
                 if st.button("Manage", key=f"manage-{quiz['id']}", width="stretch"):
                     # Opening the manager always shows what is actually stored.
@@ -664,7 +681,10 @@ def _quiz_downloads(quiz, questions: list | None = None) -> None:
 def _results_csv(progress) -> bytes:
     # One decimal, the same as the screen: a raw 33.33333333333333 in a
     # spreadsheet column helps nobody and still sorts correctly rounded.
-    frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": round(row["score"], 1) if row["score"] is not None else None, "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress])
+    frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"],
+                           "Status": row["status"] if row.get("assigned", True) else f"{row['status']} · unassigned",
+                           "Score": round(row["score"], 1) if row["score"] is not None else None,
+                           "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress])
     return frame.to_csv(index=False).encode("utf-8")
 
 
@@ -762,8 +782,8 @@ def regrade_controls(quiz, user, submitted_count: int) -> None:
             return
         st.caption(
             f"{submitted_count} submitted attempt{'s' if submitted_count != 1 else ''}. "
-            "Students are marked against the answer key that was in place when they started, so if you have "
-            "since corrected a wrong answer, use this to apply the correction to results already recorded."
+            "Attempts are marked against the answer key that was in place when they were handed in, so if you "
+            "have corrected a wrong answer since, use this to apply the correction to results already recorded."
         )
         st.caption("Questions you have reworded or deleted since keep the marking they were graded under.")
         confirm_key = f"regrade-confirm-{quiz_id}"
@@ -775,8 +795,9 @@ def regrade_controls(quiz, user, submitted_count: int) -> None:
         # Regrading rewrites every recorded score and cannot be undone, so the
         # button that does it is not the same button the teacher first clicked.
         st.warning(
-            f"This rewrites the score and pass/fail result of all {submitted_count} submitted "
-            f"attempt{'s' if submitted_count != 1 else ''}, and cannot be undone."
+            "This rewrites the score and pass/fail result of "
+            + (f"all {submitted_count} submitted attempts" if submitted_count != 1 else "the one submitted attempt")
+            + ", and cannot be undone."
         )
         go, cancel = st.columns(2)
         if cancel.button("Cancel", key=f"regrade-cancel-{quiz_id}", width="stretch"):
@@ -850,7 +871,7 @@ def _render_quiz_pdf(quiz, questions, format_key: str) -> bytes:
         opening = datetime.fromisoformat(quiz["opening_time"]).astimezone().strftime("%b %d, %I:%M %p") if quiz.get("opening_enabled") else "Any time"
         closing = datetime.fromisoformat(quiz["closing_time"]).astimezone().strftime("%b %d, %I:%M %p") if quiz.get("closing_enabled") else "Open"
         settings_lines = [
-            f"Time allowed: {quiz['duration_minutes']} minutes",
+            f"Time allowed: {quiz['duration_minutes']} minute{'s' if quiz['duration_minutes'] != 1 else ''}",
             f"Passing score: {quiz['passing_score']}%",
             f"Opens: {opening}",
             f"Closes: {closing}",
@@ -973,6 +994,46 @@ def question_bank(quiz) -> None:
         st.caption("  ·  ".join(f"{label}) {text}" for label, text in options))
 
 
+_UPLOAD_OPTION = re.compile(r"^\s*([A-F])\s*\)\s*(.*)$", re.I)
+
+
+def _options_from_cell(cell: str) -> list[tuple[str, str]]:
+    """Read the review table's "A) one | B) two" cell back into labelled options.
+
+    The letters in that cell are the ones the `Correct` column points at, so they
+    have to survive the round trip. Re-lettering by position instead moved the
+    answer key on to whichever option happened to land in that slot: a bank
+    listing its options B, A, C silently marked the wrong one correct, and an
+    option whose own text contained a "|" split in two and did the same. Neither
+    could be caught by validation, because the relabelled set always contains the
+    key. A cell with no letters at all is still lettered by position -- that is a
+    teacher typing plain alternatives, and position is all there is to go on.
+    """
+    parts = str(cell or "").split("|")
+    if not any(_UPLOAD_OPTION.match(part) for part in parts):
+        return [(chr(65 + index), part.strip()) for index, part in enumerate(parts) if part.strip()]
+    options: list[list[str]] = []
+    for part in parts:
+        match = _UPLOAD_OPTION.match(part)
+        if match:
+            options.append([match.group(1).upper(), match.group(2).strip()])
+        elif options:
+            # No letter of its own: the tail of an option whose text held a "|".
+            options[-1][1] = f"{options[-1][1]} | {part.strip()}".strip(" |")
+        elif part.strip():
+            options.append(["A", part.strip()])
+    taken: set[str] = set()
+    labelled = []
+    for label, option_text in options:
+        if not option_text:
+            continue
+        if label in taken:
+            label = next((letter for letter in "ABCDEF" if letter not in taken), label)
+        taken.add(label)
+        labelled.append((label, option_text))
+    return labelled
+
+
 def _questions_from_table(frame) -> list[dict]:
     """Turn the reviewed upload table back into saveable questions, type intact."""
     questions = []
@@ -995,11 +1056,7 @@ def _questions_from_table(frame) -> list[dict]:
         if question_type == "True / False":
             options = [("A", "True"), ("B", "False")]
         else:
-            options = [
-                (chr(65 + i), part.split(")", 1)[-1].strip())
-                for i, part in enumerate(str(row.get("Options", "") or "").split("|"))
-                if part.split(")", 1)[-1].strip()
-            ]
+            options = _options_from_cell(row.get("Options", ""))
         if question_type == SELECT_ALL_TYPE:
             correct = [part.strip().upper() for part in correct_raw.replace("|", ",").split(",") if part.strip()]
         else:
@@ -1330,7 +1387,10 @@ def results(quiz) -> None:
     progress = student_progress_for_quiz(quiz["owner_id"], quiz["id"])
     if not progress:
         st.info("No students are assigned to this exam yet."); return
-    frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": row["score"], "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress])
+    frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"],
+                           "Status": row["status"] if row.get("assigned", True) else f"{row['status']} · unassigned",
+                           "Score": percent(row["score"]), "Result": row["result"],
+                           "Last activity": when(row["last_activity"])} for row in progress])
     st.dataframe(frame, width="stretch", hide_index=True)
 
 
@@ -1376,8 +1436,16 @@ def roster_page(user) -> None:
         st.subheader("Teams")
         st.caption("Choose a team to see its members. Use the optional search to add someone without opening the member list.")
         for team in teams:
-            with st.expander(f"{team['name']} · {len(team_student_ids(team['id']))} members"):
-                members = st.multiselect("Members", roster, default=[row for row in roster if row["id"] in team_student_ids(team["id"])], format_func=lambda row: f"{row['name']} · {row['email']}", key=f"team-members-{team['id']}")
+            member_ids = team_student_ids(team["id"])
+            # The epoch renames the box after every write. A Streamlit widget key
+            # outranks the `default=` it is re-rendered with, so after "Add
+            # member" the list still showed the membership from before the click
+            # -- contradicting the header right above it -- and "Save members"
+            # then wrote that stale list back, silently deleting the person who
+            # had just been added while reporting "Team updated."
+            epoch = int(st.session_state.get(f"team-epoch-{team['id']}", 0))
+            with st.expander(f"{team['name']} · {len(member_ids)} member{'s' if len(member_ids) != 1 else ''}"):
+                members = st.multiselect("Members", roster, default=[row for row in roster if row["id"] in member_ids], format_func=lambda row: f"{row['name']} · {row['email']}", key=f"team-members-{team['id']}-{epoch}")
                 show_search = st.checkbox("Show search to add a member", key=f"show-team-search-{team['id']}")
                 if show_search:
                     member_search = st.text_input("Search roster", placeholder="Search by name or email", key=f"team-search-{team['id']}")
@@ -1387,6 +1455,7 @@ def roster_page(user) -> None:
                         if st.button("Add member", key=f"add-team-member-{team['id']}"):
                             members = [*members, candidate] if candidate["id"] not in {row["id"] for row in members} else members
                             set_team_members(team["id"], [row["id"] for row in members])
+                            st.session_state[f"team-epoch-{team['id']}"] = epoch + 1
                             st.rerun()
                 if st.button("Save members", key=f"save-team-{team['id']}"):
                     set_team_members(team["id"], [row["id"] for row in members])

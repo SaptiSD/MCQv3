@@ -91,6 +91,9 @@ def dashboard(user) -> None:
     blocked = st.session_state.pop("retake_blocked", None)
     if blocked:
         st.warning(f"**{blocked}** has already been submitted and your teacher didn't allow retakes.")
+    if st.session_state.pop("attempt_withdrawn", False):
+        st.warning("The assessment you were taking has been removed by your teacher, so that attempt has ended. "
+                   "Nothing you had answered was kept.")
 
     quizzes = available_quizzes(user["id"], user["id"] if previewing else None)
     attempts = attempts_for_student(user["id"])
@@ -133,7 +136,8 @@ def dashboard(user) -> None:
                     f"closes {datetime.fromisoformat(quiz['closing_time']).astimezone().strftime('%b %d, %I:%M %p')}"
                     if quiz["closing_enabled"] else "no closing date"
                 )
-                bits = [f"{quiz['duration_minutes']} minutes", f"pass at {quiz['passing_score']}%", closes]
+                minutes = quiz["duration_minutes"]
+                bits = [f"{minutes} minute{'s' if minutes != 1 else ''}", f"pass at {quiz['passing_score']}%", closes]
                 if quiz["allow_retake"]:
                     bits.append("retakes allowed")
                 st.caption("  ·  ".join(bits))
@@ -158,6 +162,13 @@ def dashboard(user) -> None:
 
 @st.fragment
 def my_teachers_page(user) -> None:
+    # Joining and leaving are writes, and a fragment rerun never re-executes the
+    # main script body -- so `main()`'s session check does not run for the clicks
+    # in here. Without this a tab signed out in another window kept the run of
+    # its own enrolment, and joining a teacher hands over that teacher's
+    # class-wide assessments.
+    if not require_session(user):
+        return
     page_header("Your workspace", "My teachers", "The teachers whose assessments you receive. Add another at any time.")
     current = teachers_for_student(user["id"])
     st.subheader("Your teachers")
@@ -262,8 +273,12 @@ def take_attempt(user, attempt_id: int) -> None:
         return
     attempt = attempt_with_quiz(attempt_id, user["id"])
     if not attempt:
+        # The attempt row has gone, which means the assessment was deleted out
+        # from under it -- deleting a quiz takes its attempts with it. Returning
+        # quietly left the questions simply disappearing off the screen.
         st.session_state.pop("attempt_id", None)
-        return
+        st.session_state.attempt_withdrawn = True
+        st.rerun()
     try:
         payload = json.loads(attempt["answers_json"] or "{}")
         questions = payload["questions"]

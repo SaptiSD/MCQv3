@@ -125,6 +125,81 @@ weird = pd.DataFrame([{"Question": "Hmm", "Type": "Essay", "Options": "A) x | B)
 check("falls back to Multiple choice", TP._questions_from_table(weird)[0]["question_type"], "Multiple choice")
 
 print()
+print("== the review table keeps the letters the answer key points at ==")
+# The Options cell carries its own letters. Re-lettering by position moved the
+# key on to whatever landed in that slot and marked the wrong option correct.
+out_of_order = pd.DataFrame([{"Question": "Capital of France?", "Type": "Multiple choice",
+                              "Options": "B) Berlin | A) Paris | C) Rome", "Correct": "A"}])
+built = TP._questions_from_table(out_of_order)[0]
+check("options keep their own letters", built["options"], [("B", "Berlin"), ("A", "Paris"), ("C", "Rome")])
+check("so the key still means Paris", dict(built["options"])[built["correct_label"]], "Paris")
+check("and it validates", TP._question_errors([built]), [])
+
+piped = pd.DataFrame([{"Question": "Which pair are mammals?", "Type": "Multiple choice",
+                       "Options": "A) cats | dogs | B) sparrows", "Correct": "A"}])
+built = TP._questions_from_table(piped)[0]
+check("an option whose text holds a pipe stays whole", built["options"], [("A", "cats | dogs"), ("B", "sparrows")])
+check("and keeps its answer", dict(built["options"])[built["correct_label"]], "cats | dogs")
+
+plain = pd.DataFrame([{"Question": "Pick one", "Type": "Multiple choice",
+                       "Options": "one | two | three", "Correct": "B"}])
+check("a cell with no letters is still lettered by position",
+      TP._questions_from_table(plain)[0]["options"], [("A", "one"), ("B", "two"), ("C", "three")])
+
+collide = pd.DataFrame([{"Question": "Pick one", "Type": "Multiple choice",
+                         "Options": "A) one | A) two", "Correct": "A"}])
+check("a repeated letter is moved rather than silently merged",
+      [label for label, _ in TP._questions_from_table(collide)[0]["options"]], ["A", "B"])
+
+
+print()
+print("== a question number with no space after it is still a question ==")
+from ingestion import parse_report
+
+RUN_ON = "1.What is 2+2?\nA) 3\nB) 4\n2. What is 3+3?\nA) 5\nB) 6\n\nAnswer Key:\n1. B\n2. B\n"
+questions, skipped = parse_report(RUN_ON)
+check("both questions are read", [q["number"] for q in questions], [1, 2])
+check("and nothing is reported as skipped", skipped, [])
+check("the first one keeps its own options", questions[0]["options"], [("A", "3"), ("B", "4")])
+
+WRAPPED = "1. Mass of the sample?\nA) 3\nB) 4\n1.5 grams of salt\n\nAnswer Key:\n1. B\n"
+wrapped, _ = parse_report(WRAPPED)
+check("a decimal on a wrapped line is not mistaken for question 1", [q["number"] for q in wrapped], [1])
+check("it stays part of the question it belongs to",
+      wrapped[0]["question_text"], "Mass of the sample? 1.5 grams of salt")
+
+
+print()
+print("== a Windows ANSI file is not guessed at as UTF-16 ==")
+# utf-16 decodes almost any even-length input by pairing bytes up, so whether an
+# ANSI bank read back used to depend on the file's length being odd.
+ANSI_BODY = ("1. What does the teacher’s CPU do?\r\n"
+             "A. Processes instructions\r\nB. Stores files\r\n\r\nAnswer Key:\r\n1. A\r\n")
+ansi = ANSI_BODY.encode("cp1252")
+for label, payload in (("odd length", ansi), ("even length", ansi + b" ")):
+    read_back = extract_upload(FakeUpload("bank.txt", payload))
+    check(f"an ANSI bank reads back ({label})", len(parse_report(read_back)[0]), 1)
+check("a real UTF-16 file still reads",
+      len(parse_report(extract_upload(FakeUpload("b.txt", ANSI_BODY.encode("utf-16"))))[0]), 1)
+check("so does UTF-8 with a BOM",
+      len(parse_report(extract_upload(FakeUpload("b.txt", ANSI_BODY.encode("utf-8-sig"))))[0]), 1)
+
+
+print()
+print("== validation rejects options that marking cannot tell apart ==")
+
+
+def duplicate_check(first, second):
+    question = {"question_text": "Pick one", "question_type": "Multiple choice",
+                "options": [("A", first), ("B", second), ("C", "other")], "correct_label": "A"}
+    return TP._question_errors([question])
+
+
+for first, second in (("Paris", "Paris."), ("New York", "New  York"), ("yes", "(yes)")):
+    check(f"{first!r} and {second!r} are refused", bool(duplicate_check(first, second)), True)
+check("genuinely different options are still accepted", duplicate_check("cat", "dog"), [])
+
+print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S): {FAILURES}")
     raise SystemExit(1)

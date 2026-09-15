@@ -169,6 +169,10 @@ def admins_section(user) -> None:
                 except ValueError as exc:
                     st.error(str(exc))
                 else:
+                    # Same as the accounts above: a new password or address has
+                    # to end the sessions it replaces, under both addresses.
+                    server_state.revoke(server_state.account_key(selected))
+                    server_state.revoke(server_state.account_key({"email": edit_email}))
                     flash("admins", f"Changes to {edit_options[edit_id]} saved.")
                     st.rerun()
             st.divider()
@@ -184,5 +188,11 @@ def admins_section(user) -> None:
                     except ValueError as exc:
                         st.error(str(exc))
                     else:
+                        # Without this the removed administrator kept working in
+                        # any tab they already had open -- including this very
+                        # form, which let them add themselves straight back. It
+                        # is the one privileged role here, and the only one whose
+                        # removal used to do nothing to its live sessions.
+                        server_state.revoke(server_state.account_key({"email": remove_options[remove_id]}))
                         flash("admins", f"Administrator {remove_options[remove_id]} removed.")
                         st.rerun()
