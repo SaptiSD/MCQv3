@@ -110,6 +110,31 @@ def _mirror_draft(form: dict) -> None:
     server_state.save_draft(_draft_key(), DRAFT_NAME, dict(form))
 
 
+# Deliberately does *not* start with "new-": `_clear_new_quiz_state` sweeps
+# every "new-" key out of the session, and an epoch that swept itself away would
+# reset to zero and rename nothing.
+_CREATE_EPOCH = "create-quiz-epoch"
+
+
+def _create_suffix() -> str:
+    """What is appended to every Create-page widget key to name this draft."""
+    return f"~{int(st.session_state.get(_CREATE_EPOCH, 0))}"
+
+
+def _ck(name: str) -> str:
+    """The widget key for a Create-page field whose draft key is `name`.
+
+    The draft is keyed by the bare name; the widget gets the name plus the
+    current epoch. Discarding bumps the epoch, which renames every box on the
+    page -- and renaming is the only thing that actually empties one. Deleting
+    the key does not: the browser still holds what was typed, re-sends it on the
+    next run, and Streamlit restores it under the same key. That is why Discard
+    draft appeared to do nothing -- the draft came straight back, and the
+    callback then wrote it into a fresh form.
+    """
+    return f"{name}{_create_suffix()}"
+
+
 def _vanished(widget_key: str) -> bool:
     """True when a widget's `on_change` has outlived the widget itself.
 
@@ -128,36 +153,41 @@ def _vanished(widget_key: str) -> bool:
     return widget_key not in st.session_state
 
 
-def _create_save_typed(key: str) -> None:
+def _create_save_typed(name: str) -> None:
     """Persist a typed-answer widget into the new-quiz draft."""
-    if _vanished(key):
+    widget_key = _ck(name)
+    if _vanished(widget_key):
         return
     form = st.session_state.setdefault("new_quiz_data", {})
-    form[key] = st.session_state[key]
+    form[name] = st.session_state[widget_key]
     st.session_state["create_dirty"] = True
     _mirror_draft(form)
 
 
-def typed_answer_editor(prefix: str, read, write=None) -> dict:
+def typed_answer_editor(prefix: str, read, write=None, key_suffix: str = "") -> dict:
     """Answer controls for a Fill in the blank / Short answer question.
 
     `read(name, default)` fetches a stored value and `write(name)` is the
     on_change callback; the two question editors keep their state differently,
     so they pass their own accessors in.
+
+    `key_suffix` is appended to the widget keys but never to what `write` is
+    told, so a caller can rename these boxes -- which is how the Create page
+    empties them -- without moving where the draft is stored.
     """
     fmt_label = read("format", "Text")
     fmt_label = fmt_label if fmt_label in ANSWER_FORMATS else "Text"
     answer_col, format_col = st.columns([3, 2])
     with answer_col:
         value = st.text_input(
-            "Correct answer", value=read("answer", ""), key=f"{prefix}-answer",
+            "Correct answer", value=read("answer", ""), key=f"{prefix}-answer{key_suffix}",
             placeholder="e.g. 6  ·  33.33  ·  Paris",
             **({"on_change": write, "args": (f"{prefix}-answer",)} if write else {}),
         )
     with format_col:
         fmt_label = st.selectbox(
             "Answer type", list(ANSWER_FORMATS), index=list(ANSWER_FORMATS).index(fmt_label),
-            key=f"{prefix}-format",
+            key=f"{prefix}-format{key_suffix}",
             help="Number grades 6, 6.0 and 6.00 as the same answer. Text ignores capitals and extra spaces.",
             **({"on_change": write, "args": (f"{prefix}-format",)} if write else {}),
         )
@@ -166,7 +196,7 @@ def typed_answer_editor(prefix: str, read, write=None) -> dict:
     with st.expander("Marking options"):
         if answer_format == grading.NUMBER:
             tolerance = st.text_input(
-                "Accept answers within ±", value=read("tolerance", ""), key=f"{prefix}-tolerance",
+                "Accept answers within ±", value=read("tolerance", ""), key=f"{prefix}-tolerance{key_suffix}",
                 placeholder="leave blank to use the answer's own precision",
                 **({"on_change": write, "args": (f"{prefix}-tolerance",)} if write else {}),
             )
@@ -174,17 +204,17 @@ def typed_answer_editor(prefix: str, read, write=None) -> dict:
             alternatives = [
                 item for item in st.text_input(
                     "Also accept (comma separated)", value=read("alternatives", ""),
-                    key=f"{prefix}-alternatives", placeholder="e.g. USA, US, America",
+                    key=f"{prefix}-alternatives{key_suffix}", placeholder="e.g. USA, US, America",
                     **({"on_change": write, "args": (f"{prefix}-alternatives",)} if write else {}),
                 ).split(",")
             ]
             allow_typos = st.checkbox(
                 "Forgive single-letter spelling slips", value=bool(read("typos", False)),
-                key=f"{prefix}-typos",
+                key=f"{prefix}-typos{key_suffix}",
                 **({"on_change": write, "args": (f"{prefix}-typos",)} if write else {}),
             )
         limit_raw = st.text_input(
-            "Limit the answer box to (characters)", value=read("limit", ""), key=f"{prefix}-limit",
+            "Limit the answer box to (characters)", value=read("limit", ""), key=f"{prefix}-limit{key_suffix}",
             placeholder="leave blank to size it automatically",
             **({"on_change": write, "args": (f"{prefix}-limit",)} if write else {}),
         )
@@ -313,12 +343,13 @@ def analytics_page(user) -> None:
             st.info("No students are assigned to this exam yet.")
 
 
-def _create_save_setting(key: str) -> None:
-    if _vanished(key):
+def _create_save_setting(name: str) -> None:
+    widget_key = _ck(name)
+    if _vanished(widget_key):
         return
     if "new_quiz_data" not in st.session_state:
         st.session_state["new_quiz_data"] = {}
-    st.session_state["new_quiz_data"][key] = st.session_state[key]
+    st.session_state["new_quiz_data"][name] = st.session_state[widget_key]
     st.session_state["create_dirty"] = True
     _mirror_draft(st.session_state["new_quiz_data"])
 
@@ -365,8 +396,11 @@ def _clear_new_quiz_state() -> None:
     st.session_state.pop("create_dirty", None)
     st.session_state.pop("new-quiz-section", None)
     st.session_state.pop("publish_in_flight", None)
-    for key in [key for key in st.session_state if key.startswith("new-")]:
-        st.session_state.pop(key, None)
+    # Rename every box rather than deleting it. Deleting looked like the obvious
+    # way to empty the form and could not work: the browser still holds what was
+    # typed and re-sends it on the very next run, so Streamlit put it back under
+    # the same key and the "discarded" draft was on screen again immediately.
+    st.session_state[_CREATE_EPOCH] = int(st.session_state.get(_CREATE_EPOCH, 0)) + 1
     server_state.clear_draft(_draft_key(), DRAFT_NAME)
 
 
@@ -390,9 +424,9 @@ def _create_questions_section(form: dict) -> None:
         # the real one -- so an uploaded bank published as an empty quiz.
         question_mode = st.radio("Add questions", question_modes, horizontal=True,
                                  index=question_modes.index(stored_mode) if stored_mode in question_modes else 0,
-                                 key="new-quiz-mode", on_change=_create_save_setting, args=("new-quiz-mode",))
+                                 key=_ck("new-quiz-mode"), on_change=_create_save_setting, args=("new-quiz-mode",))
         if question_mode == "Upload question bank":
-            upload = st.file_uploader("Question bank (.txt or .docx)", type=["txt", "docx"], key="new-quiz-upload")
+            upload = st.file_uploader("Question bank (.txt or .docx)", type=["txt", "docx"], key=_ck("new-quiz-upload"))
             if upload and st.button("Read question bank", key="new-quiz-parse"):
                 try:
                     questions, skipped = parse_report(extract_upload(upload))
@@ -451,15 +485,15 @@ def _create_questions_section(form: dict) -> None:
                 with st.container(border=True):
                     st.markdown(f"**Question {index + 1}**")
                     current_type = form.get(f"new-type-{index}", "Multiple choice")
-                    question_type = st.selectbox("Question type", QUESTION_TYPES, index=QUESTION_TYPES.index(current_type) if current_type in QUESTION_TYPES else 0, key=f"new-type-{index}", on_change=_create_save_setting, args=(f"new-type-{index}",))
-                    st.text_area("Question text", key=f"new-text-{index}", height=80, value=form.get(f"new-text-{index}", ""), on_change=_create_save_setting, args=(f"new-text-{index}",))
+                    question_type = st.selectbox("Question type", QUESTION_TYPES, index=QUESTION_TYPES.index(current_type) if current_type in QUESTION_TYPES else 0, key=_ck(f"new-type-{index}"), on_change=_create_save_setting, args=(f"new-type-{index}",))
+                    st.text_area("Question text", key=_ck(f"new-text-{index}"), height=80, value=form.get(f"new-text-{index}", ""), on_change=_create_save_setting, args=(f"new-text-{index}",))
                     if question_type in {"Multiple choice", SELECT_ALL_TYPE}:
                         option_cols = st.columns(4)
                         for option_index, label in enumerate(("A", "B", "C", "D")):
                             with option_cols[option_index]:
-                                st.text_input(f"Option {label}", key=f"new-option-{index}-{label}", value=form.get(f"new-option-{index}-{label}", ""), on_change=_create_save_setting, args=(f"new-option-{index}-{label}",))
+                                st.text_input(f"Option {label}", key=_ck(f"new-option-{index}-{label}"), value=form.get(f"new-option-{index}-{label}", ""), on_change=_create_save_setting, args=(f"new-option-{index}-{label}",))
                         if question_type == SELECT_ALL_TYPE:
-                            st.multiselect("Correct answers", ["A", "B", "C", "D"], key=f"new-correct-all-{index}", default=form.get(f"new-correct-all-{index}", []), on_change=_create_save_setting, args=(f"new-correct-all-{index}",))
+                            st.multiselect("Correct answers", ["A", "B", "C", "D"], key=_ck(f"new-correct-all-{index}"), default=form.get(f"new-correct-all-{index}", []), on_change=_create_save_setting, args=(f"new-correct-all-{index}",))
                         else:
                             # One key per question type. Sharing a single key meant a
                             # multiple-choice "C" survived a switch to True / False,
@@ -467,15 +501,16 @@ def _create_questions_section(form: dict) -> None:
                             # letter -- a silently wrong answer key.
                             correct_cfg = ["A", "B", "C", "D"]
                             correct_val = form.get(f"new-correct-mc-{index}")
-                            st.selectbox("Correct answer", correct_cfg, index=(correct_cfg.index(correct_val) if correct_val in correct_cfg else 0), key=f"new-correct-mc-{index}", on_change=_create_save_setting, args=(f"new-correct-mc-{index}",))
+                            st.selectbox("Correct answer", correct_cfg, index=(correct_cfg.index(correct_val) if correct_val in correct_cfg else 0), key=_ck(f"new-correct-mc-{index}"), on_change=_create_save_setting, args=(f"new-correct-mc-{index}",))
                     elif question_type == "True / False":
                         tf_val = form.get(f"new-correct-tf-{index}")
-                        st.selectbox("Correct answer", ["True", "False"], index=(0 if tf_val != "False" else 1), key=f"new-correct-tf-{index}", on_change=_create_save_setting, args=(f"new-correct-tf-{index}",))
+                        st.selectbox("Correct answer", ["True", "False"], index=(0 if tf_val != "False" else 1), key=_ck(f"new-correct-tf-{index}"), on_change=_create_save_setting, args=(f"new-correct-tf-{index}",))
                     else:
                         typed_answer_editor(
                             f"new-typed-{index}",
                             lambda name, default, i=index: form.get(f"new-typed-{i}-{name}", default),
                             _create_save_typed,
+                            key_suffix=_create_suffix(),
                         )
 
 
@@ -484,35 +519,35 @@ def _create_settings_section(user, form: dict) -> None:
     """Quiz settings, in their own fragment for the same reason."""
     with st.container(border=True):
         st.subheader("Quiz settings")
-        st.text_input("Quiz title", placeholder="e.g. Foundations of Computing", key="new-title",
+        st.text_input("Quiz title", placeholder="e.g. Foundations of Computing", key=_ck("new-title"),
                       value=form.get("new-title", ""), on_change=_create_save_setting, args=("new-title",))
         first, second = st.columns(2)
-        with first: st.number_input("Time allowed (minutes)", 1, 480, form.get("new-duration", 30), key="new-duration", on_change=_create_save_setting, args=("new-duration",))
-        with second: st.number_input("Passing score (%)", 0, 100, form.get("new-passing", 70), key="new-passing", on_change=_create_save_setting, args=("new-passing",))
-        st.checkbox("Allow retakes", form.get("new-retakes", False), key="new-retakes", on_change=_create_save_setting, args=("new-retakes",))
-        st.checkbox("Show class average to students", form.get("new-average", False), key="new-average", on_change=_create_save_setting, args=("new-average",))
-        st.checkbox("Randomize question order", form.get("new-randomize-questions", True), key="new-randomize-questions", on_change=_create_save_setting, args=("new-randomize-questions",))
-        st.checkbox("Randomize answer order", form.get("new-randomize-answers", True), key="new-randomize-answers", on_change=_create_save_setting, args=("new-randomize-answers",))
+        with first: st.number_input("Time allowed (minutes)", 1, 480, form.get("new-duration", 30), key=_ck("new-duration"), on_change=_create_save_setting, args=("new-duration",))
+        with second: st.number_input("Passing score (%)", 0, 100, form.get("new-passing", 70), key=_ck("new-passing"), on_change=_create_save_setting, args=("new-passing",))
+        st.checkbox("Allow retakes", form.get("new-retakes", False), key=_ck("new-retakes"), on_change=_create_save_setting, args=("new-retakes",))
+        st.checkbox("Show class average to students", form.get("new-average", False), key=_ck("new-average"), on_change=_create_save_setting, args=("new-average",))
+        st.checkbox("Randomize question order", form.get("new-randomize-questions", True), key=_ck("new-randomize-questions"), on_change=_create_save_setting, args=("new-randomize-questions",))
+        st.checkbox("Randomize answer order", form.get("new-randomize-answers", True), key=_ck("new-randomize-answers"), on_change=_create_save_setting, args=("new-randomize-answers",))
         today = datetime.now().date()
         tomorrow = today + timedelta(days=1)
         opening_enabled = form.get("new-opening-enabled", True)
-        st.checkbox("Enable opening date and time", opening_enabled, key="new-opening-enabled", on_change=_create_save_setting, args=("new-opening-enabled",))
+        st.checkbox("Enable opening date and time", opening_enabled, key=_ck("new-opening-enabled"), on_change=_create_save_setting, args=("new-opening-enabled",))
         opening_date, opening_time = st.columns(2)
-        with opening_date: st.date_input("Opens on", form.get("new-opening-day", today), key="new-opening-day", disabled=not opening_enabled, on_change=_create_save_setting, args=("new-opening-day",))
-        with opening_time: st.time_input("Opening time", form.get("new-opening-clock", time(8, 0)), key="new-opening-clock", disabled=not opening_enabled, on_change=_create_save_setting, args=("new-opening-clock",))
+        with opening_date: st.date_input("Opens on", form.get("new-opening-day", today), key=_ck("new-opening-day"), disabled=not opening_enabled, on_change=_create_save_setting, args=("new-opening-day",))
+        with opening_time: st.time_input("Opening time", form.get("new-opening-clock", time(8, 0)), key=_ck("new-opening-clock"), disabled=not opening_enabled, on_change=_create_save_setting, args=("new-opening-clock",))
         closing_enabled = form.get("new-closing-enabled", True)
-        st.checkbox("Enable closing date and time", closing_enabled, key="new-closing-enabled", on_change=_create_save_setting, args=("new-closing-enabled",))
+        st.checkbox("Enable closing date and time", closing_enabled, key=_ck("new-closing-enabled"), on_change=_create_save_setting, args=("new-closing-enabled",))
         closing_date, closing_time = st.columns(2)
-        with closing_date: st.date_input("Closes on", form.get("new-closing-day", tomorrow), key="new-closing-day", disabled=not closing_enabled, on_change=_create_save_setting, args=("new-closing-day",))
-        with closing_time: st.time_input("Closing time", form.get("new-closing-clock", time(17, 0)), key="new-closing-clock", disabled=not closing_enabled, on_change=_create_save_setting, args=("new-closing-clock",))
+        with closing_date: st.date_input("Closes on", form.get("new-closing-day", tomorrow), key=_ck("new-closing-day"), disabled=not closing_enabled, on_change=_create_save_setting, args=("new-closing-day",))
+        with closing_time: st.time_input("Closing time", form.get("new-closing-clock", time(17, 0)), key=_ck("new-closing-clock"), disabled=not closing_enabled, on_change=_create_save_setting, args=("new-closing-clock",))
         st.divider(); st.subheader("Audience")
-        audience_mode = st.radio("Assign to", ["All", "Students", "Teams"], horizontal=True, key="new-audience-mode",
+        audience_mode = st.radio("Assign to", ["All", "Students", "Teams"], horizontal=True, key=_ck("new-audience-mode"),
                                  index=0 if form.get("new-audience-mode") != "Students" and form.get("new-audience-mode") != "Teams" else 1 if form.get("new-audience-mode") == "Students" else 2,
                                  on_change=_create_save_setting, args=("new-audience-mode",))
         if audience_mode == "Students":
-            st.multiselect("Assign to students", options=students(user["id"]), default=form.get("new-selected", []), format_func=lambda row: f"{row['name']}  ·  {row['email']}", key="new-selected", on_change=_create_save_setting, args=("new-selected",))
+            st.multiselect("Assign to students", options=students(user["id"]), default=form.get("new-selected", []), format_func=lambda row: f"{row['name']}  ·  {row['email']}", key=_ck("new-selected"), on_change=_create_save_setting, args=("new-selected",))
         elif audience_mode == "Teams":
-            st.multiselect("Assign to teams", options=teams_for_teacher(user["id"]), default=form.get("new-team-selected", []), format_func=lambda team: team["name"], key="new-team-selected", on_change=_create_save_setting, args=("new-team-selected",))
+            st.multiselect("Assign to teams", options=teams_for_teacher(user["id"]), default=form.get("new-team-selected", []), format_func=lambda team: team["name"], key=_ck("new-team-selected"), on_change=_create_save_setting, args=("new-team-selected",))
 
 
 def create(user) -> None:

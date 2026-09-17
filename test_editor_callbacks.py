@@ -118,6 +118,55 @@ check("and the editor still works afterwards", not at.exception)
 
 
 print()
+print("== Discard draft empties the form by renaming it, not by deleting keys ==")
+# Deleting a widget's key cannot empty it: the browser still holds what was
+# typed, re-sends it on the next run, and Streamlit restores it under the same
+# key. The Create page had no epoch, so Discard draft looked like it did
+# nothing -- the title came straight back and the callback wrote it into a fresh
+# draft. Verified in the browser too; this pins the pieces.
+DISCARD = """
+import streamlit as st
+import teacher_portal as TP
+
+st.text(f"widget_key={TP._ck('new-title')}")
+st.text(f"epoch_key_is_swept={TP._CREATE_EPOCH.startswith('new-')}")
+
+if st.button("type something"):
+    st.session_state[TP._ck("new-title")] = "a draft"
+    TP._create_save_setting("new-title")
+    st.rerun()
+
+if st.button("discard"):
+    TP._clear_new_quiz_state()
+    st.rerun()
+
+st.text(f"draft={dict(st.session_state.get('new_quiz_data') or {})}")
+"""
+at = AppTest.from_string(DISCARD, default_timeout=60).run()
+check("the widget key carries the epoch", at.text[0].value.endswith("~0"))
+check("the epoch key would not be swept away by its own cleanup",
+      "epoch_key_is_swept=False" in at.text[1].value)
+
+at.button[0].click().run()
+check("a typed value lands in the draft under its bare name",
+      "'new-title': 'a draft'" in at.text[2].value)
+check("and the widget key is still the epoch-0 one", at.text[0].value.endswith("~0"))
+
+at.button[1].click().run()
+check("discarding empties the draft", "draft={}" in at.text[2].value)
+check("and renames every box by bumping the epoch", at.text[0].value.endswith("~1"))
+check("no exception on the way through", not at.exception)
+
+# The form has to keep working afterwards, or publishing would silently lose
+# everything typed after a discard.
+at.button[0].click().run()
+check("typing after a discard still reaches the draft",
+      "'new-title': 'a draft'" in at.text[2].value)
+check("under the bare name, not the epoched one",
+      "~1" not in at.text[2].value)
+
+
+print()
 print("== a callback whose widget is genuinely gone does nothing ==")
 GUARD = """
 import streamlit as st

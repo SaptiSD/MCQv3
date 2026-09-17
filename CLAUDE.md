@@ -147,6 +147,11 @@ always to *rename* the widget, never to delete its key:
 - attempts use `q-{attempt}-{paper}-{paint}-{index}`
 - the question editor bumps `editor_epoch(quiz_id)`
 - team membership bumps `team-epoch-{team_id}`
+- the Create page puts `_create_suffix()` on every data widget via `_ck(name)`,
+  and `_clear_new_quiz_state` bumps it. The draft stays keyed by the bare name,
+  so only the widget moves. Note `_CREATE_EPOCH` deliberately does *not* start
+  with `new-`: that cleanup sweeps every `new-` key out of the session, and an
+  epoch that swept itself away would reset to zero and rename nothing.
 
 Deleting the key instead looks equivalent and is not: Streamlit fires the deleted
 widget's `on_change`, and that callback then writes its own stale copy back.
@@ -167,9 +172,13 @@ app deletes them or not -- deleting is merely pointless, the guard is the fix.
 main body may gate on state a fragment owns. The Create page's Discard draft
 button was hidden until the draft held something; the draft is filled in by the
 settings and questions fragments, so the button stayed hidden however much was
-typed and read as broken. It is drawn unconditionally now. Forcing a full run
-from the fragment instead would scroll the page to the top on the first
-keystroke, which is what the fragments exist to prevent.
+typed. It is drawn unconditionally now. Forcing a full run from the fragment
+instead would scroll the page to the top on the first keystroke, which is what
+the fragments exist to prevent.
+
+That was only half of why Discard draft "did nothing", and the smaller half. The
+other half is the widget-key rule above: the button was reached, it emptied the
+draft, and the browser put every value straight back. Both halves had to go.
 
 **Nothing appears on a student's screen unless something re-runs the page.**
 Streamlit only re-runs on interaction, so an assessment assigned while a student
