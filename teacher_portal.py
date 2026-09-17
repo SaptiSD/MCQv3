@@ -508,6 +508,21 @@ def create(user) -> None:
     # reconnect -- present the same token, and only the first one wins.
     if not form.get("new-publish-token"):
         form["new-publish-token"] = uuid.uuid4().hex
+    # A publish that wrote the quiz but never got to clear up after itself --
+    # the run was cut short, or the connection went between the write and the
+    # rerun -- used to leave the teacher looking at "Publishing this quiz..."
+    # with the buttons disabled and the finished draft still on screen, offering
+    # to make the whole thing a second time. Nothing on the page could clear it
+    # because nothing on the page could run. The claim knows better: if this
+    # draft's token already produced a quiz, the work is done, and saying so is
+    # the first thing this page does.
+    if server_state.publish_result(_draft_key(), form.get("new-publish-token")) is not None:
+        published_title = form.get("new-title", "").strip()
+        _clear_new_quiz_state()
+        st.session_state.pop("manage_quiz", None)
+        st.session_state.page_override = "Dashboard"
+        st.session_state.quiz_created = published_title
+        st.rerun()
     page_header("New assessment", "Build an assessment", "Set it up first, then write the questions, and publish when everything is ready.")
     if st.session_state.pop("draft_recovered", False):
         st.info("Picked up where you left off — this quiz was still unpublished. Use **Discard draft** below if you'd rather start fresh.")
@@ -610,6 +625,10 @@ def create(user) -> None:
     quiz_id = None
     try:
         quiz_id = create_quiz(user["id"], title, form.get("new-duration", 30), form.get("new-passing", 70), form.get("new-retakes", False), form.get("new-average", False), opening.isoformat(), closing.isoformat(), list(assigned_students), opening_enabled, closing_enabled, form.get("new-randomize-questions", True), form.get("new-randomize-answers", True))
+        # Record the id the moment the row exists. Held back until the end, a run
+        # that died in between left the claim holding `None`, which expires after
+        # two minutes -- and the next click then published the whole quiz again.
+        server_state.finish_publish(_draft_key(), token, quiz_id)
         save_question_bank(quiz_id, questions)
     except Exception as exc:
         # Publishing failed, so let the teacher try again with their work intact.
@@ -715,7 +734,10 @@ def manage_quiz(user, quiz_id: int) -> None:
         if not quiz: return
         st.divider(); st.markdown(f"### Manage: {quiz['title']}")
         just_saved = st.session_state.pop(f"saved-questions-{quiz_id}", False)
-        if just_saved:
+        if just_saved == "key":
+            st.success("Answer key saved. The questions are unchanged — anyone still working is marked "
+                       "against the corrected key when they hand in.")
+        elif just_saved:
             st.success("Test saved and published. The questions below are what students will now see.")
         attempts = quiz_attempt_counts(quiz_id, exclude_student_id=user["id"])
         if just_saved and attempts["submitted"]:
@@ -916,7 +938,7 @@ def question_bank(quiz) -> None:
             "the correction to results already recorded. To change the questions themselves, delete this "
             "assessment and publish a new one. Your own preview attempts from Student view don't count."
         )
-    if questions:
+    if questions and not locked:
         with st.expander("Reorder questions"):
             question_options = {question["id"]: f"{index}. {question['question_text']}" for index, question in enumerate(questions, 1)}
             selected_id = st.selectbox("Question", list(question_options), format_func=question_options.get, key=f"reorder-question-{quiz['id']}-{editor_epoch(quiz['id'])}")
@@ -925,14 +947,19 @@ def question_bank(quiz) -> None:
             # would take the whole manager down with it.
             selected_index = next((index for index, question in enumerate(questions) if question["id"] == selected_id), 0)
             move_up, move_down = st.columns(2)
+            def _move(direction: int) -> None:
+                try:
+                    move_question(quiz["id"], selected_id, direction)
+                except ValueError as exc:
+                    st.error(str(exc))
+                    return
+                reset_editor_state(quiz["id"])
+                st.rerun(scope="fragment")
+
             if move_up.button("Move up", key=f"move-up-{quiz['id']}", disabled=selected_index == 0, width="stretch"):
-                move_question(quiz["id"], selected_id, -1)
-                reset_editor_state(quiz["id"])
-                st.rerun(scope="fragment")
+                _move(-1)
             if move_down.button("Move down", key=f"move-down-{quiz['id']}", disabled=selected_index == len(questions) - 1, width="stretch"):
-                move_question(quiz["id"], selected_id, 1)
-                reset_editor_state(quiz["id"])
-                st.rerun(scope="fragment")
+                _move(1)
     if locked:
         # An upload replaces the whole paper, so there is nothing it could do here
         # that the lock would allow.
@@ -995,7 +1022,7 @@ def question_bank(quiz) -> None:
                     st.session_state.pop(f"draft-{quiz['id']}", None)
                     st.session_state.pop(f"draft-skipped-{quiz['id']}", None)
                     reset_editor_state(quiz["id"])
-                    st.session_state[f"saved-questions-{quiz['id']}"] = True
+                    st.session_state[f"saved-questions-{quiz['id']}"] = "paper"
                     # A full rerun, not a fragment one: the quiz card above the
                     # manager shows the question count and the Draft/Published
                     # badge, and neither is redrawn by a fragment rerun -- which
@@ -1330,7 +1357,7 @@ def manual_question_editor(quiz, locked: bool = False) -> None:
             st.error(str(exc))
             return
         reset_editor_state(quiz_id)
-        st.session_state[f"saved-questions-{quiz_id}"] = True
+        st.session_state[f"saved-questions-{quiz_id}"] = "key" if locked else "paper"
         # Full rerun: the card above the manager carries the question count and
         # the Draft/Published badge, and a fragment rerun leaves both stale.
         st.rerun()

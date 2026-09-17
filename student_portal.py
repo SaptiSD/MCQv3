@@ -92,8 +92,8 @@ def dashboard(user) -> None:
     if blocked:
         st.warning(f"**{blocked}** has already been submitted and your teacher didn't allow retakes.")
     if st.session_state.pop("attempt_withdrawn", False):
-        st.warning("The assessment you were taking has been removed by your teacher, so that attempt has ended. "
-                   "Nothing you had answered was kept.")
+        st.warning("The assessment you were taking is no longer yours to take - your teacher either removed it "
+                   "or unassigned you - so that attempt has ended and nothing was submitted.")
 
     quizzes = available_quizzes(user["id"], user["id"] if previewing else None)
     attempts = attempts_for_student(user["id"])
@@ -374,6 +374,7 @@ def take_attempt(user, attempt_id: int) -> None:
         save_attempt_answers(attempt_id, json.dumps(stored))
         st.session_state[seen_key] = stored["revision"]
         st.session_state.pop(f"attempt-news-{attempt_id}", None)
+        st.session_state.pop(f"confirm-submit-{attempt_id}", None)
 
     st.divider()
     heading, clock = st.columns([3, 1.4], vertical_alignment="center")
@@ -436,12 +437,40 @@ def take_attempt(user, attempt_id: int) -> None:
     else:
         st.caption("Your answers save as you go, so you can come back later or run out of time without losing them. "
                    "Submitting is final unless your teacher allowed retakes.")
-    if st.button("Submit quiz", type="primary", width="stretch", key=f"submit-{attempt_id}",
-                 disabled=out_of_date):
+    def _hand_in() -> None:
         payload["answers"] = answers
         submit_attempt(attempt, payload, False)
+        st.session_state.pop(f"confirm-submit-{attempt_id}", None)
         st.session_state.pop("attempt_id", None)
         st.rerun()
+
+    # Submitting is final, and a question the student meant to come back to
+    # looks exactly like one they decided to skip. Ask once, name the questions,
+    # and let them go straight back to them. The clock running out still submits
+    # without asking -- there is nobody left to answer.
+    blanks = [index + 1 for index in range(len(questions))
+              if answers.get(str(index)) in (None, "", [])]
+    confirm_key = f"confirm-submit-{attempt_id}"
+    if blanks and st.session_state.get(confirm_key):
+        listed = ", ".join(str(number) for number in blanks[:12])
+        if len(blanks) > 12:
+            listed += f" and {len(blanks) - 12} more"
+        st.warning(
+            f"**{len(blanks)} question{'s are' if len(blanks) != 1 else ' is'} still unanswered** "
+            f"({listed}). Unanswered questions are marked wrong."
+        )
+        back, anyway = st.columns(2)
+        if back.button("Go back to them", key=f"resume-blanks-{attempt_id}", type="primary", width="stretch"):
+            st.session_state.pop(confirm_key, None)
+            st.rerun(scope="fragment")
+        if anyway.button("Submit anyway", key=f"submit-anyway-{attempt_id}", width="stretch"):
+            _hand_in()
+    elif st.button("Submit quiz", type="primary", width="stretch", key=f"submit-{attempt_id}",
+                   disabled=out_of_date):
+        if blanks:
+            st.session_state[confirm_key] = True
+            st.rerun(scope="fragment")
+        _hand_in()
 
 
 def submit_attempt(attempt, payload: dict, automatic: bool) -> None:

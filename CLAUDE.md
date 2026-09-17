@@ -88,6 +88,26 @@ any more rather than being reconciled after the fact. Enforced in
 only a rendering decision -- by comparing `bank_fingerprint(..., include_key=False)`
 before and after. A teacher's own preview attempts do not count. The way out of a
 genuinely wrong paper is to delete the assessment and publish a new one.
+Question *order* is part of the paper and locks with it -- `move_question` raises
+`PAPER_IS_FIXED` -- because with randomisation off the teacher's order is
+literally the order on the student's screen.
+
+**Unassigning a student ends any attempt they still have open.**
+`set_quiz_assignments` deletes their unsubmitted attempts for that quiz.
+Otherwise the paper stays submittable from their still-loaded page and the result
+lies dormant until the quiz is assigned back, when it surfaces as a completed
+attempt nobody remembers. Submitted attempts are deliberately untouched: a
+teacher must not be able to erase a real result by unassigning someone.
+
+**A frozen question remembers its `position`, and that is its identity.** A quiz
+may legitimately ask the same thing twice and want a different answer each time,
+so wording does not identify a question -- matching on it marked both twins from
+the first one's key and handed a student 100% on a paper where one of their two
+identical answers was wrong. `attempt_sync.live_match` anchors on position and
+falls back to wording only when the wording is unique; for anything ambiguous it
+returns `None` on purpose, and the caller keeps the key it already had. Positions
+survive an answer-key save (`save_question_bank` re-numbers from `enumerate`) and
+reordering is locked once a student starts, so the anchor holds.
 
 **An attempt freezes its questions.** `attempts.answers_json` holds
 `{"questions": [...], "answers": {...}, "revision": n}`. The frozen copy is why
@@ -175,8 +195,8 @@ Observed Behavior   what did
 Impact              who is hurt and how
 ```
 
-Numbers are global across reports; check the last commit for where the sequence
-has got to. A finding is not a bug until it has been **reproduced**. Read-only code review
+Numbers are global across reports and currently run to MCQ-BUG-025; check the
+last commit for where the sequence has got to. A finding is not a bug until it has been **reproduced**. Read-only code review
 produces plausible-looking claims that turn out to be guarded three lines up;
 confirm against the running app at :8512 or against the database before fixing,
 and say plainly when something could not be reproduced.

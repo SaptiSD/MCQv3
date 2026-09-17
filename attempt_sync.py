@@ -76,21 +76,30 @@ def live_correct(row: dict):
 
 
 def freeze(row: dict, randomize_answers: bool = False) -> dict:
-    """Build the frozen copy of one question that an attempt payload stores."""
+    """Build the frozen copy of one question that an attempt payload stores.
+
+    `position` is carried across because it is the only thing that tells two
+    identically worded questions apart. A quiz may legitimately ask the same
+    thing twice with different answers, and matching those back by wording marks
+    both of them from the first one's key.
+    """
     question_type = _question_type(row)
     correct = live_correct(row)
+    position = row.get("position")
+    anchor = {} if position is None else {"position": int(position)}
     if question_type in TEXT_ANSWER_TYPES:
         # The answer specification never leaves the server: the frozen copy
         # keeps only what the student's answer box needs to render.
         return {"text": row["question_text"], "options": [], "correct": correct,
                 "question_type": question_type,
-                "hint": grading.student_hint(correct), "limit": grading.input_limit(correct)}
+                "hint": grading.student_hint(correct), "limit": grading.input_limit(correct),
+                **anchor}
     options = _options_from_row(row)
     # True/False keeps its natural order; shuffling it just reads oddly.
     if randomize_answers and question_type != "True / False":
         random.shuffle(options)
     return {"text": row["question_text"], "options": options,
-            "correct": correct, "question_type": question_type}
+            "correct": correct, "question_type": question_type, **anchor}
 
 
 def freeze_all(rows, randomize_questions: bool = False, randomize_answers: bool = False) -> list[dict]:
@@ -202,11 +211,43 @@ def rekey_choice(frozen: dict, live_row: dict, live_answer):
     return mapped[0] if mapped else None
 
 
-def _index_by_text(rows, text_field: str) -> dict:
-    index: dict = {}
+def _text_key(text, question_type: str) -> tuple:
+    return (grading.normalise_text(text), question_type)
+
+
+def _live_lookup(rows) -> tuple[dict, dict]:
+    """Index the live questions by position, and by wording.
+
+    Position is the anchor: the paper is fixed as soon as a student starts, so a
+    frozen question's position still names the row it came from. Wording is the
+    fallback for attempts frozen before positions were recorded.
+    """
+    by_position: dict = {}
+    by_text: dict = {}
     for row in rows:
-        index.setdefault((grading.normalise_text(row.get(text_field, "")), _question_type(row)), row)
-    return index
+        position = row.get("position")
+        if position is not None:
+            by_position.setdefault(int(position), row)
+        by_text.setdefault(_text_key(row.get("question_text", ""), _question_type(row)), []).append(row)
+    return by_position, by_text
+
+
+def live_match(entry: dict, by_position: dict, by_text: dict):
+    """The live row a frozen question came from, or `None` if it cannot be told.
+
+    `None` is a deliberate answer rather than a failure. Two questions that read
+    identically cannot be distinguished by their wording, and refreshing one from
+    the other's key is exactly how a student came to be marked right for an
+    answer that was wrong.
+    """
+    key = _text_key(entry.get("text", ""), _question_type(entry))
+    position = entry.get("position")
+    if position is not None:
+        row = by_position.get(int(position))
+        if row is not None and _text_key(row.get("question_text", ""), _question_type(row)) == key:
+            return row
+    candidates = by_text.get(key) or []
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def refresh_answer_key(payload: dict, rows) -> list[str]:
@@ -220,11 +261,11 @@ def refresh_answer_key(payload: dict, rows) -> list[str]:
     Mutates `payload` and returns the text of the questions that could not be
     matched, so a caller can say how much of the paper it left behind.
     """
-    live = _index_by_text(rows, "question_text")
+    by_position, by_text = _live_lookup(rows)
     unmatched: list[str] = []
     for entry in payload.get("questions") or []:
         text = entry.get("text", "")
-        row = live.get((grading.normalise_text(text), _question_type(entry)))
+        row = live_match(entry, by_position, by_text)
         if row is None:
             unmatched.append(text)
             continue
@@ -299,17 +340,33 @@ def resync(payload: dict, rows, randomize_answers: bool = False) -> tuple[dict, 
     """
     old_entries = list(payload.get("questions") or [])
     old_answers = payload.get("answers") or {}
-    old_index_by_text: dict = {}
+    old_by_position: dict = {}
+    old_by_text: dict = {}
     for index, entry in enumerate(old_entries):
-        old_index_by_text.setdefault(
-            (grading.normalise_text(entry.get("text", "")), _question_type(entry)), index)
+        position = entry.get("position")
+        if position is not None:
+            old_by_position.setdefault(int(position), index)
+        old_by_text.setdefault(_text_key(entry.get("text", ""), _question_type(entry)), []).append(index)
 
     fresh = [freeze(row, randomize_answers) for row in rows]
     matched: dict[int, int] = {}
     claimed: set[int] = set()
     for new_index, entry in enumerate(fresh):
-        key = (grading.normalise_text(entry["text"]), _question_type(entry))
-        old_index = old_index_by_text.get(key)
+        key = _text_key(entry["text"], _question_type(entry))
+        old_index = None
+        position = entry.get("position")
+        if position is not None:
+            candidate = old_by_position.get(int(position))
+            if candidate is not None and _text_key(old_entries[candidate].get("text", ""),
+                                                   _question_type(old_entries[candidate])) == key:
+                old_index = candidate
+        if old_index is None:
+            # Wording only identifies a question when it is the only one worded
+            # that way; anything else is a guess, and a wrong guess carries an
+            # answer onto a question with a different key.
+            same_wording = old_by_text.get(key) or []
+            if len(same_wording) == 1:
+                old_index = same_wording[0]
         if old_index is not None and old_index not in claimed:
             matched[new_index] = old_index
             claimed.add(old_index)

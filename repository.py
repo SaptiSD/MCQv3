@@ -127,6 +127,17 @@ def questions_for_quiz(quiz_id: int):
 
 
 def move_question(quiz_id: int, question_id: int, direction: int) -> bool:
+    """Swap a question with its neighbour.
+
+    Locked once a real student has started, like every other edit to the paper.
+    The order is part of what they are sitting -- with randomisation off it is
+    literally the order on their screen -- so moving it mid-attempt is how a
+    teacher and a student end up looking at different papers and neither of them
+    being told.
+    """
+    quiz = get_quiz(quiz_id)
+    if quiz and quiz_has_attempts(quiz_id, exclude_student_id=quiz["owner_id"]):
+        raise ValueError(PAPER_IS_FIXED)
     questions = list(questions_for_quiz(quiz_id))
     current_index = next((index for index, question in enumerate(questions) if question["id"] == question_id), None)
     target_index = current_index + direction if current_index is not None else None
@@ -464,6 +475,15 @@ def set_quiz_assignments(quiz_id: int, student_ids: list[int]) -> None:
     current = assigned_student_ids(quiz_id)
     if leaving := current - wanted:
         supabase.table("quiz_students").delete().eq("quiz_id", quiz_id).in_("student_id", sorted(leaving)).execute()
+        # Taking the assessment away has to take the half-finished paper with
+        # it. An attempt left open by a student who is no longer assigned stays
+        # submittable from their still-loaded page, and the result then sits
+        # invisible until the quiz is assigned back to them -- at which point it
+        # surfaces as a completed attempt nobody remembers being made.
+        # Submitted attempts are deliberately untouched: they are history, and a
+        # teacher must not be able to erase a real result by unassigning someone.
+        supabase.table("attempts").delete().eq("quiz_id", quiz_id) \
+            .in_("student_id", sorted(leaving)).is_("submitted_at", None).execute()
     if joining := wanted - current:
         supabase.table("quiz_students").upsert(
             [{"quiz_id": quiz_id, "student_id": student_id, "assigned_at": utc_now()} for student_id in sorted(joining)],

@@ -278,6 +278,76 @@ check("widening what a typed answer accepts is allowed",
 
 
 print()
+print("== MCQ-BUG-019: two questions that read the same, keyed differently ==")
+# A quiz may legitimately ask the same thing twice and want a different answer
+# each time. Matching the frozen paper back to the bank by wording marked both
+# of them from the first one's key, and a student who answered A twice scored
+# 100% on a paper where only one A was right.
+SAME_A = row(0, "Capital of France?", [["A", "Paris"], ["B", "Rome"]], "A")
+SAME_B = row(1, "Capital of France?", [["A", "Paris"], ["B", "Rome"]], "B")
+twice = [SAME_A, SAME_B]
+
+paper = attempt(twice, randomize_questions=True, randomize_answers=True)
+for index in range(len(paper["questions"])):
+    paper["answers"][str(index)] = "A"
+check("the frozen paper marks them apart to begin with", grading.score_payload(paper) == 50)
+check("each frozen question remembers where it came from",
+      sorted(q["position"] for q in paper["questions"]) == [0, 1])
+unmatched = sync.refresh_answer_key(paper, twice)
+check("refreshing matches both", unmatched == [])
+check("and still marks them apart", grading.score_payload(paper) == 50)
+check("the second question keeps its own key",
+      [q["correct"] for q in sorted(paper["questions"], key=lambda q: q["position"])] == ["A", "B"])
+
+# Correcting one of the pair has to land on that one alone.
+FIXED_B = row(1, "Capital of France?", [["A", "Paris"], ["B", "Rome"]], "A")
+paper = attempt(twice)
+paper["answers"] = {"0": "A", "1": "A"}
+sync.refresh_answer_key(paper, [SAME_A, FIXED_B])
+check("a correction to one twin reaches only that twin", grading.score_payload(paper) == 100)
+
+# An attempt frozen before positions were recorded cannot tell them apart, so it
+# must leave both keys alone rather than guess.
+legacy = {"questions": [{k: v for k, v in q.items() if k != "position"}
+                        for q in sync.freeze_all(twice)],
+          "answers": {"0": "A", "1": "A"}, "revision": 0}
+check("a legacy attempt starts correctly marked", grading.score_payload(legacy) == 50)
+unmatched = sync.refresh_answer_key(legacy, twice)
+check("it refuses to guess between them", len(unmatched) == 2)
+check("so its marking is left as it was", grading.score_payload(legacy) == 50)
+
+# Wording that is unique still matches without a position to go on.
+lone = {"questions": [{k: v for k, v in q.items() if k != "position"}
+                      for q in sync.freeze_all([CAPITALS])],
+        "answers": {"0": "A"}, "revision": 0}
+sync.refresh_answer_key(lone, [CAPITALS_REKEYED])
+check("a legacy attempt still follows a unique question's key", grading.score_payload(lone) == 0)
+
+# resync keeps the pair apart too.
+caught_up, summary = sync.resync(attempt(twice, answers={"0": "A", "1": "B"}), twice)
+check("resync pairs the twins by position, not wording", summary["added"] == 0 and summary["removed"] == 0)
+check("and carries each answer to its own question", caught_up["answers"] == {"0": "A", "1": "B"})
+check("both keys survive resync",
+      [q["correct"] for q in caught_up["questions"]] == ["A", "B"])
+
+
+print()
+print("== MCQ-BUG-025: which questions are still blank ==")
+# The student portal builds this list; an empty string and an empty list are
+# both "not answered", and a legitimate "0" or "False" is not.
+def blanks(answers, count):
+    return [index + 1 for index in range(count) if answers.get(str(index)) in (None, "", [])]
+
+
+check("nothing answered is all of them", blanks({}, 3) == [1, 2, 3])
+check("a gap in the middle is found", blanks({"0": "A", "2": "B"}, 3) == [2])
+check("an empty typed answer counts as blank", blanks({"0": ""}, 1) == [1])
+check("an empty select-all counts as blank", blanks({"0": []}, 1) == [1])
+check("a full paper has none", blanks({"0": "A", "1": "B"}, 2) == [])
+check("the answer \"0\" is an answer", blanks({"0": "0"}, 1) == [])
+
+
+print()
 print("== MCQ-BUG-017: angle brackets survive to the screen ==")
 title = "HTML Basics: Understanding <div> and <p> Tags"
 rendered = ui.text(title)
