@@ -102,6 +102,24 @@ def dashboard(user) -> None:
         st.warning("The assessment you were taking is no longer yours to take - your teacher either removed it "
                    "or unassigned you - so that attempt has ended and nothing was submitted.")
 
+    _assessment_list(user, previewing)
+    if st.session_state.get("attempt_id"):
+        take_attempt(user, st.session_state.attempt_id)
+
+
+# Streamlit only re-runs a page when somebody interacts with it, so an
+# assessment assigned while a student sat looking at their dashboard did not
+# appear until they refreshed -- and nothing on screen gave them any reason to.
+# Polling is what makes new work arrive on its own. Twenty seconds is quick
+# enough that a teacher assigning in front of the class sees it land, and slow
+# enough to be a few queries a minute for a student who is just sitting there.
+@st.fragment(run_every=20)
+def _assessment_list(user, previewing: bool) -> None:
+    # A fragment never re-executes the main script body, so the signed-out check
+    # belongs here as well -- without it a tab signed out somewhere else carries
+    # on polling, and carries on offering to start assessments.
+    if not require_session(user):
+        return
     quizzes = available_quizzes(user["id"], user["id"] if previewing else None)
     attempts = attempts_for_student(user["id"])
     latest = {}
@@ -119,6 +137,20 @@ def dashboard(user) -> None:
             (sum(1 for a in done if a["passed"]), "Passed"),
         ])
         st.divider()
+
+    # Say so, rather than leaving a new card to be noticed. Keyed per view so
+    # the teacher's Student view preview and their own dashboard don't announce
+    # each other's assessments.
+    seen_key = f"seen-quizzes-{'preview' if previewing else 'mine'}"
+    on_offer = {quiz["id"] for quiz in quizzes}
+    seen = st.session_state.get(seen_key)
+    if seen is None:
+        st.session_state[seen_key] = on_offer
+    elif (arrived := on_offer - seen):
+        st.session_state[seen_key] = on_offer
+        titles = [quiz["title"] for quiz in quizzes if quiz["id"] in arrived]
+        heading = titles[0] if len(titles) == 1 else f"{len(titles)} new assessments"
+        st.toast(f"New: {heading}", icon=":material/assignment:")
 
     if not quizzes:
         empty_state(
@@ -162,9 +194,9 @@ def dashboard(user) -> None:
                     label = "Resume" if attempt and not submitted else ("Retake" if submitted else "Start quiz")
                     if st.button(label, key=f"start-{quiz['id']}", type="primary", width="stretch"):
                         start_attempt(user, quiz)
+                        # App scope on purpose: the attempt itself is drawn by the
+                        # main script body, outside this fragment.
                         st.rerun()
-    if st.session_state.get("attempt_id"):
-        take_attempt(user, st.session_state.attempt_id)
 
 
 @st.fragment

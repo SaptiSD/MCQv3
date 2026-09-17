@@ -110,8 +110,28 @@ def _mirror_draft(form: dict) -> None:
     server_state.save_draft(_draft_key(), DRAFT_NAME, dict(form))
 
 
+def _vanished(widget_key: str) -> bool:
+    """True when a widget's `on_change` has outlived the widget itself.
+
+    Streamlit runs callbacks for whatever widget values the browser sends at the
+    start of a run, and the browser is always one render behind. If the run
+    before it cleared those widgets -- closing the question editor, discarding a
+    draft, saving and reloading the bank -- the callback still arrives, and the
+    key it was told to read is no longer there.
+
+    Reading it anyway raises `KeyError`, and because callbacks run *before* the
+    script body, nothing has been drawn yet: the teacher gets a blank white page
+    rather than an error, their work appears to have vanished, and only a manual
+    refresh gets them out. There is nothing to copy back for a widget that no
+    longer exists, so doing nothing is the whole correct behaviour.
+    """
+    return widget_key not in st.session_state
+
+
 def _create_save_typed(key: str) -> None:
     """Persist a typed-answer widget into the new-quiz draft."""
+    if _vanished(key):
+        return
     form = st.session_state.setdefault("new_quiz_data", {})
     form[key] = st.session_state[key]
     st.session_state["create_dirty"] = True
@@ -294,6 +314,8 @@ def analytics_page(user) -> None:
 
 
 def _create_save_setting(key: str) -> None:
+    if _vanished(key):
+        return
     if "new_quiz_data" not in st.session_state:
         st.session_state["new_quiz_data"] = {}
     st.session_state["new_quiz_data"][key] = st.session_state[key]
@@ -547,13 +569,16 @@ def create(user) -> None:
 
     bottom_publish = st.button("Publish quiz", key="new-quiz-publish-bottom", type="primary",
                                width="stretch", disabled=publishing)
-    # Scaffolding is not a draft: the publish token and the default question
-    # count are written just by opening the page, and neither should make this
-    # button offer to throw away work nobody has done yet.
-    scaffolding = ("new-publish-token", "new-manual-count")
-    has_draft = (any(key not in scaffolding for key in form)
-                 or int(form.get("new-manual-count", 1) or 1) > 1)
-    if has_draft and st.button("Discard draft", key="new-quiz-discard", width="stretch"):
+    # Always drawn, deliberately. This used to appear only once the draft held
+    # something, which sounds right and did not work: the draft is filled in by
+    # the settings and questions *fragments*, and a fragment re-run never
+    # re-executes this body -- so the button stayed hidden however much the
+    # teacher typed, until some unrelated click forced a full run. It looked
+    # broken because it was missing. Making the fragment force a full run instead
+    # would scroll the page back to the top on the first keystroke, which is the
+    # very thing the fragments were introduced to stop. Pressing this with
+    # nothing to discard costs nothing.
+    if st.button("Discard draft", key="new-quiz-discard", width="stretch"):
         _clear_new_quiz_state()
         st.rerun()
     # A second click that arrives while the first is still being processed is a
@@ -1182,10 +1207,17 @@ def reset_editor_state(quiz_id: int) -> None:
     has a Streamlit widget, whose value beats the `value=`/`index=` the reloaded
     draft passes in -- so a reordered question came straight back on the next
     render, and the next save wrote that stale order back to the database.
-    Dropping the keys is not enough on its own, because the browser still holds
-    the values and re-sends them; bumping `editor_epoch` renames every widget,
-    which is the only thing that really gives them a fresh start. The keys are
-    dropped as well so a long editing session doesn't accumulate dead state.
+    Bumping `editor_epoch` renames every widget, which is the only thing that
+    really gives them a fresh start: the browser still holds the old values and
+    re-sends them, so nothing short of a new key escapes them.
+
+    The old keys are deliberately *not* deleted. Dropping them looked like tidying
+    up after a rename that had already done the work, and it was the cause of the
+    blank white page after a save: the browser is a render behind, so it sends the
+    old widgets' values into the next run, Streamlit calls their `on_change`
+    callbacks, and those callbacks then read keys that are no longer there. They
+    guard against that too -- see `_vanished` -- but the fix worth having is not
+    creating the situation.
 
     Prepared exports are dropped at the same time: they were built from the old
     questions, and rebuilding them on every keystroke is what made the editor
@@ -1194,14 +1226,6 @@ def reset_editor_state(quiz_id: int) -> None:
     st.session_state.pop(editor_state_key(quiz_id), None)
     st.session_state.pop(f"downloads-ready-{quiz_id}", None)
     st.session_state[f"editor-epoch-{quiz_id}"] = editor_epoch(quiz_id) + 1
-    field_keys = (
-        f"reorder-question-{quiz_id}-",
-        f"manual-type-{quiz_id}-", f"manual-text-{quiz_id}-", f"manual-option-{quiz_id}-",
-        f"manual-correct-mc-{quiz_id}-", f"manual-correct-tf-{quiz_id}-",
-        f"manual-correct-all-{quiz_id}-", f"manual-typed-{quiz_id}-",
-    )
-    for key in [key for key in st.session_state if key.startswith(field_keys)]:
-        st.session_state.pop(key, None)
 
 
 def _editor_draft(quiz) -> list[dict]:
@@ -1268,6 +1292,8 @@ def manual_question_editor(quiz, locked: bool = False) -> None:
 
     def _write(field: str, index: int, widget_key: str, sub: str | None = None) -> None:
         """Copy a widget's value back into the working copy it was rendered from."""
+        if _vanished(widget_key) or index >= len(draft):
+            return
         value = st.session_state[widget_key]
         if sub is None:
             draft[index][field] = value
@@ -1339,6 +1365,8 @@ def manual_question_editor(quiz, locked: bool = False) -> None:
                 prefix = f"manual-typed-{quiz_id}-{epoch}-{index}"
 
                 def _write_typed(widget_key: str, i=index, p=prefix) -> None:
+                    if _vanished(widget_key) or i >= len(draft):
+                        return
                     draft[i]["typed"][widget_key[len(p) + 1:]] = st.session_state[widget_key]
 
                 typed_answer_editor(

@@ -54,6 +54,7 @@ for t in test_*.py; do .venv/Scripts/python.exe $t; done
 | `test_admin_edit_form.py` | admin edit form following the account picker |
 | `test_editor_state.py` | editor state, uploads, publish claims |
 | `test_attempt_sync.py` | quiz/attempt drift — fingerprints, resync, re-keying |
+| `test_editor_callbacks.py` | the blank-page crash; runs the real runtime via `AppTest` |
 
 `.venv/Scripts/python.exe -m pyflakes *.py` should print nothing.
 
@@ -150,6 +151,32 @@ always to *rename* the widget, never to delete its key:
 Deleting the key instead looks equivalent and is not: Streamlit fires the deleted
 widget's `on_change`, and that callback then writes its own stale copy back.
 
+**A callback can outlive its widget, and reading the key then blanks the page.**
+Streamlit runs `on_change` for whatever values the browser sends at the start of
+a run, and the browser is a render behind. If the previous run stopped drawing
+those widgets -- closing the question editor, discarding a draft, bumping
+`editor_epoch` -- the callback still arrives and the key it was told to read is
+gone. Callbacks run *before* the script body, so an uncaught `KeyError` there
+paints nothing at all: the teacher gets a white page, not an error, and only a
+refresh escapes. Every such callback starts with `_vanished(widget_key)` (and an
+index check where it indexes a draft that may have shrunk). Note that Streamlit
+culls the state of widgets it did not render, so those keys vanish whether the
+app deletes them or not -- deleting is merely pointless, the guard is the fix.
+
+**A fragment re-run never re-executes the main script body**, so nothing in the
+main body may gate on state a fragment owns. The Create page's Discard draft
+button was hidden until the draft held something; the draft is filled in by the
+settings and questions fragments, so the button stayed hidden however much was
+typed and read as broken. It is drawn unconditionally now. Forcing a full run
+from the fragment instead would scroll the page to the top on the first
+keystroke, which is what the fragments exist to prevent.
+
+**Nothing appears on a student's screen unless something re-runs the page.**
+Streamlit only re-runs on interaction, so an assessment assigned while a student
+sat on their dashboard did not show up until they refreshed, with nothing to
+suggest they should. `_assessment_list` is a `run_every=20` fragment that also
+toasts genuinely new titles. It re-checks `require_session` for the reason above.
+
 **Option letters are data, not decoration.** A, B, C, D are what the answer key
 points at, so any round trip through text -- the upload review table especially --
 has to preserve them. Re-lettering by position moves the key on to whatever lands
@@ -220,7 +247,7 @@ Observed Behavior   what did
 Impact              who is hurt and how
 ```
 
-Numbers are global across reports and currently run to MCQ-BUG-025; check the
+Numbers are global across reports and currently run to MCQ-BUG-029; check the
 last commit for where the sequence has got to. A finding is not a bug until it has been **reproduced**. Read-only code review
 produces plausible-looking claims that turn out to be guarded three lines up;
 confirm against the running app at :8512 or against the database before fixing,
