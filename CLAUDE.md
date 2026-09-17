@@ -177,6 +177,15 @@ sat on their dashboard did not show up until they refreshed, with nothing to
 suggest they should. `_assessment_list` is a `run_every=20` fragment that also
 toasts genuinely new titles. It re-checks `require_session` for the reason above.
 
+**A deferred download needs its content in its key.** `st.download_button` with a
+callable registers the builder afresh on every render and gets a new
+`deferred_file_id` each time, but the *element* id is derived from the widget
+key -- so with a fixed key the browser goes on holding the id it was handed for
+the previous selection, and the first click after changing that selection serves
+the old file. The PDF export showed it: switch the contents dropdown, and the
+answers (or the settings) only appeared on a second click. The key carries the
+chosen format now. Same cure as the widget-key rule above: rename, don't reuse.
+
 **Option letters are data, not decoration.** A, B, C, D are what the answer key
 points at, so any round trip through text -- the upload review table especially --
 has to preserve them. Re-lettering by position moves the key on to whatever lands

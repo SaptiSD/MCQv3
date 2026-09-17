@@ -717,7 +717,15 @@ def _quiz_downloads(quiz, questions: list | None = None) -> None:
         "Questions with correct answers and quiz settings": "questions-answers-settings",
     }
     format_key = format_map[pdf_format]
-    st.download_button("Download PDF", lambda: _render_quiz_pdf(quiz, questions, format_key), "quiz.pdf", "application/pdf", type="primary", on_click="ignore", key=f"pdf-{quiz['id']}")
+    # The chosen format belongs in the key. A deferred download registers its
+    # builder afresh on every render and gets a new id each time, but the
+    # *element* id comes from this key -- so with a fixed key the browser went on
+    # holding the id it was given for the previous format, and the first click
+    # after switching served the old file. Answers appeared only on a second
+    # click, by which time a rerun had caught the button up. Putting the format
+    # in the key makes it a different widget, which is the same cure as
+    # everywhere else here: rename, don't reuse.
+    st.download_button("Download PDF", lambda: _render_quiz_pdf(quiz, questions, format_key), "quiz.pdf", "application/pdf", type="primary", on_click="ignore", key=f"pdf-{quiz['id']}-{format_key}")
     st.download_button("Download question bank CSV", lambda: _question_bank_csv(questions), "question-bank.csv", "text/csv", on_click="ignore", key=f"bank-csv-{quiz['id']}")
     st.download_button("Download printable DOCX", lambda: _render_quiz_docx(quiz, questions), "quiz.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", on_click="ignore", key=f"docx-{quiz['id']}")
 
