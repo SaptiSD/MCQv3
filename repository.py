@@ -535,6 +535,36 @@ PAPER_IS_FIXED = (
     "assessment and publish a new one."
 )
 
+# The same rule, reached the commonest way: a typed answer whose correction also
+# moves the note under the student's answer box. Telling someone who has just
+# corrected an answer key that they "can still correct an answer key" reads as a
+# contradiction, so this names what actually stopped them.
+TYPED_ANSWER_IS_FIXED = (
+    "A student has already started this assessment. You can correct a typed question's "
+    "answer, but not in a way that changes the note under their answer box -- asking for "
+    "three decimal places where they were told two, or an answer longer than the box "
+    "allows, changes the question they are sitting. Keep the same precision and length, "
+    "or delete this assessment and publish a new one."
+)
+
+
+def _why_fixed(records: list[dict], stored: list[dict]) -> str:
+    """Which flavour of the refusal applies. Never whether -- only how it reads."""
+    if len(records) != len(stored):
+        return PAPER_IS_FIXED
+    for record, previous in zip(records, stored):
+        if (attempt_sync.row_signature(record, include_key=False)
+                == attempt_sync.row_signature(previous, include_key=False)):
+            continue
+        # A typed question whose wording is untouched: what moved is the answer,
+        # and with it the hint derived from the answer.
+        if not (record.get("question_type") in grading.TEXT_QUESTION_TYPES
+                and previous.get("question_type") in grading.TEXT_QUESTION_TYPES
+                and grading.normalise_text(record["question_text"])
+                == grading.normalise_text(previous["question_text"])):
+            return PAPER_IS_FIXED
+    return TYPED_ANSWER_IS_FIXED
+
 
 def save_question_bank(quiz_id: int, questions: list[dict]) -> None:
     """Replace a quiz's questions with `questions`.
@@ -579,7 +609,7 @@ def save_question_bank(quiz_id: int, questions: list[dict]) -> None:
         # which is exactly the line between a fixed paper and a correctable key.
         if (attempt_sync.bank_fingerprint(records, include_key=False)
                 != attempt_sync.bank_fingerprint(stored, include_key=False)):
-            raise ValueError(PAPER_IS_FIXED)
+            raise ValueError(_why_fixed(records, stored))
         # Keep the positions the attempts in flight were frozen against. Every
         # row is rewritten on a save, and numbering them afresh from zero would
         # be fine were it not that position is what tells two identically worded

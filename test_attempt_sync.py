@@ -391,6 +391,41 @@ check("a closing time in a different offset is still compared correctly",
 
 
 print()
+print("== the refusal names what actually stopped the save ==")
+# The general message tells a teacher they "can still correct an answer key",
+# and the commonest way to be refused is correcting a typed answer in a way that
+# moves the note under the student's answer box. Saying that to someone who has
+# just done exactly that reads as a contradiction.
+import repository                                  # noqa: E402
+
+TYPED_2DP_ROW = row(0, "Give pi", [], json.dumps(grading.build_spec("3.14", "number")), "Short answer")
+TYPED_3DP_ROW = row(0, "Give pi", [], json.dumps(grading.build_spec("3.142", "number")), "Short answer")
+TYPED_SAME_DP = row(0, "Give pi", [], json.dumps(grading.build_spec("3.15", "number")), "Short answer")
+CHOICE_ROW = row(1, "Capital of France?", [["A", "Paris"], ["B", "Rome"]], "A")
+
+check("a typed answer that moves the hint is explained as a typed answer",
+      repository._why_fixed([TYPED_3DP_ROW, CHOICE_ROW], [TYPED_2DP_ROW, CHOICE_ROW])
+      is repository.TYPED_ANSWER_IS_FIXED)
+check("a reworded question is explained as the paper",
+      repository._why_fixed([TYPED_2DP_ROW, row(1, "Which capital?", [["A", "Paris"], ["B", "Rome"]], "A")],
+                            [TYPED_2DP_ROW, CHOICE_ROW])
+      is repository.PAPER_IS_FIXED)
+check("a rewritten option is explained as the paper",
+      repository._why_fixed([TYPED_2DP_ROW, row(1, "Capital of France?", [["A", "Lyon"], ["B", "Rome"]], "A")],
+                            [TYPED_2DP_ROW, CHOICE_ROW])
+      is repository.PAPER_IS_FIXED)
+check("a different number of questions is explained as the paper",
+      repository._why_fixed([TYPED_2DP_ROW], [TYPED_2DP_ROW, CHOICE_ROW])
+      is repository.PAPER_IS_FIXED)
+check("a typed answer at the same precision is not a visible change at all",
+      sync.bank_fingerprint([TYPED_SAME_DP], include_key=False)
+      == sync.bank_fingerprint([TYPED_2DP_ROW], include_key=False))
+check("so it is never refused",
+      sync.bank_fingerprint([TYPED_SAME_DP, CHOICE_ROW], include_key=False)
+      == sync.bank_fingerprint([TYPED_2DP_ROW, CHOICE_ROW], include_key=False))
+
+
+print()
 print("== MCQ-BUG-017: angle brackets survive to the screen ==")
 title = "HTML Basics: Understanding <div> and <p> Tags"
 rendered = ui.text(title)

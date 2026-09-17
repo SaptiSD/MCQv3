@@ -1252,6 +1252,14 @@ def _draft_to_questions(draft: list[dict]) -> list[dict]:
 def manual_question_editor(quiz, locked: bool = False) -> None:
     if locked:
         st.caption("Correct an answer below and save. The questions and their options are fixed.")
+        if any(entry["type"] in TEXT_QUESTION_TYPES for entry in _editor_draft(quiz)):
+            # The note under a typed answer box is derived from the answer, so
+            # some answer corrections move it -- and moving it changes the
+            # question the student is sitting. Say so before they type, rather
+            # than only when the save is refused.
+            st.caption("For typed questions, keep the same precision and length: the note under the "
+                       "student's answer box is built from your answer, and changing it changes what "
+                       "they were asked.")
     else:
         st.caption("Create the test directly. Each question needs text, at least two options, and one correct answer.")
     draft = _editor_draft(quiz)
