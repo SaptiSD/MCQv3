@@ -348,6 +348,49 @@ check("the answer \"0\" is an answer", blanks({"0": "0"}, 1) == [])
 
 
 print()
+print("== the assessment window is checked when Start is pressed, not only when drawn ==")
+# The dashboard card is drawn from the quiz list as it stood when the page
+# rendered. Pressing Start a few seconds later used to build an attempt whose
+# deadline was `min(now + duration, closing_time)` -- in the past once the quiz
+# had closed -- so the countdown fired on the first refresh and recorded a 0%
+# on a paper the student never saw. With retakes off, permanently.
+from datetime import datetime, timezone           # noqa: E402
+import student_portal                             # noqa: E402
+
+
+def quiz_window(opening, closing, opening_enabled=1, closing_enabled=1):
+    return {"opening_time": opening, "closing_time": closing,
+            "opening_enabled": opening_enabled, "closing_enabled": closing_enabled}
+
+
+def at(hour, minute, second=0):
+    return datetime(2026, 9, 17, hour, minute, second, tzinfo=timezone.utc)
+
+
+WINDOW = quiz_window("2026-09-17T09:00:00+00:00", "2026-09-17T17:00:00+00:00")
+check("inside the window it opens", student_portal.window_state(WINDOW, at(12, 0)) == "open")
+check("five seconds after closing it does not",
+      student_portal.window_state(WINDOW, at(17, 0, 5)) == "closed")
+check("on the closing second it does not either",
+      student_portal.window_state(WINDOW, at(17, 0, 0)) == "closed")
+check("one second before closing it still does",
+      student_portal.window_state(WINDOW, at(16, 59, 59)) == "open")
+check("before opening it is not yet available",
+      student_portal.window_state(WINDOW, at(8, 59)) == "not_yet")
+check("on the opening second it is",
+      student_portal.window_state(WINDOW, at(9, 0)) == "open")
+check("a quiz with no closing date never closes",
+      student_portal.window_state(quiz_window("2026-09-17T09:00:00+00:00", "2020-01-01T00:00:00+00:00",
+                                              closing_enabled=0), at(17, 0, 5)) == "open")
+check("a quiz with no opening date is available immediately",
+      student_portal.window_state(quiz_window("2099-01-01T00:00:00+00:00", "2099-12-31T00:00:00+00:00",
+                                              opening_enabled=0), at(9, 0)) == "open")
+check("a closing time in a different offset is still compared correctly",
+      student_portal.window_state(quiz_window("2026-09-17T09:00:00+00:00",
+                                              "2026-09-17T18:00:00+01:00"), at(17, 0, 5)) == "closed")
+
+
+print()
 print("== MCQ-BUG-017: angle brackets survive to the screen ==")
 title = "HTML Basics: Understanding <div> and <p> Tags"
 rendered = ui.text(title)

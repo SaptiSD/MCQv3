@@ -143,10 +143,18 @@ def move_question(quiz_id: int, question_id: int, direction: int) -> bool:
     target_index = current_index + direction if current_index is not None else None
     if target_index is None or not 0 <= target_index < len(questions):
         return False
-    supabase = client()
-    supabase.table("questions").update({"position": -1}).eq("id", question_id).execute()
-    supabase.table("questions").update({"position": current_index}).eq("id", questions[target_index]["id"]).execute()
-    supabase.table("questions").update({"position": target_index}).eq("id", question_id).execute()
+    # One write, not three. The old version parked the moving question at
+    # position -1 to get it out of the way, then wrote the other two rows -- and
+    # `db.py` does not retry writes, so a connection that died in the middle left
+    # a question stranded at -1 for good. There is no unique index on
+    # (quiz_id, position), so the sentinel bought nothing in the first place.
+    # Swapping the stored positions rather than the list indices also keeps the
+    # numbering intact if it was ever sparse.
+    moving, neighbour = questions[current_index], questions[target_index]
+    client().table("questions").upsert([
+        {**moving, "position": neighbour["position"]},
+        {**neighbour, "position": moving["position"]},
+    ]).execute()
     return True
 
 
@@ -572,6 +580,15 @@ def save_question_bank(quiz_id: int, questions: list[dict]) -> None:
         if (attempt_sync.bank_fingerprint(records, include_key=False)
                 != attempt_sync.bank_fingerprint(stored, include_key=False)):
             raise ValueError(PAPER_IS_FIXED)
+        # Keep the positions the attempts in flight were frozen against. Every
+        # row is rewritten on a save, and numbering them afresh from zero would
+        # be fine were it not that position is what tells two identically worded
+        # questions apart -- renumber them and one twin can inherit the other's
+        # answer key, which is the bug this whole anchor exists to stop. The
+        # paper is identical here by definition, so the orders line up.
+        if len(records) == len(stored):
+            for record, previous in zip(records, stored):
+                record["position"] = previous["position"]
     # Read back what the insert actually wrote. Without this a request that
     # returned 2xx but stored nothing would still take the delete below with it,
     # and the editor would report "saved and published" over an emptied quiz.
@@ -769,17 +786,32 @@ def available_quizzes(student_id: int, owner_id: int | None = None):
 
 
 def quiz_average_score(quiz_id: int):
-    """Average score (percent) across completed student attempts for a quiz, or None.
+    """Average score (percent) across the students who have finished this quiz.
+
+    One figure per student -- their most recent submitted attempt, which is the
+    same attempt the teacher's results table shows for them, so the two cannot
+    disagree. Averaging every submitted attempt instead let one student's
+    retakes *be* the class average: eleven goes at the same quiz counted eleven
+    times against everybody else's one, and the number a student is invited to
+    measure themselves against moved every time somebody else had another try.
 
     The teacher's own preview attempts are excluded. They are already left out
     of the teacher's analytics, and leaving them in here meant the "class
     average" shown to students moved every time their teacher tried the quiz.
     """
     quiz = get_quiz(quiz_id)
-    query = client().table("attempts").select("score_percent").eq("quiz_id", quiz_id).not_.is_("submitted_at", None)
+    query = (client().table("attempts").select("student_id,score_percent,started_at")
+             .eq("quiz_id", quiz_id).not_.is_("submitted_at", None))
     if quiz:
         query = query.neq("student_id", quiz["owner_id"])
-    scores = [row.get("score_percent") for row in _rows(query.execute()) if row.get("score_percent") is not None]
+    newest: dict = {}
+    for row in _rows(query.execute()):
+        if row.get("score_percent") is None:
+            continue
+        held = newest.get(row["student_id"])
+        if held is None or (row.get("started_at") or "") > (held.get("started_at") or ""):
+            newest[row["student_id"]] = row
+    scores = [row["score_percent"] for row in newest.values()]
     return (sum(scores) / len(scores)) if scores else None
 
 

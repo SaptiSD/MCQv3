@@ -165,9 +165,34 @@ the shuffle.
 except `unsafe_allow_html=True`, and most headings here are drawn that way. Put
 anything a person typed through `ui.text()`.
 
+**A card on screen is a rendering decision, not a permission.** Every list here
+is drawn from the database as it stood when the page rendered, and Streamlit will
+happily hand you a click on a card that has since gone wrong -- a stale tab, or
+just a few seconds of reading time. Anything reached from a card re-checks its
+own preconditions: `start_attempt` re-checks retakes *and* `window_state`,
+because a Start pressed after the closing time used to build an attempt whose
+deadline was already in the past, fire the countdown on the first refresh, and
+record a 0% on a paper the student never saw. With retakes off, permanently.
+
+**One row per student in anything called an average.** `quiz_average_score` takes
+each student's most recent submitted attempt -- the same attempt the teacher's
+results table shows them, so the two cannot disagree. Averaging every submitted
+attempt let one student's eleven retakes *be* the class average.
+`teacher_analytics` is deliberately different: it is an attempt-level figure and
+the dashboard labels it next to "Completed attempts".
+
+**Every route to a submission goes through `_hand_in`.** That is where the
+stale-paper guard lives. On the Submit button alone it left the
+unanswered-questions confirmation -- raised before the paper went stale, still on
+screen after -- offering a second door straight past it.
+
 **Writes are not retried.** `db.py` retries only requests whose connection never
 opened. Prefer idempotent writes (upsert, add-missing/drop-leftover) over
-delete-then-insert, which also races and briefly leaves rows missing.
+delete-then-insert, which also races and briefly leaves rows missing. Prefer one
+statement to several, too: `move_question` used to park a row at position -1 and
+then write two more, and a connection that died in the middle stranded it there
+for good. It is one upsert now -- and there is no unique index on
+(quiz_id, position) that ever needed the sentinel.
 
 ## Conventions
 

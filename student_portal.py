@@ -91,6 +91,13 @@ def dashboard(user) -> None:
     blocked = st.session_state.pop("retake_blocked", None)
     if blocked:
         st.warning(f"**{blocked}** has already been submitted and your teacher didn't allow retakes.")
+    closed = st.session_state.pop("window_closed", None)
+    if closed:
+        st.warning(f"**{closed}** closed before you could start it, so no attempt was recorded. "
+                   "Ask your teacher if you need it reopened.")
+    early = st.session_state.pop("window_not_open", None)
+    if early:
+        st.info(f"**{early}** hasn't opened yet. It will be ready at the time your teacher set.")
     if st.session_state.pop("attempt_withdrawn", False):
         st.warning("The assessment you were taking is no longer yours to take - your teacher either removed it "
                    "or unassigned you - so that attempt has ended and nothing was submitted.")
@@ -197,6 +204,23 @@ def my_teachers_page(user) -> None:
                 st.rerun(scope="fragment")
 
 
+OPEN, NOT_YET, CLOSED = "open", "not_yet", "closed"
+
+
+def window_state(quiz, now: datetime) -> str:
+    """Whether `quiz` may be started at `now`.
+
+    Pulled out of `start_attempt` so it can be tested without a browser: the
+    bug it exists to stop is off by seconds, which is exactly the kind of thing
+    that never gets exercised by hand.
+    """
+    if quiz["closing_enabled"] and datetime.fromisoformat(quiz["closing_time"]) <= now:
+        return CLOSED
+    if quiz["opening_enabled"] and datetime.fromisoformat(quiz["opening_time"]) > now:
+        return NOT_YET
+    return OPEN
+
+
 def _paper_id(payload: dict) -> str:
     """Which version of the questions a payload holds.
 
@@ -233,9 +257,24 @@ def start_attempt(user, quiz) -> None:
         # one) could open a fresh attempt on a quiz with retakes switched off.
         st.session_state.retake_blocked = quiz["title"]
         return
+    started = current_time()
+    # The card this was pressed from was drawn from the quiz list as it stood
+    # when the page rendered, and a card is a rendering decision rather than a
+    # permission -- the same reasoning as the retake check above. A student who
+    # reads the card for a few seconds and then presses Start can arrive after
+    # the assessment has closed, and the deadline below is a `min` against the
+    # closing time: it lands in the past, the countdown fires on the very first
+    # refresh, and they are recorded as having scored nothing on a paper they
+    # never saw. With retakes switched off that nothing is final.
+    state = window_state(quiz, started)
+    if state == CLOSED:
+        st.session_state.window_closed = quiz["title"]
+        return
+    if state == NOT_YET:
+        st.session_state.window_not_open = quiz["title"]
+        return
     frozen = attempt_sync.freeze_all(questions_for_quiz(quiz["id"]),
                                      quiz["randomize_questions"], quiz["randomize_answers"])
-    started = current_time()
     deadline = started + timedelta(minutes=quiz["duration_minutes"])
     if quiz["closing_enabled"]:
         deadline = min(deadline, datetime.fromisoformat(quiz["closing_time"]))
@@ -438,6 +477,13 @@ def take_attempt(user, attempt_id: int) -> None:
         st.caption("Your answers save as you go, so you can come back later or run out of time without losing them. "
                    "Submitting is final unless your teacher allowed retakes.")
     def _hand_in() -> None:
+        # Every route to a submission goes through here, so the stale-paper
+        # guard does too rather than living on one button. The unanswered
+        # confirmation is raised before the paper can go stale and stays on
+        # screen afterwards, so its "Submit anyway" was a second door into
+        # handing in a paper that no longer exists.
+        if out_of_date:
+            return
         payload["answers"] = answers
         submit_attempt(attempt, payload, False)
         st.session_state.pop(f"confirm-submit-{attempt_id}", None)
@@ -451,7 +497,7 @@ def take_attempt(user, attempt_id: int) -> None:
     blanks = [index + 1 for index in range(len(questions))
               if answers.get(str(index)) in (None, "", [])]
     confirm_key = f"confirm-submit-{attempt_id}"
-    if blanks and st.session_state.get(confirm_key):
+    if blanks and st.session_state.get(confirm_key) and not out_of_date:
         listed = ", ".join(str(number) for number in blanks[:12])
         if len(blanks) > 12:
             listed += f" and {len(blanks) - 12} more"
