@@ -14,7 +14,9 @@ streamlit run app.py
 
 Supabase credentials come from `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`
 environment variables, or the `[supabase]` section of `.streamlit/secrets.toml`
-(gitignored). The schema lives in `supabase/schema.sql`.
+(gitignored). Copy `.streamlit/example.secrets.toml` to start one: it lists every
+setting the app reads, including the optional Google sign-in and Gemini sections.
+The schema lives in `supabase/schema.sql`.
 
 > The local setup points at the **live** database. Prefix anything you create
 > while testing so you can find and delete it afterwards.
