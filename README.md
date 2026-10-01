@@ -59,6 +59,45 @@ are still read correctly.
 `python test_grading.py` covers the rules, including the `2 * 3` and `100 / 3`
 cases.
 
+## Uploading a question bank
+
+A `.txt` or `.docx` file is read by `ingestion.py`, in document order and with
+its formatting, so it understands more than the numbered-questions-plus-answer-key
+layout: unnumbered questions (a Moodle quiz pasted into Word), Aiken-style
+`ANSWER: B` lines, and the right option marked in place by a tick, highlight,
+bold, colour, `(correct)` or an asterisk. Everything read lands in a review
+table; a question whose answer the file does not give is kept with a blank
+answer, and the quiz will not publish until it is filled in.
+
+Each row of the review table has an **Add?** box; untick it to leave that question
+out.
+
+Tables in a `.docx` become the quiz's **Description/Context** (called case
+material in the code and `quizzes.case_material` in the database) — the passage or data
+the questions refer to — shown to students above the questions and printed at
+the top of the PDF and DOCX exports. It lives in `quizzes.case_material`; an
+existing database needs that column added once (the statement is in
+`supabase/schema.sql`). Until it is, quizzes without case material publish as
+before and anything that would save some says what to run.
+
+### Reading with AI (optional)
+
+For files the rule-based reader cannot follow, **Read with AI** sends the file's
+text to Google Gemini (`ai_reader.py`). It appears only when a key is configured:
+
+```toml
+# .streamlit/secrets.toml
+[gemini]
+api_key = "..."
+# optional; tried in order, and retired models fall through to the next
+models = ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
+```
+
+The model transcribes and never answers: an answer it cannot point to in the
+file is dropped, and the table read straight out of the `.docx` is kept in
+preference to the model's copy of it. On AI Studio's free tier Google may use
+what is sent to improve its products, so don't send files with personal data.
+
 ## Documentation
 
 `guide.py` holds the teacher and student guides. The same text is the in-app

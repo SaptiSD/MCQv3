@@ -499,26 +499,50 @@ def set_quiz_assignments(quiz_id: int, student_ids: list[int]) -> None:
         ).execute()
 
 
-def create_quiz(owner_id: int, title: str, duration: int, passing: int, allow_retake: bool, show_average: bool, opening_time: str, closing_time: str, student_ids: list[int], opening_enabled: bool = True, closing_enabled: bool = True, randomize_questions: bool = True, randomize_answers: bool = True) -> int:
+CASE_MATERIAL_IS_FIXED = (
+    "A student has already started this assessment, so its Description/Context is fixed along with its "
+    "questions -- it is part of the paper they are sitting. To change it, delete this assessment and "
+    "publish a new one."
+)
+
+CASE_MATERIAL_NEEDS_COLUMN = (
+    "The Description/Context can't be saved until the database has a place for it. Run this once in the Supabase "
+    "SQL editor, then try again: alter table public.quizzes add column if not exists case_material text "
+    "not null default '';"
+)
+
+
+def _missing_case_column(exc: Exception) -> bool:
+    """Whether a write failed only because `quizzes.case_material` doesn't exist yet."""
+    return str(getattr(exc, "code", "") or "") in ("PGRST204", "42703") or "case_material" in str(exc)
+
+
+def create_quiz(owner_id: int, title: str, duration: int, passing: int, allow_retake: bool, show_average: bool, opening_time: str, closing_time: str, student_ids: list[int], opening_enabled: bool = True, closing_enabled: bool = True, randomize_questions: bool = True, randomize_answers: bool = True, case_material: str = "") -> int:
     # Publishing the same draft twice is stopped by the claim in `server_state`,
     # which every tab on this server shares. Matching on the title used to do
     # that job here, and it was wrong in both directions: it collapsed two
     # deliberately same-named quizzes into one *and* silently dropped the
     # second one's student assignments.
     supabase = client()
-    row = _rows(
-        supabase.table("quizzes").insert(
-            {
-                "owner_id": owner_id, "title": title, "duration_minutes": duration,
-                "passing_score": passing, "quiz_length": None,
-                "allow_retake": int(allow_retake), "show_average": int(show_average),
-                "opening_time": opening_time, "closing_time": closing_time,
-                "opening_enabled": int(opening_enabled), "closing_enabled": int(closing_enabled),
-                "randomize_questions": int(randomize_questions), "randomize_answers": int(randomize_answers),
-                "status": "draft", "created_at": utc_now(),
-            }
-        ).select("id").execute()
-    )[0]
+    record = {
+        "owner_id": owner_id, "title": title, "duration_minutes": duration,
+        "passing_score": passing, "quiz_length": None,
+        "allow_retake": int(allow_retake), "show_average": int(show_average),
+        "opening_time": opening_time, "closing_time": closing_time,
+        "opening_enabled": int(opening_enabled), "closing_enabled": int(closing_enabled),
+        "randomize_questions": int(randomize_questions), "randomize_answers": int(randomize_answers),
+        "status": "draft", "created_at": utc_now(),
+    }
+    # Only sent when there is some, so a database that has not had the column
+    # added yet can still publish every quiz that doesn't use it.
+    if (case_material or "").strip():
+        record["case_material"] = case_material.strip()
+    try:
+        row = _rows(supabase.table("quizzes").insert(record).select("id").execute())[0]
+    except Exception as exc:
+        if "case_material" in record and _missing_case_column(exc):
+            raise ValueError(CASE_MATERIAL_NEEDS_COLUMN) from None
+        raise
     quiz_id = row["id"]
     if student_ids:
         supabase.table("quiz_students").insert(
@@ -632,6 +656,31 @@ def save_question_bank(quiz_id: int, questions: list[dict]) -> None:
     if previous_ids:
         supabase.table("questions").delete().in_("id", previous_ids).execute()
     supabase.table("quizzes").update({"status": "active"}).eq("id", quiz_id).execute()
+
+
+def save_case_material(quiz_id: int, case_material: str) -> None:
+    """Set the passage, case or tables shown above a quiz's questions.
+
+    Students read it to answer the questions, so it is part of the paper and
+    fixes with it once a real student starts -- enforced here for the same
+    reason `save_question_bank` enforces the questions: a disabled box is only a
+    rendering decision. An unchanged save is a no-op, which is also what lets a
+    database without the column go on saving question banks.
+    """
+    case_material = (case_material or "").strip()
+    quiz = get_quiz(quiz_id)
+    if quiz is None:
+        raise ValueError("This assessment no longer exists.")
+    if case_material == (quiz.get("case_material") or "").strip():
+        return
+    if quiz_has_attempts(quiz_id, exclude_student_id=quiz["owner_id"]):
+        raise ValueError(CASE_MATERIAL_IS_FIXED)
+    try:
+        client().table("quizzes").update({"case_material": case_material}).eq("id", quiz_id).execute()
+    except Exception as exc:
+        if _missing_case_column(exc):
+            raise ValueError(CASE_MATERIAL_NEEDS_COLUMN) from None
+        raise
 
 
 def update_quiz_settings(quiz_id: int, duration: int, passing: int, allow_retake: bool, show_average: bool, opening_time: str, closing_time: str, opening_enabled: bool, closing_enabled: bool, randomize_questions: bool = True, randomize_answers: bool = True) -> None:
@@ -908,7 +957,8 @@ def attempt_with_quiz(attempt_id: int, student_id: int):
         return None
     attempt = rows[0]
     quiz = get_quiz(attempt["quiz_id"])
-    return {**attempt, "title": quiz["title"] if quiz else "", "passing_score": quiz["passing_score"] if quiz else 0}
+    return {**attempt, "title": quiz["title"] if quiz else "", "passing_score": quiz["passing_score"] if quiz else 0,
+            "case_material": (quiz.get("case_material") or "") if quiz else ""}
 
 
 def save_attempt_answers(attempt_id: int, answers_json: str) -> None:

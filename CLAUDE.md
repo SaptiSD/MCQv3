@@ -55,6 +55,8 @@ for t in test_*.py; do .venv/Scripts/python.exe $t; done
 | `test_editor_state.py` | editor state, uploads, publish claims |
 | `test_attempt_sync.py` | quiz/attempt drift — fingerprints, resync, re-keying |
 | `test_editor_callbacks.py` | the blank-page crash; runs the real runtime via `AppTest` |
+| `test_ingestion.py` | upload layouts, answer marks, case material, exports |
+| `test_ai_reader.py` | the Gemini reader with the network faked out |
 
 `.venv/Scripts/python.exe -m pyflakes *.py` should print nothing.
 
@@ -70,14 +72,21 @@ repository.py       all data access (PostgREST). No SQL in UI modules.
 db.py               Supabase client, resilient transport, demo seed
 grading.py          answer specs + marking. Pure.
 attempt_sync.py     keeping an attempt in step with its quiz. Pure.
-ingestion.py        question-bank file upload parsing
+ingestion.py        question-bank upload: blocks, layouts, answer marks,
+                    case material. Pure.
+ai_reader.py        the optional Gemini reader for files ingestion can't
+                    follow. No Streamlit, no database; one HTTPS call.
 server_state.py     state outliving one browser tab (sign-out epochs,
                     draft mirrors, publish claims)
 guide.py            teacher/student guide — also the PDF/DOCX handouts
 ```
 
-Dependency direction: `grading` ← `attempt_sync` ← `repository` ← portals.
-Keep `attempt_sync` and `grading` free of Streamlit and of the database.
+Dependency direction: `grading` ← `attempt_sync` ← `repository` ← portals, and
+`grading` ← `ingestion` / `ai_reader` ← `teacher_portal`. Keep `attempt_sync`,
+`grading`, `ingestion` and `ai_reader` free of Streamlit and of the database.
+
+The Gemini key lives in `[gemini] api_key` in `.streamlit/secrets.toml`
+(gitignored); without it the **Read with AI** button simply isn't drawn.
 
 ## Invariants worth not breaking
 
@@ -231,6 +240,46 @@ stale-paper guard lives. On the Submit button alone it left the
 unanswered-questions confirmation -- raised before the paper went stale, still on
 screen after -- offering a second door straight past it.
 
+**An upload never drops a question silently, and never guesses an answer.**
+`ingestion.read_blocks` keeps every question it finds; one whose answer the file
+doesn't give gets a blank `correct_label`, a note, and a publish that refuses
+until the teacher fills it in. Anything that isn't part of a question is either
+case material or named in a note. `parse_report` is the old strict reading
+(drop what has no key, say so) and survives for its tests; the screens use
+`read_blocks`. The file that taught this was a Moodle quiz pasted into Word:
+unnumbered questions, the answer ticked with U+F00C, and the balance sheet in
+three tables that `Document.paragraphs` never sees. It read as "Questions
+ready: 0" with nothing skipped.
+
+**The AI reads the answer key; it never writes one.** A model that solves a
+question will sometimes solve it wrong -- Quiz 4's "total debt to equity" is
+0.55 on interest-bearing debt and 1.07 on total liabilities -- and a wrong key
+marks every student wrong. `ai_reader.normalise` keeps an answer only if the
+model's quoted evidence is found in the file, and the `.docx` tables
+`ingestion` read are kept over the model's retyping of them. Gemini overloads
+(503) and retires models (404) routinely: retries, a fallback model and a hard
+`TOTAL_SECONDS` cap are the design, not an afterthought.
+
+**Case material is part of the paper.** Teachers and students see it labelled
+**Description/Context** (`teacher_portal.CONTEXT_LABEL`); the code and the column
+keep the name case material. `quizzes.case_material` is shown above
+every question (a widget label can't hold a table) and locks with the questions
+once a real student starts -- enforced in `repository.save_case_material`, not
+the editor. It is read live rather than frozen into attempts, which is only safe
+*because* it locks. The column was added after the table existed: code must keep
+working without it (insert it only when non-empty, and say what SQL to run when
+a write needs it). Render it through `ui.markdown_source`, which escapes `$` --
+Streamlit reads `$...$` as LaTeX, and a balance sheet has two per row.
+
+The upload review table is the widget-key rule once more. `st.data_editor`
+stores edits *relative to the rows it was first drawn with*, so those rows are
+pinned in `upload-base` whenever the editor starts afresh (a new reading bumps
+`upload-epoch`; Streamlit culls it when the teacher switches section) and the
+pin is the teacher's latest edits -- or every edit is lost, or applied twice.
+Its **Add?** column leaves a row out of the quiz; `_questions_from_table` skips
+unticked rows and stamps each question with its table `row`, so validation
+messages name the row on screen rather than the question's position.
+
 **Writes are not retried.** `db.py` retries only requests whose connection never
 opened. Prefer idempotent writes (upsert, add-missing/drop-leftover) over
 delete-then-insert, which also races and briefly leaves rows missing. Prefer one
@@ -242,8 +291,8 @@ for good. It is one upsert now -- and there is no unique index on
 ## Conventions
 
 - **Line endings are per-file and mixed.** `repository.py`, `grading.py`,
-  `guide.py`, `db.py`, `server_state.py`, `attempt_sync.py` and most tests are
-  LF; `teacher_portal.py`, `student_portal.py`, `ui.py`, `app.py`,
+  `guide.py`, `db.py`, `server_state.py`, `attempt_sync.py`, `ai_reader.py` and
+  most tests are LF; `teacher_portal.py`, `student_portal.py`, `ui.py`, `app.py`,
   `admin_portal.py`, `ingestion.py`, `test_editor_state.py` are CRLF. Scripted
   edits on Windows silently convert LF files to CRLF and turn the diff into the
   whole file. Open with `newline=""` and check `git diff --stat` afterwards.
@@ -265,7 +314,7 @@ Observed Behavior   what did
 Impact              who is hurt and how
 ```
 
-Numbers are global across reports and currently run to MCQ-BUG-029; check the
+Numbers are global across reports and currently run to MCQ-BUG-031; check the
 last commit for where the sequence has got to. A finding is not a bug until it has been **reproduced**. Read-only code review
 produces plausible-looking claims that turn out to be guarded three lines up;
 confirm against the running app at :8512 or against the database before fixing,

@@ -14,7 +14,8 @@ from repository import (all_teachers, attempt_with_quiz, attempts_for_student, a
                         open_attempt, questions_for_quiz, quiz_average_score, quiz_paper_fingerprint,
                         refresh_attempt_key, resync_attempt, save_attempt_answers, search_teachers,
                         submitted_attempt, teachers_for_student)
-from ui import empty_state, metric_row, page_header, percent, pill, require_session, sign_out, text
+from ui import (empty_state, markdown_source, metric_row, page_header, percent, pill, require_session,
+                sign_out, text)
 
 
 SELECT_ALL_TYPE = attempt_sync.SELECT_ALL_TYPE
@@ -479,6 +480,12 @@ def take_attempt(user, attempt_id: int) -> None:
             _announce(attempt_id, attempt_sync.describe(summary) if summary
                       else "This assessment is already up to date.")
             st.rerun(scope="fragment")
+    if attempt.get("case_material"):
+        # Each question is drawn as the label of its answer widget, and a label
+        # cannot hold a table -- so the balance sheet "the data above" refers to
+        # sits above every question, the way it would on a printed paper.
+        with st.expander("Description/Context", expanded=True):
+            st.markdown(markdown_source(attempt["case_material"]))
     for index, question in enumerate(questions):
         widget_key = f"q-{attempt_id}-{paper}-{paint}-{index}"
         labels = [f"{label}) {option_text}" for label, option_text in question["options"]]

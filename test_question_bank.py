@@ -199,6 +199,28 @@ for first, second in (("Paris", "Paris."), ("New York", "New  York"), ("yes", "(
     check(f"{first!r} and {second!r} are refused", bool(duplicate_check(first, second)), True)
 check("genuinely different options are still accepted", duplicate_check("cat", "dog"), [])
 
+
+print()
+print("== Add? leaves a question out, and errors name the row the teacher sees ==")
+reviewed = pd.DataFrame([
+    {"Add?": False, "Question": "A question from the file we don't want", "Type": "Multiple choice",
+     "Options": "A) x | B) y", "Correct": ""},
+    {"Add?": True, "Question": "Kept, but the file gave no answer", "Type": "Multiple choice",
+     "Options": "A) x | B) y", "Correct": ""},
+    {"Add?": None, "Question": "A row the teacher added", "Type": "Multiple choice",
+     "Options": "A) x | B) y", "Correct": "B"},
+])
+built = TP._questions_from_table(reviewed)
+check("an unticked row is left out", [q["question_text"] for q in built],
+      ["Kept, but the file gave no answer", "A row the teacher added"])
+check("a row with no box counts as ticked", built[1]["correct_label"], "B")
+check("the blank answer is reported against its own row, not its position",
+      TP._question_errors(built), ["Question 2 has no correct answer yet."])
+check("unticking the unanswered one too clears the way to publish",
+      TP._question_errors(TP._questions_from_table(reviewed.assign(**{"Add?": [False, False, True]}))), [])
+check("the edited table reads Add? back as a real bool",
+      [row["Add?"] for row in TP._records(reviewed)], [False, True, True])
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S): {FAILURES}")

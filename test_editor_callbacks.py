@@ -190,6 +190,73 @@ else:
 
 
 print()
+print("== a file reading reaches a case-material box the teacher already typed in ==")
+# The widget-key rule again: once the teacher has typed in the box, its key
+# outranks the `value=` it is redrawn with, so a reading that put the file's
+# tables in the store left the old text on screen -- and the next keystroke
+# wrote it back. Renaming the box is what makes the reading show.
+CASE = """
+import streamlit as st
+import teacher_portal as TP
+
+store = st.session_state.setdefault("store", {})
+TP._case_material_field(store, "case", lambda name: f"{name}-w", lambda: None)
+if st.button("read a file", key="read"):
+    TP._set_case_material(store, "case", "| Net sales | $4,885,340 |")
+    st.rerun()
+st.text(f"stored={store.get('case', '')!r}")
+"""
+at = AppTest.from_string(CASE, default_timeout=60).run()
+# A short preview once asked Streamlit for `height=None`, which it refuses --
+# so any case material under fifteen lines took the whole page down.
+check("the box and a short preview draw", not at.exception)
+at.text_area[0].input("typed by hand").run()
+check("typing reaches the store", "stored='typed by hand'" in at.text[0].value)
+at.button(key="read").click().run()
+check("the reading replaces it in the store", "Net sales" in at.text[0].value)
+check("and on screen", at.text_area[0].value == "| Net sales | $4,885,340 |")
+check("no exception on the way", not at.exception)
+# Clear is the same rule from the other side: emptying the store alone would
+# leave the box showing the old text, and the next keystroke would restore it.
+at.button(key="case-clear-w").click().run()
+check("Clear empties the store", "stored=''" in at.text[0].value)
+check("and the box on screen", at.text_area[0].value == "")
+check("and leaves it open to paste into", at.expander[0].proto.expanded)
+
+
+print()
+print("== the review table never applies an edit twice ==")
+# The editor keeps edits relative to the rows it was first drawn from. When its
+# state is culled -- the teacher went to Quiz settings and back -- it must start
+# again from the *edited* rows, or every edit is lost; and while its state lives
+# those rows must not move, or every edit is applied a second time.
+REVIEW = """
+import streamlit as st
+import teacher_portal as TP
+
+store = st.session_state.setdefault("store", {
+    "upload-rows": [{"Add?": True, "Question": "One?", "Type": "Multiple choice", "Options": "A) x | B) y",
+                     "Correct": "", "Answer from": ""}],
+    "upload-epoch": 1, "upload-notes": [], "upload-name": "bank.docx",
+})
+if st.checkbox("show the table", value=True):
+    TP._upload_review(store, lambda name: f"{name}-w", lambda: None, None)
+if st.button("the teacher fills in an answer"):
+    store["upload-rows"] = [dict(store["upload-rows"][0], Correct="A")]
+st.text(f"base={store.get('upload-base')!r}")
+"""
+at = AppTest.from_string(REVIEW, default_timeout=60).run()
+check("the table draws", not at.exception)
+check("a blank answer is called out", any("No correct answer yet for question 1" in w.value for w in at.warning))
+at.button[0].click().run()
+check("while the table lives, its starting rows hold still", "'Correct': ''" in at.text[0].value)
+at.checkbox[0].uncheck().run()
+at.checkbox[0].check().run()
+check("after it is culled, it starts again from the edited rows", "'Correct': 'A'" in at.text[0].value)
+check("and nothing raised", not at.exception)
+
+
+print()
 failed = [name for name, ok in results if not ok]
 print(f"{len(results) - len(failed)} passed, {len(failed)} failed.")
 if failed:

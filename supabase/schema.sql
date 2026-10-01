@@ -37,6 +37,7 @@ create table if not exists public.quizzes (
   randomize_questions integer not null default 1,
   randomize_answers  integer not null default 1,
   status             text not null default 'active',
+  case_material      text not null default '',
   created_at         timestamptz not null
 );
 
@@ -125,6 +126,11 @@ grant all on all functions in schema public to anon, authenticated, service_role
 alter table public.users drop constraint if exists users_role_check;
 alter table public.users add constraint users_role_check
   check (role in ('teacher', 'student', 'unassigned'));
+
+-- Case material: the passage, case or data tables shown above a quiz's
+-- questions. Added after the table existed, so it needs its own idempotent
+-- statement; `create table if not exists` never adds a column.
+alter table public.quizzes add column if not exists case_material text not null default '';
 
 -- Re-align identity sequences after a backfill that inserted explicit ids
 -- (identity columns don't auto-advance on explicit inserts). Idempotent.

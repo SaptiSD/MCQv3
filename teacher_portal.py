@@ -11,17 +11,20 @@ from datetime import datetime, time, timedelta, timezone
 import pandas as pd
 import streamlit as st
 from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from fpdf import FPDF
 
+import ai_reader
 import grading
+import ingestion
 import server_state
-from ingestion import extract_upload, parse_report
-from ui import (empty_state, flash, metric_row, page_header, percent, pill, require_session,
+from ui import (empty_state, flash, markdown_source, metric_row, page_header, percent, pill, require_session,
                 show_flash, text, when)
 from repository import (add_student_to_roster, assigned_student_ids, create_quiz,
                         delete_quiz, move_question, questions_for_quiz, quiz_attempt_counts,
                         quiz_counts_for_teacher, quiz_for_teacher, quizzes_for_teacher,
-                        quiz_has_attempts, regrade_quiz, save_question_bank, set_quiz_assignments, students,
+                        quiz_has_attempts, regrade_quiz, save_case_material, save_question_bank,
+                        set_quiz_assignments, students,
                         student_analytics, student_detail_analytics, student_progress_for_quiz,
                         set_team_members, student_ids_for_teams, team_student_ids, teams_for_student, teams_for_teacher,
                         teacher_analytics, update_quiz_settings)
@@ -39,7 +42,10 @@ def _question_errors(questions: list[dict]) -> list[str]:
         # Saving nothing used to be treated as valid, which emptied the quiz.
         return ["A quiz needs at least one question."]
     errors = []
-    for index, question in enumerate(questions, 1):
+    for position, question in enumerate(questions, 1):
+        # A reviewed upload names the table row, which is what the teacher sees
+        # when some rows above it have been left out.
+        index = question.get("row", position)
         question_type = question.get("question_type")
         if not question["question_text"]:
             errors.append(f"Question {index} needs text.")
@@ -62,6 +68,11 @@ def _question_errors(questions: list[dict]) -> list[str]:
         labels = question["correct_label"] if question_type == SELECT_ALL_TYPE else [question["correct_label"]]
         if question_type == SELECT_ALL_TYPE and not labels:
             errors.append(f"Question {index} needs at least one correct answer.")
+        elif not any(labels):
+            # A single-answer question only arrives blank from an upload: a file
+            # that doesn't say which answer is right is read with the answer
+            # left empty for the teacher, rather than guessed at or dropped.
+            errors.append(f"Question {index} has no correct answer yet.")
         elif not set(labels).issubset({label for label, _ in question["options"]}):
             errors.append(f"Question {index} needs its selected correct option filled in.")
     return errors
@@ -354,6 +365,16 @@ def _create_save_setting(name: str) -> None:
     _mirror_draft(st.session_state["new_quiz_data"])
 
 
+def _create_changed() -> None:
+    """Mark the new-quiz draft dirty and mirror it, for writes no widget made.
+
+    Everything typed reaches the mirror through an `on_change` hook; a file
+    reading, or an edit to the review table, has to ask for itself.
+    """
+    st.session_state["create_dirty"] = True
+    _mirror_draft(st.session_state.setdefault("new_quiz_data", {}))
+
+
 def _forget_question(form: dict, index: int) -> None:
     """Drop every field belonging to question `index` from the draft.
 
@@ -417,6 +438,7 @@ def _create_questions_section(form: dict) -> None:
     """
     with st.container(border=True):
         st.subheader("Questions")
+        _case_material_field(form, "new-case-material", _ck, _create_changed)
         question_modes = ["Create manually", "Upload question bank"]
         stored_mode = form.get("new-quiz-mode", question_modes[0])
         # Without an explicit index a recovered draft always came back on
@@ -426,31 +448,7 @@ def _create_questions_section(form: dict) -> None:
                                  index=question_modes.index(stored_mode) if stored_mode in question_modes else 0,
                                  key=_ck("new-quiz-mode"), on_change=_create_save_setting, args=("new-quiz-mode",))
         if question_mode == "Upload question bank":
-            upload = st.file_uploader("Question bank (.txt or .docx)", type=["txt", "docx"], key=_ck("new-quiz-upload"))
-            if upload and st.button("Read question bank", key="new-quiz-parse"):
-                try:
-                    questions, skipped = parse_report(extract_upload(upload))
-                    form["new-uploaded-questions"] = questions
-                    form["new-skipped-questions"] = skipped
-                except Exception as exc:
-                    form["new-uploaded-questions"] = []
-                    form["new-skipped-questions"] = []
-                    st.error(f"Could not read this question bank: {exc}")
-                st.session_state["create_dirty"] = True
-                # Everything else reaches the mirror through an on_change
-                # hook; this is the one write that has to ask for itself.
-                _mirror_draft(form)
-            uploaded_questions = form.get("new-uploaded-questions", [])
-            if not isinstance(uploaded_questions, list):
-                uploaded_questions = []
-            st.write(f"Questions ready: **{len(uploaded_questions)}**")
-            skipped = form.get("new-skipped-questions") or []
-            if skipped:
-                with st.expander(f"{len(skipped)} question{'s were' if len(skipped) != 1 else ' was'} skipped"):
-                    for note in skipped:
-                        st.write(f"- {note}")
-            if upload and not uploaded_questions:
-                st.warning("No valid questions found. Include numbered questions, options, and an Answer Key before publishing.")
+            _upload_panel(form, _ck, _create_changed, "new-case-material")
         else:
             count_key = "new-manual-count"
             if count_key not in form:
@@ -623,9 +621,10 @@ def create(user) -> None:
     title = form.get("new-title", "").strip()
     question_mode = form.get("new-quiz-mode", "Create manually")
     if question_mode == "Upload question bank":
-        questions = form.get("new-uploaded-questions", [])
-        if not isinstance(questions, list):
-            questions = []
+        # What the teacher reviewed, not what the file said: the review table is
+        # where a blank answer gets filled in and a misread one gets fixed.
+        rows = form.get("upload-rows") or []
+        questions = _questions_from_table(pd.DataFrame(rows, columns=REVIEW_COLUMNS)) if rows else []
     else:
         questions = []
         for index in range(int(form.get("new-manual-count", 1))):
@@ -684,7 +683,7 @@ def create(user) -> None:
     st.session_state["publish_in_flight"] = datetime.now(timezone.utc).timestamp()
     quiz_id = None
     try:
-        quiz_id = create_quiz(user["id"], title, form.get("new-duration", 30), form.get("new-passing", 70), form.get("new-retakes", False), form.get("new-average", False), opening.isoformat(), closing.isoformat(), list(assigned_students), opening_enabled, closing_enabled, form.get("new-randomize-questions", True), form.get("new-randomize-answers", True))
+        quiz_id = create_quiz(user["id"], title, form.get("new-duration", 30), form.get("new-passing", 70), form.get("new-retakes", False), form.get("new-average", False), opening.isoformat(), closing.isoformat(), list(assigned_students), opening_enabled, closing_enabled, form.get("new-randomize-questions", True), form.get("new-randomize-answers", True), form.get("new-case-material", ""))
         # Record the id the moment the row exists. Held back until the end, a run
         # that died in between left the claim holding `None`, which expires after
         # two minutes -- and the next click then published the whole quiz again.
@@ -780,8 +779,104 @@ def _question_bank_csv(questions) -> bytes:
     return frame.to_csv(index=False).encode("utf-8")
 
 
+_TABLE_RULE = re.compile(r"^:?-{3,}:?$")
+
+
+def _table_cells(line: str) -> list[str]:
+    inner = line.strip()
+    inner = inner[1:] if inner.startswith("|") else inner
+    inner = inner[:-1] if inner.endswith("|") and not inner.endswith("\\|") else inner
+    return [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", inner)]
+
+
+def _markdown_blocks(source: str) -> list[tuple[str, object]]:
+    """Case material as ("text", paragraph) and ("table", (rows, right_aligned)) blocks.
+
+    Only as much Markdown as case material uses: paragraphs and pipe tables. The
+    exports print the tables as tables; a PDF of a balance sheet as a column of
+    "| Cash | $634,527 |" lines is not something anyone could hand out.
+    """
+    blocks: list[tuple[str, object]] = []
+    paragraph: list[str] = []
+    table: list[list[str]] = []
+
+    def finish_paragraph() -> None:
+        if paragraph:
+            blocks.append(("text", " ".join(paragraph)))
+            paragraph.clear()
+
+    def finish_table() -> None:
+        if not table:
+            return
+        # An all-blank row is a spacer between sections of a statement, not the rule.
+        rules = [row for row in table if any(row) and all(_TABLE_RULE.match(cell) for cell in row if cell)]
+        rows = [row for row in table if row not in rules]
+        width = max((len(row) for row in rows), default=0)
+        right = [bool(rules) and index < len(rules[0]) and rules[0][index].endswith(":") for index in range(width)]
+        if rows:
+            blocks.append(("table", ([row + [""] * (width - len(row)) for row in rows], right)))
+        table.clear()
+
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            finish_paragraph()
+            table.append(_table_cells(stripped))
+            continue
+        finish_table()
+        if stripped:
+            paragraph.append(stripped)
+        else:
+            finish_paragraph()
+    finish_paragraph()
+    finish_table()
+    return blocks
+
+
+def _docx_case_material(document, case_material: str) -> None:
+    document.add_heading(CONTEXT_LABEL, level=1)
+    for kind, content in _markdown_blocks(case_material):
+        if kind == "text":
+            document.add_paragraph(content)
+            continue
+        rows, right = content
+        grid = document.add_table(rows=len(rows), cols=len(rows[0]))
+        grid.style = "Table Grid"
+        for row_index, row in enumerate(rows):
+            for column, value in enumerate(row):
+                cell = grid.cell(row_index, column)
+                cell.text = value
+                if right[column]:
+                    cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        document.add_paragraph()
+
+
+def _pdf_case_material(pdf, case_material: str) -> None:
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.multi_cell(0, 7, CONTEXT_LABEL, new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
+    for kind, content in _markdown_blocks(case_material):
+        if kind == "text":
+            pdf.set_font("Helvetica", "", 11)
+            pdf.multi_cell(0, 5.5, _pdf_text(content), new_x="LMARGIN", new_y="NEXT")
+        else:
+            rows, right = content
+            widths = [max(6, max(len(row[column]) for row in rows)) for column in range(len(rows[0]))]
+            pdf.set_font("Helvetica", "", 9)
+            with pdf.table(col_widths=widths, line_height=5, first_row_as_headings=False,
+                           text_align=tuple("RIGHT" if flag else "LEFT" for flag in right)) as grid:
+                for row in rows:
+                    cells = grid.row()
+                    for value in row:
+                        cells.cell(_pdf_text(value))
+        pdf.ln(3)
+    pdf.ln(2)
+
+
 def _render_quiz_docx(quiz, questions) -> bytes:
     document = Document(); document.add_heading(quiz["title"], 0)
+    if (quiz.get("case_material") or "").strip():
+        _docx_case_material(document, quiz["case_material"])
     for index, q in enumerate(questions, 1):
         document.add_paragraph(f"{index}. {q['question_text']}")
         for label, option_text in json.loads(q["options_json"]): document.add_paragraph(f"{label}) {option_text}", style="List Bullet")
@@ -974,6 +1069,9 @@ def _render_quiz_pdf(quiz, questions, format_key: str) -> bytes:
         pdf.set_text_color(0, 0, 0)
         pdf.ln(3)
 
+    if (quiz.get("case_material") or "").strip():
+        _pdf_case_material(pdf, quiz["case_material"])
+
     for index, question in enumerate(questions, 1):
         if pdf.get_y() > 250:
             pdf.add_page()
@@ -1031,64 +1129,45 @@ def question_bank(quiz) -> None:
     if locked:
         # An upload replaces the whole paper, so there is nothing it could do here
         # that the lock would allow.
+        _quiz_case_material(quiz, locked=True)
         manual_question_editor(quiz, locked=True)
         return
     mode = st.radio("How would you like to add questions?", ["Create manually", "Upload question bank"], horizontal=True, key=f"question-mode-{quiz['id']}")
     if mode == "Create manually":
+        _quiz_case_material(quiz)
         manual_question_editor(quiz)
         return
-    upload = st.file_uploader("Upload question bank (.txt or .docx)", type=["txt", "docx"], key=f"upload-{quiz['id']}")
-    if upload and st.button("Parse question bank", type="primary", key=f"parse-{quiz['id']}"):
-        try:
-            parsed, skipped = parse_report(extract_upload(upload))
-            st.session_state[f"draft-{quiz['id']}"] = parsed
-            st.session_state[f"draft-skipped-{quiz['id']}"] = skipped
-        except Exception as exc:
-            st.session_state[f"draft-{quiz['id']}"] = []
-            st.session_state[f"draft-skipped-{quiz['id']}"] = []
-            st.error(f"Could not read this question bank: {exc}")
-    draft = st.session_state.get(f"draft-{quiz['id']}")
-    if draft is not None:
-        if not draft:
-            st.warning("No valid questions found. Include numbered questions, options, and an Answer Key before publishing.")
-            return
-        skipped = st.session_state.get(f"draft-skipped-{quiz['id']}") or []
-        if skipped:
-            with st.expander(f"{len(skipped)} question{'s were' if len(skipped) != 1 else ' was'} skipped"):
-                for note in skipped:
-                    st.write(f"- {note}")
-        st.write("Review extracted questions before publishing")
-        table = pd.DataFrame([
-            {
-                "Question": q["question_text"],
-                "Type": q.get("question_type", "Multiple choice"),
-                "Options": " | ".join(f"{a}) {b}" for a, b in q["options"]),
-                "Correct": q["correct_label"],
-            }
-            for q in draft
-        ])
-        edited = st.data_editor(
-            table, num_rows="dynamic", width="stretch", key=f"editor-{quiz['id']}",
-            column_config={
-                "Type": st.column_config.SelectboxColumn("Type", options=QUESTION_TYPES, required=True),
-                "Options": st.column_config.TextColumn("Options", help="A) first | B) second — leave blank for typed answers"),
-                "Correct": st.column_config.TextColumn("Correct", help="A letter for choice questions, or the answer itself for typed ones"),
-            },
-        )
-        st.caption("Set the Type column to change how a question is answered and marked. Typed questions grade the Correct column as text unless it reads as a number.")
+    store = st.session_state.setdefault(_upload_store_key(quiz["id"]), {})
+    store.setdefault("case", quiz.get("case_material") or "")
+    epoch = editor_epoch(quiz["id"])
+
+    def _wkey(name: str) -> str:
+        # The editor epoch as well as the quiz: every reset renames the review,
+        # so a reading started after a save can never inherit the last one's edits.
+        return f"{name}-{quiz['id']}-{epoch}"
+
+    def _unchanged() -> None:
+        pass
+
+    _case_material_field(store, "case", _wkey, _unchanged)
+    _upload_panel(store, _wkey, _unchanged, "case")
+    rows = store.get("upload-rows")
+    if rows:
         if st.button("Save question bank and publish", type="primary", key=f"save-{quiz['id']}"):
-            questions = _questions_from_table(edited)
+            questions = _questions_from_table(pd.DataFrame(rows, columns=REVIEW_COLUMNS))
             errors = _question_errors(questions)
             if errors:
                 st.error(" ".join(errors))
             else:
                 try:
+                    # Case material first: it is the write that can be refused
+                    # for want of a database column, and refusing before the
+                    # questions change leaves nothing half-saved.
+                    save_case_material(quiz["id"], store.get("case", ""))
                     save_question_bank(quiz["id"], questions)
                 except ValueError as exc:
                     st.error(str(exc))
                 else:
-                    st.session_state.pop(f"draft-{quiz['id']}", None)
-                    st.session_state.pop(f"draft-skipped-{quiz['id']}", None)
                     reset_editor_state(quiz["id"])
                     st.session_state[f"saved-questions-{quiz['id']}"] = "paper"
                     # A full rerun, not a fragment one: the quiz card above the
@@ -1144,12 +1223,22 @@ def _options_from_cell(cell: str) -> list[tuple[str, str]]:
     return labelled
 
 
+def _included(value) -> bool:
+    """Whether a review row's Add? box is ticked. A row with no box -- added by
+    the teacher, or from a table that predates the column -- counts as ticked."""
+    return value is None or bool(pd.isna(value)) or bool(value)
+
+
 def _questions_from_table(frame) -> list[dict]:
-    """Turn the reviewed upload table back into saveable questions, type intact."""
+    """Turn the reviewed upload table back into saveable questions, type intact.
+
+    Each question remembers its `row` in the table, so a validation message
+    names the row the teacher can see even when unticked rows sit above it.
+    """
     questions = []
-    for _, row in frame.iterrows():
+    for row_number, (_, row) in enumerate(frame.iterrows(), 1):
         text = str(row.get("Question", "") or "").strip()
-        if not text:
+        if not text or not _included(row.get("Add?")):
             continue
         question_type = str(row.get("Type") or "Multiple choice").strip()
         if question_type not in QUESTION_TYPES:
@@ -1160,7 +1249,7 @@ def _questions_from_table(frame) -> list[dict]:
             questions.append({
                 "question_text": text, "options": [],
                 "correct_label": grading.build_spec(correct_raw, answer_format),
-                "question_type": question_type,
+                "question_type": question_type, "row": row_number,
             })
             continue
         if question_type == "True / False":
@@ -1173,9 +1262,284 @@ def _questions_from_table(frame) -> list[dict]:
             correct = correct_raw.upper()[:1]
         questions.append({
             "question_text": text, "options": options,
-            "correct_label": correct, "question_type": question_type,
+            "correct_label": correct, "question_type": question_type, "row": row_number,
         })
     return questions
+
+
+# What teachers call a quiz's case material -- the passage, case or data its
+# questions refer to. Stored as `quizzes.case_material`.
+CONTEXT_LABEL = "Description/Context"
+
+REVIEW_COLUMNS = ["Add?", "Question", "Type", "Options", "Correct", "Answer from"]
+
+CASE_MATERIAL_HELP = (
+    "A passage, case or data tables the questions refer to. Students see it above the questions. "
+    "Tables are Markdown, one row per line: | Item | Year 7 | Year 6 |"
+)
+
+
+def _upload_store_key(quiz_id: int) -> str:
+    return f"upload-store-{quiz_id}"
+
+
+def _ai_settings() -> dict | None:
+    """The Gemini key and models from secrets.toml, or None when AI reading isn't set up."""
+    try:
+        section = st.secrets.get("gemini") or {}
+        api_key = str(section.get("api_key") or "").strip()
+        models = section.get("models") or ai_reader.DEFAULT_MODELS
+    except Exception:
+        # No secrets file at all is a perfectly good way to run without AI.
+        return None
+    if not api_key:
+        return None
+    return {"api_key": api_key, "models": tuple([models] if isinstance(models, str) else models)}
+
+
+def _review_rows(reading: dict) -> list[dict]:
+    """A reading as the rows of the table the teacher checks before anything is saved."""
+    rows = []
+    for question in reading["questions"]:
+        correct = question.get("correct_label") or ""
+        if isinstance(correct, (list, tuple)):
+            correct = ", ".join(correct)
+        rows.append({
+            "Add?": True,
+            "Question": question["question_text"],
+            "Type": question.get("question_type") or "Multiple choice",
+            "Options": " | ".join(f"{label}) {option}" for label, option in question["options"]),
+            "Correct": str(correct),
+            "Answer from": question.get("key_source") or "",
+        })
+    return rows
+
+
+def _records(frame) -> list[dict]:
+    """The edited review table as plain rows: Add? a real bool, empty text cells
+    "" rather than None or NaN."""
+    return [{"Add?": _included(row.get("Add?")),
+             **{column: "" if pd.isna(row.get(column)) else str(row.get(column))
+                for column in REVIEW_COLUMNS if column != "Add?"}}
+            for row in frame.to_dict("records")]
+
+
+def _set_case_material(store: dict, name: str, value: str) -> None:
+    """Put `value` in a case-material box, renaming the box so it actually shows."""
+    store[name] = value
+    store[f"{name}-epoch"] = int(store.get(f"{name}-epoch", 0)) + 1
+
+
+def _store_case_material(store: dict, name: str, widget_key: str, changed) -> None:
+    if _vanished(widget_key):
+        return
+    store[name] = st.session_state[widget_key]
+    changed()
+
+
+def _case_material_preview(value: str) -> None:
+    if value.strip():
+        # A rule between the box being typed in and the preview of it, or the
+        # two read as one block.
+        st.divider()
+        st.caption("What students will see:")
+        # A full balance sheet is a long way to scroll past to reach the
+        # questions, so the preview scrolls on its own once it gets that long.
+        with st.container(border=True, height=380 if len(value.splitlines()) > 14 else "content"):
+            st.markdown(markdown_source(value))
+
+
+def _clear_case_material(store: dict, name: str, changed) -> None:
+    """Empty a case-material box. A callback, so the box is renamed before it draws."""
+    _set_case_material(store, name, "")
+    # Clearing collapses the box by changing its label; keep it open for whatever
+    # the teacher is about to paste in its place.
+    store[f"{name}-open"] = True
+    changed()
+
+
+def _case_material_field(store: dict, name: str, wkey, changed, footer=None) -> None:
+    """The case-material box, editing `store[name]`; `footer()` draws inside it, last."""
+    value = str(store.get(name) or "")
+    widget_key = wkey(f"{name}-{int(store.get(f'{name}-epoch', 0))}")
+    opened = bool(value.strip()) or bool(store.pop(f"{name}-open", False))
+    with st.expander(CONTEXT_LABEL if value.strip() else f"{CONTEXT_LABEL} (optional)", expanded=opened):
+        help_column, clear_column = st.columns([6, 1], vertical_alignment="center")
+        help_column.caption(CASE_MATERIAL_HELP)
+        # Not disabled when empty: a box that has just been typed in commits on
+        # blur, so a Clear disabled until then swallowed the click that blurred it.
+        clear_column.button("Clear", key=wkey(f"{name}-clear"), width="stretch",
+                            on_click=_clear_case_material, args=(store, name, changed))
+        st.text_area(CONTEXT_LABEL, value=value, height=220, key=widget_key, label_visibility="collapsed",
+                     on_change=_store_case_material, args=(store, name, widget_key, changed))
+        _case_material_preview(value)
+        if footer:
+            footer()
+
+
+def _case_store_key(quiz_id: int) -> str:
+    return f"case-edit-{quiz_id}"
+
+
+def _quiz_case_material(quiz, locked: bool = False) -> None:
+    """A saved quiz's case material, editable until a real student starts it.
+
+    The same box as a new quiz's, working on a copy held in the session and
+    written to the database only by Save -- so Clear empties the box without
+    deleting anything until the teacher means it.
+    """
+    current = (quiz.get("case_material") or "").strip()
+    if locked:
+        if current:
+            with st.expander(CONTEXT_LABEL):
+                st.caption("Fixed along with the questions, because a student has started this assessment.")
+                st.markdown(markdown_source(current))
+        return
+    store = st.session_state.setdefault(_case_store_key(quiz["id"]), {"case": current})
+    epoch = editor_epoch(quiz["id"])
+
+    def _wkey(name: str) -> str:
+        return f"{name}-saved-{quiz['id']}-{epoch}"
+
+    def _unchanged() -> None:
+        pass
+
+    def _save() -> None:
+        if st.session_state.pop(f"saved-case-{quiz['id']}", False):
+            st.success(f"{CONTEXT_LABEL} saved.")
+        if st.button(f"Save {CONTEXT_LABEL}", key=f"save-case-{quiz['id']}", width="stretch"):
+            try:
+                save_case_material(quiz["id"], store.get("case", ""))
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                # Both copies now describe a quiz that has moved on: this box's,
+                # and a file reading under review, which took its own when it
+                # began -- saving that one later would put the old text back.
+                st.session_state.pop(_case_store_key(quiz["id"]), None)
+                st.session_state.pop(_upload_store_key(quiz["id"]), None)
+                st.session_state[f"saved-case-{quiz['id']}"] = True
+                st.rerun(scope="fragment")
+
+    _case_material_field(store, "case", _wkey, _unchanged, footer=_save)
+
+
+def _upload_panel(store: dict, wkey, changed, case_name: str) -> None:
+    """Upload a file, read it, and review what was read -- Create quiz and Manage alike.
+
+    `store` keeps the reading and the teacher's edits to it: the Create draft,
+    so they survive a refresh, or a per-quiz dict in session state. `wkey` names
+    each widget and `changed()` hears about every write to `store`. Nothing here
+    saves; both pages publish from `store["upload-rows"]`, the reviewed table.
+    """
+    upload = st.file_uploader("Question bank (.txt or .docx)", type=["txt", "docx"], key=wkey("upload-file"))
+    ai = _ai_settings()
+    if upload:
+        read_column, ai_column = st.columns(2)
+        if read_column.button("Read question bank", key=wkey("upload-read"), width="stretch"):
+            _read_upload(store, upload, case_name)
+            changed()
+            st.rerun(scope="fragment")
+        if ai and ai_column.button("Read with AI", key=wkey("upload-read-ai"), width="stretch"):
+            with st.spinner("Gemini is reading the file. This usually takes under a minute, "
+                            "and up to two and a half when Gemini is busy..."):
+                _read_upload(store, upload, case_name, ai)
+            changed()
+            st.rerun(scope="fragment")
+        if ai:
+            st.caption("**Read with AI** sends the file's text to Google Gemini, for files the ordinary reader "
+                       "can't follow. It copies the answers your file marks and never works them out. Either "
+                       "way, nothing is published until you've checked the table below.")
+    if store.get("upload-error"):
+        st.error(store["upload-error"])
+    if store.get("upload-rows") is not None:
+        _upload_review(store, wkey, changed, ai)
+
+
+def _read_upload(store: dict, upload, case_name: str, ai: dict | None = None) -> None:
+    """Read `upload` into `store`, replacing any earlier reading."""
+    store.pop("upload-error", None)
+    try:
+        blocks = ingestion.upload_blocks(upload)
+        reading = ingestion.read_blocks(blocks)
+        if ai:
+            reading = ai_reader.read_document(ingestion.document_markdown(blocks), ai["api_key"], ai["models"],
+                                              case_material=reading["case_material"])
+    except ai_reader.AIReadError as exc:
+        # Any earlier reading stays: a busy model is no reason to lose it.
+        store["upload-error"] = str(exc)
+        return
+    except Exception as exc:
+        store["upload-error"] = f"Could not read this file: {exc}"
+        return
+    rows = _review_rows(reading)
+    store["upload-rows"] = rows
+    store["upload-base"] = rows
+    store["upload-epoch"] = int(store.get("upload-epoch", 0)) + 1
+    store["upload-notes"] = list(reading["notes"])
+    store["upload-reader"] = "Gemini" if ai else "the file reader"
+    store["upload-unread"] = int(reading.get("unread") or 0)
+    store["upload-name"] = upload.name
+    if reading["case_material"]:
+        _set_case_material(store, case_name, reading["case_material"])
+
+
+def _upload_review(store: dict, wkey, changed, ai: dict | None) -> None:
+    """What was read, what to check, and the table to check it in."""
+    rows = store.get("upload-rows") or []
+    notes = list(store.get("upload-notes") or [])
+    st.write(f"**{len(rows)} question{'s' if len(rows) != 1 else ''}** read from "
+             f"{store.get('upload-name', 'the file')} by {store.get('upload-reader', 'the file reader')}.")
+    if not rows:
+        # Saying nothing is what this used to do: "Questions ready: 0" over a
+        # file that had plainly been read, and no word about why.
+        st.warning(notes.pop(0) if notes else "No questions were found in this file.")
+        if ai and store.get("upload-reader") != "Gemini" and store.get("upload-unread"):
+            st.info("Try **Read with AI**: it can follow layouts the ordinary reader can't.")
+    if notes:
+        with st.expander(f"{len(notes)} thing{'s' if len(notes) != 1 else ''} to check", expanded=True):
+            for note in notes:
+                st.write(f"- {note}")
+    if not rows:
+        return
+    editor_key = wkey(f"upload-review-{int(store.get('upload-epoch', 0))}")
+    # The editor's state is a list of edits *relative to the rows it was first
+    # drawn from*, so those rows must hold still underneath it. They are pinned
+    # whenever the editor starts afresh -- a new reading, or Streamlit culling
+    # its state when the teacher went to Quiz settings and back -- and pinned to
+    # the teacher's latest edits, so nothing typed is lost and nothing applied twice.
+    if editor_key not in st.session_state:
+        store["upload-base"] = rows
+    edited = st.data_editor(
+        pd.DataFrame(store.get("upload-base") or [], columns=REVIEW_COLUMNS),
+        # "add", not "dynamic": rows can still be added, but deleting one is what
+        # Add? is for, and the row-selector column deletion needed was an empty
+        # box beside it that teachers took for a second checkbox.
+        num_rows="add", hide_index=True, width="stretch", key=editor_key,
+        column_config={
+            "Add?": st.column_config.CheckboxColumn("Add?", default=True, width="small",
+                                                    help="Untick to leave this question out of the quiz."),
+            "Question": st.column_config.TextColumn("Question", width="large"),
+            "Type": st.column_config.SelectboxColumn("Type", options=QUESTION_TYPES, required=True, width="small"),
+            "Options": st.column_config.TextColumn("Options", width="medium", help="A) first | B) second — leave blank for typed answers"),
+            "Correct": st.column_config.TextColumn("Correct", width="small", help="A letter for choice questions (A, C for select-all), or the answer itself for typed ones"),
+            "Answer from": st.column_config.TextColumn("Answer from", disabled=True, width="small",
+                                                       help="Where the file showed the answer. Blank means it didn't: fill in Correct."),
+        },
+    )
+    records = _records(edited)
+    if records != rows:
+        store["upload-rows"] = records
+        changed()
+    wanted = [(number, row) for number, row in enumerate(records, 1) if row["Add?"] and row["Question"].strip()]
+    missing = [str(number) for number, row in wanted if not row["Correct"].strip()]
+    if missing:
+        st.warning(f"No correct answer yet for question{'s' if len(missing) != 1 else ''} {', '.join(missing)}: "
+                   "the file doesn't say. Fill in the Correct column, or untick Add?, before publishing.")
+    if len(wanted) != len([row for row in records if row["Question"].strip()]):
+        st.caption(f"{len(wanted)} of these will be added to the quiz.")
+    st.caption("Untick **Add?** to leave a question out. Set the Type column to change how a question is answered "
+               "and marked; typed questions grade the Correct column as text unless it reads as a number.")
 
 
 def _blank_question() -> dict:
@@ -1268,6 +1632,10 @@ def reset_editor_state(quiz_id: int) -> None:
     """
     st.session_state.pop(editor_state_key(quiz_id), None)
     st.session_state.pop(f"downloads-ready-{quiz_id}", None)
+    # A file reading under review belongs to the bank as it was; after a save or
+    # a reorder it describes a quiz that no longer exists.
+    st.session_state.pop(_upload_store_key(quiz_id), None)
+    st.session_state.pop(_case_store_key(quiz_id), None)
     st.session_state[f"editor-epoch-{quiz_id}"] = editor_epoch(quiz_id) + 1
 
 

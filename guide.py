@@ -111,16 +111,23 @@ TEACHER_GUIDE = [
     ]),
 
     ("Uploading a question bank", [
-        ("p", "Instead of typing questions one at a time you can upload a .txt or .docx file. Open a quiz, choose Manage, then Upload question bank."),
-        ("p", "Format the file with numbered questions, lettered options, and an answer key at the end:"),
+        ("p", "Instead of typing questions one at a time you can upload a .txt or .docx file - on Create quiz under Questions, or on an existing quiz under Manage. Choose Upload question bank, pick the file and press Read question bank."),
+        ("h3", "Layouts it understands"),
         ("ul", [
-            "1. What does CPU stand for?",
-            "A. Central Processing Unit",
-            "B. Computer Personal Utility",
-            "...",
-            "Answer Key: 1: A, 2: B, 3: A",
+            "Numbered questions with lettered options and an answer key at the end - Answer Key: 1: A, 2: B, 3: A.",
+            "Questions without numbers, the way a Moodle quiz looks when it is copied into Word - a line of text followed by options a. b. c. d. Lines such as Select one: are skipped.",
+            "An answer under each question - ANSWER: B, or The correct answer is: Paris.",
+            "The right option marked where it stands - a tick, highlight, bold, a different colour, (correct) or an asterisk. Marking only counts when it picks out some options and not the others, so a file with every option in bold is not read as all of them being right.",
         ]),
-        ("p", "After reading the file you get a table of everything it found. Check it, change any question's Type - including to a typed answer - and press Save question bank and publish. Questions without a matching answer key entry are left out."),
+        ("h3", "Checking what was read"),
+        ("p", "You get a table of every question found, and the Answer from column says where each answer came from. Where the file does not say which option is right, Correct is left blank for you to fill in - the question is never dropped and the answer is never guessed - and the quiz will not publish until every question has one. Anything in the file that was not part of a question is listed under things to check."),
+        ("p", "Change any question's Type - including to a typed answer - and fix anything that reads wrong, then publish."),
+        ("h3", "Description/Context"),
+        ("p", "Tables in a .docx, with the sentence introducing them, become the quiz's Description/Context: the passage, case or data the questions refer to. Students see it above the questions while they work, and it is printed at the top of the PDF and DOCX downloads. You can also type or paste it yourself under Description/Context; a table is written one row per line, like | Net sales | $4,885,340 |."),
+        ("note", "The Description/Context is part of the paper, so like the questions it is fixed once a real student starts."),
+        ("h3", "Read with AI"),
+        ("p", "If the ordinary reader cannot follow a file's layout, Read with AI sends the file's text to Google Gemini to read instead. It copies the answers your file marks and never works them out: an answer it cannot point to in the file is left blank for you. It can take a minute or two, and the result lands in the same table for you to check."),
+        ("note", "Read with AI only appears once a Gemini key has been set up. Do not use it on files that contain student names or other personal details."),
     ]),
 
     ("Assigning, scheduling and results", [
@@ -134,7 +141,7 @@ TEACHER_GUIDE = [
         ("p", "To change the questions themselves after students have started, delete the assessment and publish a new one."),
         ("h3", "Downloads"),
         ("ul", [
-            "Download PDF - the paper itself, optionally with the answer key and the quiz settings.",
+            "Download PDF - the paper itself with its Description/Context, optionally with the answer key and the quiz settings.",
             "Download results CSV - every assigned student with status, score and result.",
             "Download question bank CSV and Download printable DOCX - for editing or handing out on paper.",
         ]),
@@ -149,6 +156,7 @@ TEACHER_GUIDE = [
             "I need to fix a published question - if nobody has started it yet, open Manage, edit it and save. Once a student has started, only the answer key can change: correct it, then use Regrade submitted attempts for results already recorded. To change the question itself, delete the assessment and publish a new one.",
             "I unassigned a student who was halfway through - their unfinished attempt ends with the assignment, and nothing is recorded. Work they had already handed in is kept: unassigning someone never deletes a result.",
             "A student joined the wrong teacher - they can leave you from My teachers, and you can remove them from your roster.",
+            "An upload found no questions - the message under the file says what it did contain and why nothing was read as a question. Check each question is followed by lettered options, or try Read with AI.",
         ]),
     ]),
 ]

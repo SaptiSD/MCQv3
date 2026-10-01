@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from html import escape
 
@@ -25,6 +26,17 @@ def text(value) -> str:
     itself does not, or the markup would escape its own tags.
     """
     return escape("" if value is None else str(value))
+
+
+def markdown_source(value) -> str:
+    """Prepare teacher-written Markdown -- case material -- for `st.markdown`.
+
+    Never drawn with `unsafe_allow_html`, so tables and bold work and anything
+    shaped like HTML is shown as typed. The one thing left to escape is the
+    dollar sign: Streamlit reads `$...$` as inline LaTeX, and a balance-sheet
+    row has two amounts on it.
+    """
+    return re.sub(r"(?<!\\)\$", r"\\$", "" if value is None else str(value))
 
 
 def styles() -> None:
@@ -133,6 +145,13 @@ def styles() -> None:
     input, textarea { font-size:.94rem !important; }
     input::placeholder, textarea::placeholder { color:#93a29b !important; opacity:1 !important; }
     [data-baseweb='input'] > div:focus-within, [data-baseweb='textarea'] > div:focus-within, [data-baseweb='select'] > div:focus-within {
+      border-color:var(--green) !important; box-shadow:0 0 0 3px rgba(18,105,79,.15) !important; }
+    /* Streamlit 1.63 stopped drawing text areas through baseweb, so the rule above
+       no longer reaches them: the border now sits on stTextAreaRootElement and
+       defaults to the page colour, which left a white box on a white card with
+       no edge until it was clicked. */
+    [data-testid='stTextAreaRootElement'] { border:1px solid #c3d1ca !important; border-radius:9px !important; }
+    [data-testid='stTextAreaRootElement']:focus-within {
       border-color:var(--green) !important; box-shadow:0 0 0 3px rgba(18,105,79,.15) !important; }
     [data-testid='stNumberInput'] button { border-color:var(--line) !important; }
 
