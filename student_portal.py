@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import streamlit as st
 
 import attempt_sync
 import grading
-from repository import (all_teachers, attempt_with_quiz, attempts_for_student, available_quizzes,
+from repository import (all_teachers, attempt_is_open, attempt_with_quiz, attempts_for_student, available_quizzes,
                         complete_attempt, create_attempt, join_teacher, leave_teacher,
                         open_attempt, questions_for_quiz, quiz_average_score, quiz_paper_fingerprint,
                         refresh_attempt_key, resync_attempt, save_attempt_answers, search_teachers,
@@ -121,8 +122,20 @@ def _assessment_list(user, previewing: bool) -> None:
     # on polling, and carries on offering to start assessments.
     if not require_session(user):
         return
-    quizzes = available_quizzes(user["id"], user["id"] if previewing else None)
-    attempts = attempts_for_student(user["id"])
+    # While a paper is open the list above it waits. Nothing on it changes what
+    # the student does next, and re-reading it every 20 seconds was a third of
+    # what a class sitting a test cost the server. It is read afresh whenever
+    # the open paper changes -- so starting one still shows "In progress" -- and
+    # as soon as the paper closes.
+    open_paper = st.session_state.get("attempt_id")
+    held = st.session_state.get("dashboard-reading")
+    if open_paper and held and held[0] == (open_paper, previewing):
+        quizzes, attempts, averages = held[1]
+    else:
+        quizzes = available_quizzes(user["id"], user["id"] if previewing else None)
+        attempts = attempts_for_student(user["id"])
+        averages = {}
+        st.session_state["dashboard-reading"] = ((open_paper, previewing), (quizzes, attempts, averages))
     latest = {}
     for attempt in attempts:
         latest.setdefault(attempt["quiz_id"], attempt)
@@ -184,7 +197,9 @@ def _assessment_list(user, previewing: bool) -> None:
                 if submitted:
                     average = ""
                     if quiz["show_average"]:
-                        class_average = quiz_average_score(quiz["id"])
+                        if quiz["id"] not in averages:
+                            averages[quiz["id"]] = quiz_average_score(quiz["id"])
+                        class_average = averages[quiz["id"]]
                         if class_average is not None:
                             average = f"  ·  class average {class_average:.0f}%"
                     st.markdown(f"Your score: **{percent(attempt['score_percent'])}**{average}")
@@ -334,13 +349,16 @@ def _answer_from_widget(question: dict, value):
     return str(value).split(")", 1)[0]
 
 
-# Re-runs on a timer so the countdown moves and time-up submits without the
-# student having to click anything.
-@st.fragment(run_every=5)
+# The paper redraws when the student does something; only its clock (`_clock`)
+# runs on a timer. The whole paper used to re-run every five seconds just to
+# move the countdown -- every question, the Description/Context and three
+# queries, for every student -- and a load test of 35 students showed that was
+# the entire server: answers took minutes to save, and half the class was
+# disconnected while the other half's answers went unsaved.
+@st.fragment
 def take_attempt(user, attempt_id: int) -> None:
-    # This fragment re-runs on a timer as well as on every answer, and neither
-    # re-executes the main script body, so it has to check for itself that the
-    # account is still signed in here.
+    # A fragment re-run never re-executes the main script body, so this has to
+    # check for itself that the account is still signed in.
     if not require_session(user):
         return
     attempt = attempt_with_quiz(attempt_id, user["id"])
@@ -396,8 +414,9 @@ def take_attempt(user, attempt_id: int) -> None:
     live_fingerprint = quiz_paper_fingerprint(attempt["quiz_id"])
     out_of_date = bool(live_fingerprint) and live_fingerprint != attempt_sync.payload_fingerprint(payload, include_key=False)
 
-    remaining = datetime.fromisoformat(attempt["deadline_at"]) - current_time()
-    if remaining.total_seconds() <= 0:
+    # `_clock` notices the deadline; handing the paper in happens here, from the
+    # attempt as stored, so a full re-run is all the clock has to ask for.
+    if datetime.fromisoformat(attempt["deadline_at"]) <= current_time():
         if out_of_date:
             # Time is up. Catch the paper up and hand it in, rather than making
             # the student choose between the two with no clock left to do it in.
@@ -455,13 +474,7 @@ def take_attempt(user, attempt_id: int) -> None:
         st.progress(min(1.0, len(answers) / len(questions)) if questions else 0,
                     text=f"{len(answers)} of {len(questions)} answered")
     with clock:
-        total_seconds = int(remaining.total_seconds())
-        low = " low" if total_seconds <= 120 else ""
-        st.markdown(
-            f'<div class="timer{low}"><span>Time left</span>'
-            f'<span class="clock">{total_seconds // 60}:{total_seconds % 60:02d}</span></div>',
-            unsafe_allow_html=True,
-        )
+        _clock(user, attempt_id, attempt["deadline_at"])
     if news := st.session_state.get(f"attempt-news-{attempt_id}"):
         st.info(news)
     if out_of_date:
@@ -556,6 +569,42 @@ def take_attempt(user, attempt_id: int) -> None:
             st.session_state[confirm_key] = True
             st.rerun(scope="fragment")
         _hand_in()
+
+
+@st.fragment(run_every=5)
+def _clock(user, attempt_id: int, deadline_at: str) -> None:
+    """The countdown: the only part of an open paper that runs on a timer.
+
+    It hands anything that needs deciding to a full re-run, where `take_attempt`
+    already knows what to do -- time running out, and a paper finished somewhere
+    else (submitted from another tab, or withdrawn by the teacher). Time-up is
+    noticed on the tick it happens; the latter within half a minute, for one
+    small query rather than the attempt, its quiz and the question bank.
+    """
+    if not require_session(user):
+        return
+    seconds = int((datetime.fromisoformat(deadline_at) - current_time()).total_seconds())
+    still_open = True
+    checked_key = f"attempt-checked-{attempt_id}"
+    # Every sixth tick or so: a query per tick per student was, after the paper
+    # stopped redrawing, most of what an open paper still cost. Time-up needs no
+    # query at all, and anything else is also caught by the student's next click.
+    if seconds > 0 and current_time().timestamp() - st.session_state.get(checked_key, 0) >= 30:
+        st.session_state[checked_key] = current_time().timestamp()
+        try:
+            still_open = attempt_is_open(attempt_id, user["id"])
+        except httpx.HTTPError:
+            # Only a courtesy check; the clock keeps moving through a hiccup and
+            # the next check asks again.
+            pass
+    if seconds <= 0 or not still_open:
+        st.rerun()
+    low = " low" if seconds <= 120 else ""
+    st.markdown(
+        f'<div class="timer{low}"><span>Time left</span>'
+        f'<span class="clock">{seconds // 60}:{seconds % 60:02d}</span></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def submit_attempt(attempt, payload: dict, automatic: bool) -> None:

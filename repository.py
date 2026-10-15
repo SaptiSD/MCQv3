@@ -8,6 +8,8 @@ import hmac
 import json
 import secrets
 
+import streamlit as st
+
 import attempt_sync
 import grading
 from db import client, utc_now
@@ -856,12 +858,17 @@ def available_quizzes(student_id: int, owner_id: int | None = None):
         .or_(f"closing_enabled.eq.0,closing_time.gte.{now}")
     if owner_id is not None:
         return _rows(base.eq("owner_id", owner_id).order("closing_time").execute())
-    quizzes = _rows(base.order("closing_time").execute())
-    mine = {
+    # Ask for this student's quizzes only. Fetching every active quiz in the
+    # database and filtering here grew with everyone's quizzes -- each with its
+    # Description/Context -- and it runs for every student on every dashboard
+    # refresh.
+    mine = sorted({
         row["quiz_id"]
         for row in _rows(supabase.table("quiz_students").select("quiz_id").eq("student_id", student_id).execute())
-    }
-    return [q for q in quizzes if q["id"] in mine]
+    })
+    if not mine:
+        return []
+    return _rows(base.in_("id", mine).order("closing_time").execute())
 
 
 def quiz_average_score(quiz_id: int):
@@ -895,8 +902,10 @@ def quiz_average_score(quiz_id: int):
 
 
 def attempts_for_student(student_id: int):
+    """What the student dashboard shows of each attempt -- not the papers themselves,
+    which every retake makes longer and the dashboard re-reads every 20 seconds."""
     return _rows(
-        client().table("attempts").select("*")
+        client().table("attempts").select("id,quiz_id,started_at,submitted_at,score_percent,passed")
         .eq("student_id", student_id)
         .order("started_at", desc=True)
         .execute()
@@ -945,7 +954,25 @@ def create_attempt(quiz_id: int, student_id: int, started_at: str, deadline_at: 
     )[0]["id"]
 
 
+# Every student with a paper open asks for the same quiz row and the same paper
+# fingerprint on each five-second refresh. With a class of 35 that was 14
+# identical queries a second, two thirds of what a refresh did, and the queue
+# behind them is what stalled a load test for minutes. Both are fixed once a
+# student starts -- the paper locks and so do the settings -- so a copy a few
+# seconds old is as good as a fresh one, and one copy serves the whole class.
+# Whatever *decides* something (marking, save_question_bank's lock, the editors)
+# still reads live through `get_quiz` and `questions_for_quiz`.
+_SHARED_FOR_SECONDS = 5
+
+
+@st.cache_data(ttl=_SHARED_FOR_SECONDS, show_spinner=False)
+def _quiz_for_attempts(quiz_id: int):
+    return get_quiz(quiz_id)
+
+
 def attempt_with_quiz(attempt_id: int, student_id: int):
+    """The attempt as stored -- always live -- with its quiz's title, pass mark and
+    case material, which come from the shared copy above."""
     rows = _rows(
         client().table("attempts").select("*")
         .eq("id", attempt_id)
@@ -956,9 +983,22 @@ def attempt_with_quiz(attempt_id: int, student_id: int):
     if not rows:
         return None
     attempt = rows[0]
-    quiz = get_quiz(attempt["quiz_id"])
+    quiz = _quiz_for_attempts(attempt["quiz_id"])
     return {**attempt, "title": quiz["title"] if quiz else "", "passing_score": quiz["passing_score"] if quiz else 0,
             "case_material": (quiz.get("case_material") or "") if quiz else ""}
+
+
+def attempt_is_open(attempt_id: int, student_id: int) -> bool:
+    """Whether this student's attempt still exists and is unsubmitted -- the cheap
+    check an open paper's clock makes on every tick."""
+    return bool(_rows(
+        client().table("attempts").select("id")
+        .eq("id", attempt_id)
+        .eq("student_id", student_id)
+        .is_("submitted_at", None)
+        .limit(1)
+        .execute()
+    ))
 
 
 def save_attempt_answers(attempt_id: int, answers_json: str) -> None:
@@ -991,6 +1031,7 @@ def quiz_attempt_counts(quiz_id: int, exclude_student_id: int | None = None) -> 
     return {"open": len(rows) - submitted, "submitted": submitted}
 
 
+@st.cache_data(ttl=_SHARED_FOR_SECONDS, show_spinner=False)
 def quiz_paper_fingerprint(quiz_id: int) -> str | None:
     """A digest of what the quiz's questions currently *look like*, or `None`.
 
@@ -1002,6 +1043,9 @@ def quiz_paper_fingerprint(quiz_id: int) -> str | None:
     `None` is deliberately not a fingerprint either: a quiz with no questions is
     a half-finished save, and nothing should conclude from it that every attempt
     in flight has gone stale.
+
+    Shared across sessions for a few seconds (see `_quiz_for_attempts`): it is
+    only ever compared against, and a paper that has a student on it cannot change.
     """
     rows = _rows(
         client().table("questions")

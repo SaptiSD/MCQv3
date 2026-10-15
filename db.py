@@ -80,8 +80,8 @@ def _harden(session) -> None:
     """Give one of the SDK's httpx clients a short-lived, self-healing pool.
 
     The transport is replaced rather than the whole client: the SDK builds its
-    session with the base URL, the service-role headers and HTTP/2 already set
-    up, and handing it a client of our own would quietly drop all of that.
+    session with the base URL and the service-role headers already set up, and
+    handing it a client of our own would quietly drop both.
     """
     existing = getattr(session, "_transport", None)
     if not isinstance(existing, httpx.HTTPTransport):
@@ -89,8 +89,20 @@ def _harden(session) -> None:
         # break a working client. Requests still work, just without the retry.
         return
     session._transport = _ResilientTransport(
-        http2=True,
-        limits=httpx.Limits(max_connections=10, max_keepalive_connections=5,
+        # HTTP/1.1, not the SDK's HTTP/2. Every Streamlit session is a thread on
+        # this one client, and httpcore's sync HTTP/2 lets those threads drive a
+        # single connection's h2 state at the same time (`send_headers` takes no
+        # lock), so two students clicking together corrupted the connection's
+        # shared header-compression table. Supabase's gateway then dropped the
+        # connection -- PROTOCOL_ERROR, or a bare 400 -- and every request in
+        # flight on it failed at once: tracebacks on screen, answers that were
+        # never saved, and "open in more than one place" for students with one
+        # tab, from five students upward. HTTP/1.1 gives each request a
+        # connection to itself, so the pool is sized for a class, not a person,
+        # and keeps every connection warm: a pool that kept fewer than it opened
+        # spent its busiest moments on fresh TLS handshakes.
+        http2=False,
+        limits=httpx.Limits(max_connections=40, max_keepalive_connections=40,
                             keepalive_expiry=_KEEPALIVE_SECONDS),
     )
     existing.close()
