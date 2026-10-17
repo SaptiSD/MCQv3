@@ -104,9 +104,11 @@ def dashboard(user) -> None:
         st.warning("The assessment you were taking is no longer yours to take - your teacher either removed it "
                    "or unassigned you - so that attempt has ended and nothing was submitted.")
 
-    _assessment_list(user, previewing)
     if st.session_state.get("attempt_id"):
+        _assessment_list_held(user, previewing)
         take_attempt(user, st.session_state.attempt_id)
+    else:
+        _assessment_list(user, previewing)
 
 
 # Streamlit only re-runs a page when somebody interacts with it, so an
@@ -117,6 +119,21 @@ def dashboard(user) -> None:
 # enough to be a few queries a minute for a student who is just sitting there.
 @st.fragment(run_every=20)
 def _assessment_list(user, previewing: bool) -> None:
+    _draw_assessment_list(user, previewing)
+
+
+# The same list while a paper is open, with no timer. Nothing on it changes what
+# the student does next, and its 20-second timer firing as they answered was
+# how a question's redraw got lost: Streamlit drops the last messages of a run
+# that has just finished when the next request makes it start a fresh runner
+# before they are sent. Under a different name it is a different fragment, so
+# the old timer's ticks find nothing to run and cost nothing.
+@st.fragment
+def _assessment_list_held(user, previewing: bool) -> None:
+    _draw_assessment_list(user, previewing)
+
+
+def _draw_assessment_list(user, previewing: bool) -> None:
     # A fragment never re-executes the main script body, so the signed-out check
     # belongs here as well -- without it a tab signed out somewhere else carries
     # on polling, and carries on offering to start assessments.
@@ -349,12 +366,13 @@ def _answer_from_widget(question: dict, value):
     return str(value).split(")", 1)[0]
 
 
-# The paper redraws when the student does something; only its clock (`_clock`)
-# runs on a timer. The whole paper used to re-run every five seconds just to
-# move the countdown -- every question, the Description/Context and three
-# queries, for every student -- and a load test of 35 students showed that was
-# the entire server: answers took minutes to save, and half the class was
-# disconnected while the other half's answers went unsaved.
+# The paper redraws only for its own buttons (Submit, and the like); each
+# question is its own fragment (`_question`) and only the header (`_clock`) runs
+# on a timer. The whole paper used to re-run every five seconds just to move the
+# countdown -- every question, the Description/Context and three queries, for
+# every student -- and a load test of 35 students showed that was the entire
+# server: answers took minutes to save, and half the class was disconnected
+# while the other half's answers went unsaved.
 @st.fragment
 def take_attempt(user, attempt_id: int) -> None:
     # A fragment re-run never re-executes the main script body, so this has to
@@ -402,7 +420,10 @@ def take_attempt(user, attempt_id: int) -> None:
         st.session_state[paint_key] = paint + 1
         _announce(attempt_id, "You had this assessment open in more than one place. "
                               "The answers below are the ones that were saved most recently.")
-        st.rerun(scope="fragment")
+        # App scope: this is now usually noticed during a full run -- the save
+        # that found the tab behind asks for one -- and `scope="fragment"` raises
+        # outside a fragment re-run instead of repainting.
+        st.rerun()
     st.session_state[seen_key] = attempt_sync.revision(payload)
     paper = _paper_id(payload)
 
@@ -428,53 +449,18 @@ def take_attempt(user, attempt_id: int) -> None:
         st.session_state.time_up_title = attempt["title"]
         st.rerun()
 
-    def _record(index: int, widget_key: str) -> None:
-        """Store one answer the moment it changes.
-
-        Answers used to live in an `st.form`, which meant nothing reached the
-        server until the student pressed a button. If the clock ran out first,
-        the automatic submission scored an empty attempt — a student could
-        answer every question, run out of time, and be marked zero. Saving on
-        each change means the stored attempt is always what is on screen.
-
-        What goes back is the *stored* attempt with this one answer changed, not
-        the copy this run was drawn from. Writing the drawn copy back meant a tab
-        that had been open a while restored its own questions and answers over
-        whatever had happened since — another tab's work, or a teacher's edit.
-        """
-        given = _answer_from_widget(questions[index], st.session_state.get(widget_key))
-        latest = attempt_with_quiz(attempt_id, user["id"])
-        if not latest or latest["submitted_at"]:
-            return
-        try:
-            stored = json.loads(latest["answers_json"] or "{}")
-        except (TypeError, ValueError):
-            return
-        if _paper_id(stored) != paper:
-            # This box was drawn against a version of the paper that has since
-            # been replaced. Its value cannot be placed on the new one, and its
-            # index would land on a different question.
-            return
-        saved_answers = stored.get("answers") or {}
-        if given is None:
-            saved_answers.pop(str(index), None)
-        else:
-            saved_answers[str(index)] = given
-        stored["answers"] = saved_answers
-        stored["revision"] = attempt_sync.revision(stored) + 1
-        save_attempt_answers(attempt_id, json.dumps(stored))
-        st.session_state[seen_key] = stored["revision"]
-        st.session_state.pop(f"attempt-news-{attempt_id}", None)
-        st.session_state.pop(f"confirm-submit-{attempt_id}", None)
+    # What this tab knows is stored. Each question draws from it and each save
+    # updates it, so a question redrawn on its own shows the right answer without
+    # the paper -- or the database -- being read again.
+    st.session_state[f"attempt-answers-{attempt_id}"] = dict(answers)
+    # Every question is drawn below, in this same run -- but after the header, whose
+    # check for a save that never redrew would otherwise see them all as missing
+    # and ask for this run again, for ever.
+    for index in range(len(questions)):
+        st.session_state[f"attempt-drawn-{attempt_id}-{index}"] =             st.session_state.get(f"attempt-saved-{attempt_id}-{index}", 0)
 
     st.divider()
-    heading, clock = st.columns([3, 1.4], vertical_alignment="center")
-    with heading:
-        st.markdown(f"### {text(attempt['title'])}", unsafe_allow_html=True)
-        st.progress(min(1.0, len(answers) / len(questions)) if questions else 0,
-                    text=f"{len(answers)} of {len(questions)} answered")
-    with clock:
-        _clock(user, attempt_id, attempt["deadline_at"])
+    _clock(user, attempt_id, attempt["title"], attempt["deadline_at"], len(questions))
     if news := st.session_state.get(f"attempt-news-{attempt_id}"):
         st.info(news)
     if out_of_date:
@@ -500,27 +486,7 @@ def take_attempt(user, attempt_id: int) -> None:
         with st.expander("Description/Context", expanded=True):
             st.markdown(markdown_source(attempt["case_material"]))
     for index, question in enumerate(questions):
-        widget_key = f"q-{attempt_id}-{paper}-{paint}-{index}"
-        labels = [f"{label}) {option_text}" for label, option_text in question["options"]]
-        if question.get("question_type") in TEXT_ANSWER_TYPES:
-            st.text_input(
-                f"{index + 1}. {question['text']}",
-                value=answers.get(str(index), ""),
-                max_chars=question.get("limit") or grading.MAX_TEXT_LIMIT,
-                help=question.get("hint"),
-                placeholder=question.get("hint", "Your answer"),
-                key=widget_key, on_change=_record, args=(index, widget_key),
-            )
-        elif question.get("question_type") == SELECT_ALL_TYPE:
-            current = [f"{label}) {option_text}" for label, option_text in question["options"]
-                       if label in (answers.get(str(index)) or [])]
-            st.multiselect(f"{index + 1}. {question['text']}", labels, default=current,
-                           key=widget_key, on_change=_record, args=(index, widget_key))
-        else:
-            current = next((label for label in labels if label.split(")", 1)[0] == answers.get(str(index))), None)
-            st.radio(f"{index + 1}. {question['text']}", labels,
-                     index=labels.index(current) if current in labels else None,
-                     key=widget_key, on_change=_record, args=(index, widget_key))
+        _question(user, attempt_id, paper, paint, index, question, attempt["deadline_at"])
     st.divider()
     if out_of_date:
         st.caption("Submitting is paused until you load your teacher's update, so that you are "
@@ -571,24 +537,158 @@ def take_attempt(user, attempt_id: int) -> None:
         _hand_in()
 
 
-@st.fragment(run_every=5)
-def _clock(user, attempt_id: int, deadline_at: str) -> None:
-    """The countdown: the only part of an open paper that runs on a timer.
+def _save_answer(user, attempt_id: int, paper: str, index: int, question: dict,
+                 widget_key: str, deadline_at: str) -> None:
+    """Store one answer the moment it changes.
 
-    It hands anything that needs deciding to a full re-run, where `take_attempt`
-    already knows what to do -- time running out, and a paper finished somewhere
-    else (submitted from another tab, or withdrawn by the teacher). Time-up is
-    noticed on the tick it happens; the latter within half a minute, for one
-    small query rather than the attempt, its quiz and the question bank.
+    Answers used to live in an `st.form`, which meant nothing reached the
+    server until the student pressed a button. If the clock ran out first,
+    the automatic submission scored an empty attempt — a student could
+    answer every question, run out of time, and be marked zero. Saving on
+    each change means the stored attempt is always what is on screen.
+
+    What goes back is the *stored* attempt with this one answer changed, not
+    the copy this run was drawn from. Writing the drawn copy back meant a tab
+    that had been open a while restored its own questions and answers over
+    whatever had happened since — another tab's work, or a teacher's edit.
+
+    Anything that means the paper has moved on under this tab -- handed in,
+    withdrawn, out of time, replaced, or saved from another tab -- is left to a
+    full run (`attempt-resync-*`), where `take_attempt` already decides what to
+    do about each.
+    """
+    if widget_key not in st.session_state:
+        # The callback outlived its widget (see teacher_portal._vanished). Reading
+        # it anyway gave `None`, and "no answer" was then stored over the real one.
+        return
+    resync_key = f"attempt-resync-{attempt_id}"
+    status_key = f"attempt-status-{attempt_id}-{index}"
+    seen_key = f"attempt-seen-{attempt_id}"
+    given = _answer_from_widget(question, st.session_state[widget_key])
+    if datetime.fromisoformat(deadline_at) <= current_time():
+        # Out of time. The clock only looks every few seconds, and an answer must
+        # not be squeezed in after the deadline in between; the full run this
+        # asks for hands the paper in with everything saved before it.
+        st.session_state[resync_key] = True
+        return
+    try:
+        latest = attempt_with_quiz(attempt_id, user["id"])
+        stored = json.loads(latest["answers_json"] or "{}") if latest and not latest["submitted_at"] else None
+        if not stored or _paper_id(stored) != paper:
+            # Handed in, withdrawn, or replaced by a different version of the
+            # paper: this box's value has nowhere to go, and its index would land
+            # on a different question.
+            st.session_state[resync_key] = True
+            return
+        behind = attempt_sync.overtaken(stored, st.session_state.get(seen_key))
+        saved = stored.get("answers") or {}
+        if given is None:
+            saved.pop(str(index), None)
+        else:
+            saved[str(index)] = given
+        stored["answers"] = saved
+        stored["revision"] = attempt_sync.revision(stored) + 1
+        save_attempt_answers(attempt_id, json.dumps(stored))
+    except (TypeError, ValueError):
+        st.session_state[resync_key] = True
+        return
+    except httpx.HTTPError:
+        # The choice is still showing, which is exactly what made a lost answer
+        # invisible. Redraw the box under a new name (the widget-key rule) so it
+        # shows what is really stored, and say so.
+        retry_key = f"attempt-retry-{attempt_id}-{index}"
+        st.session_state[retry_key] = int(st.session_state.get(retry_key, 0)) + 1
+        st.session_state[status_key] = "failed"
+        return
+    st.session_state[f"attempt-answers-{attempt_id}"] = dict(saved)
+    st.session_state[status_key] = "saved"
+    serial = int(st.session_state.get(f"attempt-serial-{attempt_id}", 0)) + 1
+    st.session_state[f"attempt-serial-{attempt_id}"] = serial
+    st.session_state[f"attempt-saved-{attempt_id}-{index}"] = serial
+    st.session_state.pop(f"attempt-news-{attempt_id}", None)
+    if behind:
+        # Another tab saved since this one last read. Its answers are in what was
+        # just written, but this tab is still showing its own -- so `seen` stays
+        # behind, and the full run recognises the tab and repaints it.
+        st.session_state[resync_key] = True
+    else:
+        st.session_state[seen_key] = stored["revision"]
+    if st.session_state.pop(f"confirm-submit-{attempt_id}", None):
+        # The "still unanswered" list on screen just went out of date.
+        st.session_state[resync_key] = True
+
+
+# Re-drawing all thirty questions and the Description/Context on every answer
+# was most of what a class sitting a test cost the server once the clock had
+# stopped re-running the paper -- and reading the attempt back straight after
+# saving it was a round trip the save had just made unnecessary.
+@st.fragment
+def _question(user, attempt_id: int, paper: str, paint: int, index: int, question: dict,
+              deadline_at: str) -> None:
+    """One question of an open paper. Answering it redraws this question alone."""
+    # A fragment re-run never re-executes the main script body.
+    if not require_session(user):
+        return
+    if st.session_state.pop(f"attempt-resync-{attempt_id}", False):
+        # The save found the paper had moved on under this tab. A full run is
+        # where `take_attempt` decides how, and repaints or leaves accordingly.
+        st.rerun()
+    known = st.session_state.get(f"attempt-answers-{attempt_id}") or {}
+    retry = int(st.session_state.get(f"attempt-retry-{attempt_id}-{index}", 0))
+    widget_key = f"q-{attempt_id}-{paper}-{paint}-{index}" + (f"-r{retry}" if retry else "")
+    args = (user, attempt_id, paper, index, question, widget_key, deadline_at)
+    labels = [f"{label}) {option_text}" for label, option_text in question["options"]]
+    if question.get("question_type") in TEXT_ANSWER_TYPES:
+        st.text_input(
+            f"{index + 1}. {question['text']}",
+            value=known.get(str(index), ""),
+            max_chars=question.get("limit") or grading.MAX_TEXT_LIMIT,
+            help=question.get("hint"),
+            placeholder=question.get("hint", "Your answer"),
+            key=widget_key, on_change=_save_answer, args=args,
+        )
+    elif question.get("question_type") == SELECT_ALL_TYPE:
+        current = [f"{label}) {option_text}" for label, option_text in question["options"]
+                   if label in (known.get(str(index)) or [])]
+        st.multiselect(f"{index + 1}. {question['text']}", labels, default=current,
+                       key=widget_key, on_change=_save_answer, args=args)
+    else:
+        current = next((label for label in labels if label.split(")", 1)[0] == known.get(str(index))), None)
+        st.radio(f"{index + 1}. {question['text']}", labels,
+                 index=labels.index(current) if current in labels else None,
+                 key=widget_key, on_change=_save_answer, args=args)
+    status = st.session_state.get(f"attempt-status-{attempt_id}-{index}")
+    # Which save this drawing shows -- `_clock` compares it with the last one made.
+    st.session_state[f"attempt-drawn-{attempt_id}-{index}"] = \
+        st.session_state.get(f"attempt-saved-{attempt_id}-{index}", 0)
+    if status == "saved":
+        st.caption(":material/check: Saved")
+    elif status == "failed":
+        st.warning("That answer didn't save — the connection dropped. Please choose it again.")
+
+
+@st.fragment(run_every=15)
+def _clock(user, attempt_id: int, title: str, deadline_at: str, total: int) -> None:
+    """The paper's header -- title, progress and countdown -- and the only part of an
+    open paper that runs on a timer.
+
+    The countdown ticks in the browser (`_countdown`); this re-runs every 15
+    seconds to set it right and to notice what needs deciding, which it hands to
+    a full re-run where `take_attempt` already knows what to do -- time running
+    out, and a paper finished somewhere else (submitted from another tab, or
+    withdrawn by the teacher). Time-up is noticed within a tick, and saving
+    refuses anything after the deadline in the meantime; the rest within half a
+    minute, for one small query rather than the attempt, its quiz and the
+    question bank. At five seconds a class of 35 was seven of these a second.
     """
     if not require_session(user):
         return
     seconds = int((datetime.fromisoformat(deadline_at) - current_time()).total_seconds())
     still_open = True
     checked_key = f"attempt-checked-{attempt_id}"
-    # Every sixth tick or so: a query per tick per student was, after the paper
-    # stopped redrawing, most of what an open paper still cost. Time-up needs no
-    # query at all, and anything else is also caught by the student's next click.
+    # Every other tick: a query per tick per student was, after the paper stopped
+    # redrawing, most of what an open paper still cost. Time-up needs no query at
+    # all, and anything else is also caught by the student's next answer.
     if seconds > 0 and current_time().timestamp() - st.session_state.get(checked_key, 0) >= 30:
         st.session_state[checked_key] = current_time().timestamp()
         try:
@@ -597,14 +697,61 @@ def _clock(user, attempt_id: int, deadline_at: str) -> None:
             # Only a courtesy check; the clock keeps moving through a hiccup and
             # the next check asks again.
             pass
-    if seconds <= 0 or not still_open:
-        st.rerun()
-    low = " low" if seconds <= 120 else ""
-    st.markdown(
-        f'<div class="timer{low}"><span>Time left</span>'
-        f'<span class="clock">{seconds // 60}:{seconds % 60:02d}</span></div>',
-        unsafe_allow_html=True,
+    # A save whose question never redrew. Streamlit runs a widget's callback in
+    # whichever run carries its new value -- often this tick's -- and a timer
+    # firing as the student clicks could cut the question's own run short (seen
+    # under load: about one answer in two hundred stored but never marked
+    # "Saved"). The answer is safe either way; a full run puts the screen right.
+    unshown = any(
+        st.session_state.get(f"attempt-saved-{attempt_id}-{index}", 0)
+        > st.session_state.get(f"attempt-drawn-{attempt_id}-{index}", 0)
+        for index in range(total)
     )
+    if seconds <= 0 or not still_open or unshown:
+        st.rerun()
+    # Counted from what this tab knows is stored, so the bar catches up on the
+    # next tick after an answer; each question says "Saved" straight away.
+    answered = len(st.session_state.get(f"attempt-answers-{attempt_id}") or {})
+    heading, clock = st.columns([3, 1.4], vertical_alignment="center")
+    with heading:
+        st.markdown(f"### {text(title)}", unsafe_allow_html=True)
+        st.progress(min(1.0, answered / total) if total else 0, text=f"{answered} of {total} answered")
+    with clock:
+        st.html(_countdown(attempt_id, seconds), unsafe_allow_javascript=True)
+
+
+_COUNTDOWN_SCRIPT = """<script>
+(function () {
+  var id = "__ID__", end = Date.now() + __SECONDS__ * 1000;
+  var clocks = window.mcqClocks = window.mcqClocks || {};
+  clearInterval(clocks[id]);
+  function tick() {
+    var box = document.getElementById(id);
+    if (!box) { clearInterval(clocks[id]); return; }
+    var left = Math.max(0, Math.round((end - Date.now()) / 1000));
+    box.querySelector(".clock").textContent = Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0");
+    box.classList.toggle("low", left <= 120);
+  }
+  tick();
+  clocks[id] = setInterval(tick, 1000);
+})();
+</script>"""
+
+
+def _countdown(attempt_id: int, seconds: int) -> str:
+    """The timer box, counting down each second in the browser.
+
+    The server draws it with the right time on every tick, so it is correct even
+    where the script doesn't run, and the script counts from the time it was
+    handed rather than the date on the student's computer -- a wrong clock there
+    cannot move it.
+    """
+    element = f"mcq-clock-{attempt_id}"
+    seconds = max(seconds, 0)
+    low = " low" if seconds <= 120 else ""
+    return (f'<div class="timer{low}" id="{element}"><span>Time left</span>'
+            f'<span class="clock">{seconds // 60}:{seconds % 60:02d}</span></div>'
+            + _COUNTDOWN_SCRIPT.replace("__ID__", element).replace("__SECONDS__", str(seconds)))
 
 
 def submit_attempt(attempt, payload: dict, automatic: bool) -> None:

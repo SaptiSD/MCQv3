@@ -153,7 +153,8 @@ widget showing that same data keeps its pre-write value, the screen starts
 contradicting itself, and the next Save writes the stale value back. The cure is
 always to *rename* the widget, never to delete its key:
 
-- attempts use `q-{attempt}-{paper}-{paint}-{index}`
+- attempts use `q-{attempt}-{paper}-{paint}-{index}`, plus `-r{n}` after a save
+  that failed, so the box redraws showing what is really stored
 - the question editor bumps `editor_epoch(quiz_id)`
 - team membership bumps `team-epoch-{team_id}`
 - the Create page puts `_create_suffix()` on every data widget via `_ck(name)`,
@@ -194,6 +195,25 @@ Streamlit only re-runs on interaction, so an assessment assigned while a student
 sat on their dashboard did not show up until they refreshed, with nothing to
 suggest they should. `_assessment_list` is a `run_every=20` fragment that also
 toasts genuinely new titles. It re-checks `require_session` for the reason above.
+While a paper is open it holds its last reading instead of querying, and is
+drawn as `_assessment_list_held`, with no timer: a timer firing as a student
+clicked lost that question's redraw to a Streamlit race (a run's last messages
+are dropped if the next request starts a fresh runner before they are sent).
+
+**An open paper runs on one small timer, and an answer redraws one question.**
+Load-tested in Oct 2026: when the whole paper was a
+`run_every=5` fragment, 35 students were 7 full redraws and ~20 queries a second
+and the server fell over. Now `take_attempt` redraws only for its own buttons;
+each question is its own `_question` fragment, whose `_save_answer` reads the
+attempt once, writes once, and updates `attempt-answers-{id}` (this tab's copy of
+what is stored) instead of reading back; and `_clock` -- title, progress and a
+countdown that ticks in the browser -- is the only `run_every` (15 s). Anything a
+save finds wrong (handed in, withdrawn, out of time, another tab ahead) sets
+`attempt-resync-{id}` and the question asks for a full run, where `take_attempt`'s
+existing checks decide. Two consequences: the progress bar lags an answer by up
+to a tick (each question says "Saved" at once), and anything `take_attempt`
+reruns from may now be a full run -- `st.rerun(scope="fragment")` raises there, so
+the two-tab repaint uses app scope. Don't put the paper back on a timer.
 
 **A deferred download needs its content in its key.** `st.download_button` with a
 callable registers the builder afresh on every render and gets a new
