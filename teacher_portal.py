@@ -112,6 +112,12 @@ def has_unpublished_draft(user) -> bool:
     return bool(server_state.load_draft(server_state.account_key(user), DRAFT_NAME))
 
 
+def draft_token() -> str:
+    """The open Create quiz draft's identity: the token `create` mints for each
+    draft, which changes when the draft is discarded or published."""
+    return (st.session_state.get("new_quiz_data") or {}).get("new-publish-token", "")
+
+
 def _mirror_draft(form: dict) -> None:
     """Keep a copy of the in-progress quiz outside the browser session.
 

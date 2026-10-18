@@ -552,31 +552,40 @@ def signed_out_elsewhere_notice() -> None:
         st.warning("You were signed out because this account was signed out (or signed in again) in another tab or window.")
 
 
-# Installed once per page; every later run only redraws the marker. The
-# listeners keep no flags of their own and read the marker instead, so a page
-# that stops drawing it -- the login page after a teacher signs out, and then
-# a student signing in in the same tab -- is never asked about a teacher's draft.
+# Runs whenever the marker changes; the listeners go in once. They read the
+# marker `warn_before_leaving` draws, so a page that stops drawing it -- the
+# login page after a teacher signs out, and then a student signing in in the
+# same tab -- is never asked about a teacher's draft. What typing armed is kept
+# on the window against the draft it was typed into, because the marker itself
+# is rebuilt whenever its markup changes.
 _LEAVE_GUARD_SCRIPT = """<script>
 (function () {
+  function marker() { return document.getElementById("mcq-leave-guard"); }
+  var current = marker();
+  // Leaving the Create page committed whatever was typed, and the draft is
+  // kept server-side, so there is nothing left that only the browser knows.
+  if (current && current.dataset.armOnTyping !== "true") window.mcqTypedInDraft = "";
   if (window.mcqLeaveGuard) return;
   window.mcqLeaveGuard = true;
-  function marker() { return document.getElementById("mcq-leave-guard"); }
   window.addEventListener("beforeunload", function (event) {
     var guard = marker();
-    if (!guard || guard.dataset.unsaved !== "true") return;
+    if (!guard) return;
+    var typed = guard.dataset.armOnTyping === "true" && guard.dataset.draft !== ""
+      && window.mcqTypedInDraft === guard.dataset.draft;
+    if (guard.dataset.unsaved !== "true" && !typed) return;
     event.preventDefault();
     event.returnValue = "You have an assessment in progress that has not been published yet.";
     return event.returnValue;
   });
   document.addEventListener("input", function () {
     var guard = marker();
-    if (guard && guard.dataset.armOnTyping === "true") guard.dataset.unsaved = "true";
+    if (guard && guard.dataset.armOnTyping === "true") window.mcqTypedInDraft = guard.dataset.draft;
   }, true);
 })();
 </script>"""
 
 
-def warn_before_leaving(active: bool, arm_on_typing: bool = False) -> None:
+def warn_before_leaving(active: bool, arm_on_typing: bool = False, draft: str = "") -> None:
     """Ask the browser to confirm before a refresh or Back throws away unsaved work.
 
     This used to live in a component iframe, which Streamlit rebuilds on every
@@ -589,17 +598,17 @@ def warn_before_leaving(active: bool, arm_on_typing: bool = False) -> None:
     warning at all -- exactly the moment it is worth most. With `arm_on_typing`,
     the first keystroke arms the guard in the browser, with no round trip.
 
-    Every full run then puts the server's view back, which is safe because any
-    click that causes one commits what was typed first -- and it is what
-    disarms the guard after Discard draft, which used to leave the page asking
-    about a draft that was gone. The run number is what makes it happen: the
-    browser re-applies `st.html` only when its markup changes, and without it
-    the markup after a discard is the markup from before the typing.
+    What typing armed belongs to `draft`, the draft's own token, and stays armed
+    until Discard draft or Publish replaces the token or the teacher leaves the
+    page; no other run can turn it off. Both simpler rules failed. Never
+    disarming on the Create page meant a discarded draft went on asking. Letting
+    every full run put the server's view back -- on the grounds that the click
+    starting one commits what was typed first -- missed typing *during* that
+    run: it commits nothing, the run said "nothing unsaved", and a refresh lost it.
     """
-    run = st.session_state["leave-guard-run"] = st.session_state.get("leave-guard-run", 0) + 1
     st.html(
         f'<div id="mcq-leave-guard" data-unsaved="{str(active).lower()}" '
-        f'data-arm-on-typing="{str(arm_on_typing).lower()}" data-run="{run}"></div>'
+        f'data-arm-on-typing="{str(arm_on_typing).lower()}" data-draft="{text(draft)}"></div>'
         + _LEAVE_GUARD_SCRIPT,
         unsafe_allow_javascript=True,
     )

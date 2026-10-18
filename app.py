@@ -11,7 +11,7 @@ from student_portal import choose_teacher_page, dashboard as student_dashboard
 from student_portal import my_teachers_page, needs_a_teacher
 from teacher_portal import create as create_quiz
 from teacher_portal import analytics_page, dashboard as teacher_dashboard
-from teacher_portal import has_unpublished_draft, roster_page
+from teacher_portal import draft_token, has_unpublished_draft, roster_page
 from repository import PortalMismatch
 from ui import (choose_role_page, confirm_discard_dialog, enforce_session, google_user, login_page,
                 portal_mismatch_message, signed_out_elsewhere_notice, styles, warn_before_leaving,
@@ -137,7 +137,7 @@ def main() -> None:
     # student's full run, guarding nothing.
     if user["role"] == "teacher":
         warn_before_leaving(bool(st.session_state.get("create_dirty")),
-                            arm_on_typing=(page == "Create quiz"))
+                            arm_on_typing=(page == "Create quiz"), draft=draft_token())
 
 
 try:
