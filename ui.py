@@ -552,64 +552,54 @@ def signed_out_elsewhere_notice() -> None:
         st.warning("You were signed out because this account was signed out (or signed in again) in another tab or window.")
 
 
+# Installed once per page; every later run only redraws the marker. The
+# listeners keep no flags of their own and read the marker instead, so a page
+# that stops drawing it -- the login page after a teacher signs out, and then
+# a student signing in in the same tab -- is never asked about a teacher's draft.
+_LEAVE_GUARD_SCRIPT = """<script>
+(function () {
+  if (window.mcqLeaveGuard) return;
+  window.mcqLeaveGuard = true;
+  function marker() { return document.getElementById("mcq-leave-guard"); }
+  window.addEventListener("beforeunload", function (event) {
+    var guard = marker();
+    if (!guard || guard.dataset.unsaved !== "true") return;
+    event.preventDefault();
+    event.returnValue = "You have an assessment in progress that has not been published yet.";
+    return event.returnValue;
+  });
+  document.addEventListener("input", function () {
+    var guard = marker();
+    if (guard && guard.dataset.armOnTyping === "true") guard.dataset.unsaved = "true";
+  }, true);
+})();
+</script>"""
+
+
 def warn_before_leaving(active: bool, arm_on_typing: bool = False) -> None:
     """Ask the browser to confirm before a refresh or Back throws away unsaved work.
 
-    Two things make this fiddlier than it looks.
+    This used to live in a component iframe, which Streamlit rebuilds on every
+    rerun, and a listener registered from inside it stopped firing once the
+    iframe was gone -- the guard worked for exactly one rerun. `st.html` puts the
+    script in the page itself, so the listeners are installed once and stay.
 
-    Streamlit runs the snippet inside a component iframe that it tears down and
-    rebuilds on every rerun. A listener registered from inside that iframe is
-    registered with a function belonging to the iframe's realm, and the browser
-    quietly stops calling it once the iframe is gone -- so the guard worked for
-    exactly one rerun and then silently did nothing. The handlers are therefore
-    injected into the parent page's own realm, once, and afterwards the iframe
-    only sets two flags on the parent window.
+    Timing: a Streamlit input reaches the server only when it loses focus, so a
+    teacher who is still typing has set no "unsaved" flag and used to get no
+    warning at all -- exactly the moment it is worth most. With `arm_on_typing`,
+    the first keystroke arms the guard in the browser, with no round trip.
 
-    The second is timing: a Streamlit input reaches the server only when it
-    loses focus, so a teacher who is still typing has set no "unsaved" flag and
-    used to get no warning at all -- exactly the moment it is worth most. With
-    `arm_on_typing`, the first keystroke arms the guard in the browser, with no
-    round trip.
+    Every full run then puts the server's view back, which is safe because any
+    click that causes one commits what was typed first -- and it is what
+    disarms the guard after Discard draft, which used to leave the page asking
+    about a draft that was gone. The run number is what makes it happen: the
+    browser re-applies `st.html` only when its markup changes, and without it
+    the markup after a discard is the markup from before the typing.
     """
-    from streamlit.components.v1 import html
-
-    state = "true" if active else "false"
-    arm = "true" if arm_on_typing else "false"
-    html(
-        f"""
-        <script>
-        (function () {{
-          const parentWindow = window.parent;
-          if (!parentWindow) return;
-          if (!parentWindow.__mcqGuardInstalled) {{
-            parentWindow.__mcqGuardInstalled = true;
-            parentWindow.__mcqUnloadGuard = false;
-            parentWindow.__mcqArmOnInput = false;
-            // Injected so the handlers belong to the page, not to this iframe.
-            const installer = parentWindow.document.createElement('script');
-            installer.textContent = [
-              "(function () {{",
-              "  window.addEventListener('beforeunload', function (event) {{",
-              "    if (!window.__mcqUnloadGuard) return;",
-              "    event.preventDefault();",
-              "    event.returnValue = 'You have an assessment in progress that has not been published yet.';",
-              "    return event.returnValue;",
-              "  }});",
-              "  document.addEventListener('input', function () {{",
-              "    if (window.__mcqArmOnInput) window.__mcqUnloadGuard = true;",
-              "  }}, true);",
-              "}})();"
-            ].join('\\n');
-            parentWindow.document.head.appendChild(installer);
-          }}
-          parentWindow.__mcqArmOnInput = {arm};
-          if ({state}) {{
-            parentWindow.__mcqUnloadGuard = true;
-          }} else if (!{arm}) {{
-            parentWindow.__mcqUnloadGuard = false;
-          }}
-        }})();
-        </script>
-        """,
-        height=0,
+    run = st.session_state["leave-guard-run"] = st.session_state.get("leave-guard-run", 0) + 1
+    st.html(
+        f'<div id="mcq-leave-guard" data-unsaved="{str(active).lower()}" '
+        f'data-arm-on-typing="{str(arm_on_typing).lower()}" data-run="{run}"></div>'
+        + _LEAVE_GUARD_SCRIPT,
+        unsafe_allow_javascript=True,
     )

@@ -132,9 +132,12 @@ def main() -> None:
     if user["role"] == "teacher" and st.session_state.get("create_nav_guard"):
         confirm_discard_dialog()
     # Refreshing or navigating away mid-build now costs a browser confirmation
-    # rather than the whole draft (which is also mirrored server-side).
-    warn_before_leaving(bool(st.session_state.get("create_dirty")),
-                        arm_on_typing=(page == "Create quiz"))
+    # rather than the whole draft (which is also mirrored server-side). Only a
+    # teacher has a draft; drawn for everyone, it was one more element on every
+    # student's full run, guarding nothing.
+    if user["role"] == "teacher":
+        warn_before_leaving(bool(st.session_state.get("create_dirty")),
+                            arm_on_typing=(page == "Create quiz"))
 
 
 try:
