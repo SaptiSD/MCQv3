@@ -62,6 +62,7 @@ for t in test_*.py; do .venv/Scripts/python.exe $t; done
 | `test_ai_reader.py` | the OpenAI reader with the network faked out |
 | `test_activation.py` | quizzes stay hidden until activated; the class's clock (live DB, ZZTEST rows) |
 | `test_classes.py` | class lists (paste/CSV), bulk moves, the gradebook (live DB, ZZTEST rows) |
+| `test_class_delete.py` | deleting a class warns first; only the confirmation deletes (`AppTest`) |
 
 `.venv/Scripts/python.exe -m pyflakes *.py` should print nothing.
 

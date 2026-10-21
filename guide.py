@@ -57,6 +57,7 @@ TEACHER_GUIDE = [
             "Sort students - a table of your whole roster with a Class column. Change the class on as many rows as you like and press Save class changes once, or tick a set of students (Tick all shown works with the Show filter and the search) and press Move ticked.",
             "Add from a list - paste email addresses, one per line or straight from a spreadsheet, or upload a CSV with an email column and optionally name and class columns. Everyone is added to your roster and put in their class in one go; classes the file names that do not exist yet can be created for you. Download a CSV template from the same tab.",
             "A student is in one class at a time: moving them takes them out of your other classes.",
+            "Rename or delete - rename a class, or delete it. Delete asks first and says what will happen: the class goes, its students stay on your roster with every result, and assessments already assigned to them stay assigned. It cannot be undone.",
         ]),
     ]),
 

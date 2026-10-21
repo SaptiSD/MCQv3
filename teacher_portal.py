@@ -2198,20 +2198,55 @@ def _manage_classes(user, classes, epoch: int) -> None:
                 flash("classes", f"Renamed to **{' '.join(new_name.split())}**.")
                 st.session_state["class-epoch"] = epoch + 1
                 st.rerun()
-        armed = st.session_state.get("class-delete-armed") == row["id"]
-        if delete_column.button("Confirm" if armed else "Delete", key=f"class-delete-{row['id']}",
-                                type="primary" if armed else "secondary", width="stretch"):
-            if not armed:
-                st.session_state["class-delete-armed"] = row["id"]
-                st.rerun()
-            delete_class(user["id"], row["id"])
-            st.session_state.pop("class-delete-armed", None)
-            flash("classes", f"Class **{row['name']}** deleted. Its students are still on your roster, and quizzes "
-                             "already assigned through it stay assigned.")
-            st.session_state["class-epoch"] = epoch + 1
+        if delete_column.button("Delete", key=f"class-delete-{row['id']}", width="stretch"):
+            delete_class_dialog(user, row["id"])
+
+
+@st.dialog("Delete class?")
+def delete_class_dialog(user, class_id: int) -> None:
+    """Say exactly what deleting a class does before it happens.
+
+    The button used to turn into "Confirm" in place and say no more than that,
+    which reads like a second click on the same thing -- and two quick clicks
+    deleted a class of thirty without a word about it.
+    """
+    # A dialog body is a fragment: the session check has to happen in here.
+    if not require_session(user):
+        return
+    target = next((row for row in teams_for_teacher(user["id"]) if row["id"] == class_id), None)
+    if target is None:
+        st.info("This class has already been deleted.")
+        if st.button("Close", key=f"class-delete-gone-{class_id}", width="stretch"):
             st.rerun()
-        if armed:
-            st.caption(f"Press **Confirm** to delete {row['name']}. Its students stay on your roster.")
+        return
+    members = team_student_ids(class_id)
+    through = [quiz["title"] for quiz in quizzes_for_teacher(user["id"])
+               if members and members <= assigned_student_ids(quiz["id"])]
+    count = f"{len(members)} student{'s' if len(members) != 1 else ''}"
+    st.warning(
+        f"Deleting **{text(target['name'])}** removes the class itself"
+        + (f" and takes its {count} out of it" if members else "")
+        + ". **This cannot be undone** -- to get it back you would have to create the class again and "
+        "re-sort every student into it."
+    )
+    st.markdown(
+        "- Its students **stay on your roster** and keep every result they have.\n"
+        "- Assessments assigned through it **stay assigned** to those students.\n"
+        "- It disappears from the **Assign to classes** choices on Create quiz and Manage."
+    )
+    if through:
+        shown = ", ".join(f"**{text(title)}**" for title in through[:5]) + (f" and {len(through) - 5} more" if len(through) > 5 else "")
+        st.caption(f"Still assigned to its students afterwards: {shown}.")
+    confirm, cancel = st.columns(2)
+    if confirm.button(f"Yes, delete {target['name']}", key=f"confirm-class-delete-{class_id}", type="primary", width="stretch"):
+        delete_class(user["id"], class_id)
+        flash("classes", f"Class **{target['name']}** deleted. Its {count} are still on your roster, and "
+                         "assessments already assigned to them stay assigned." if members else
+                         f"Class **{target['name']}** deleted.")
+        st.session_state["class-epoch"] = int(st.session_state.get("class-epoch", 0)) + 1
+        st.rerun()
+    if cancel.button("Cancel", key=f"cancel-class-delete-{class_id}", width="stretch"):
+        st.rerun()
 
 
 def roster_page(user) -> None:
