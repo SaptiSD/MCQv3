@@ -15,7 +15,7 @@ streamlit run app.py
 Supabase credentials come from `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`
 environment variables, or the `[supabase]` section of `.streamlit/secrets.toml`
 (gitignored). Copy `.streamlit/example.secrets.toml` to start one: it lists every
-setting the app reads, including the optional Google sign-in and Gemini sections.
+setting the app reads, including Google sign-in and the optional OpenAI section.
 The schema lives in `supabase/schema.sql`.
 
 > The local setup points at the **live** database. Prefix anything you create
@@ -28,18 +28,34 @@ Credentials are scoped to their panel: a student account signing in on the
 teacher side is told to use the other one, and vice versa. Admins sign in on the
 teacher side and land in the admin console.
 
-There is no approval queue. Signing in with Google from a panel creates that
-kind of account immediately; if the OAuth round trip loses which panel was used,
-the app asks once and creates the account on the spot.
+**Everyone signs in with Google.** There are no MCQ passwords on the live site:
+every student and teacher has a school Google account. Signing in from a panel
+creates that kind of account immediately; if the OAuth round trip loses which
+panel was used, the app asks once and creates the account on the spot. An
+account a teacher or admin adds by email is found by Google sign-in the first
+time that person arrives.
+
+The email-and-password form survives only for testing: it is drawn when
+`[app] allow_password_login = true` is set in `secrets.toml`, or when no Google
+client is configured at all, and it is labelled *Local testing only*. Never set
+the flag on the live host.
 
 **Students must choose a teacher before they can do anything.** A student with
 no teacher sees a blocking picker, searches for their teacher by name or email,
 and on joining picks up every assessment that teacher had already given the
 whole class. They can add or leave teachers later from **My teachers**.
 
-Passwords are stored as salted PBKDF2-SHA256 hashes. Rows written before that
-change are still plaintext; they are verified as-is and rehashed on that
-account's next successful sign-in.
+Where passwords are used (local testing), they are stored as salted
+PBKDF2-SHA256 hashes. Rows written before that change are still plaintext; they
+are verified as-is and rehashed on that account's next successful sign-in.
+
+## Activating an assessment
+
+A published assessment is **inactive** until its teacher presses **Activate** on
+the dashboard; only then does it reach assigned students, within its opening and
+closing times. **Deactivate** hides it again without touching any attempt. Times
+are read and shown in the class's zone, `[app] timezone` (default
+`America/Chicago`), not the server's.
 
 ## Question types
 
@@ -85,20 +101,20 @@ before and anything that would save some says what to run.
 ### Reading with AI (optional)
 
 For files the rule-based reader cannot follow, **Read with AI** sends the file's
-text to Google Gemini (`ai_reader.py`). It appears only when a key is configured:
+text to OpenAI (`ai_reader.py`). It appears only when a key is configured:
 
 ```toml
 # .streamlit/secrets.toml
-[gemini]
+[openai]
 api_key = "..."
 # optional; tried in order, and retired models fall through to the next
-models = ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
+models = ["gpt-5.4-mini", "gpt-4.1-mini"]
 ```
 
 The model transcribes and never answers: an answer it cannot point to in the
 file is dropped, and the table read straight out of the `.docx` is kept in
-preference to the model's copy of it. On AI Studio's free tier Google may use
-what is sent to improve its products, so don't send files with personal data.
+preference to the model's copy of it. Don't send files with students' personal
+data.
 
 ## Documentation
 
@@ -112,7 +128,4 @@ python instructions/build_instructions.py
 
 ## TODO
 
-- [ ] Configure an email provider (e.g., SMTP) to send welcome emails on signup
-      and password-reset emails for the "forgot password" flow.
-- [ ] Students added to a roster by a teacher have no password, so they can only
-      sign in with Google until the invite flow above exists.
+- [ ] Configure an email provider (e.g., SMTP) to send welcome emails on signup.

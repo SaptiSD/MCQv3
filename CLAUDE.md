@@ -31,6 +31,9 @@ Seeded by `db.seed_demo_data()` on startup. All on the live database.
 | Admin | `admin@mcq.local` | `admin` |
 
 Teachers and admins sign in on the **left** panel, students on the **right**.
+The live site is Google-only; the password form exists locally because
+`.streamlit/secrets.toml` sets `[app] allow_password_login = true`. Never set
+that flag on the live host.
 Credentials are scoped to their panel and the app says so if you pick wrong.
 
 **Real people use this database.** Owner id 17 is a real tester; other rows are
@@ -58,6 +61,7 @@ for t in test_*.py; do .venv/Scripts/python.exe $t; done
 | `test_ingestion.py` | upload layouts, answer marks, case material, exports |
 | `test_ai_reader.py` | the OpenAI reader with the network faked out |
 | `test_activation.py` | quizzes stay hidden until activated; the class's clock (live DB, ZZTEST rows) |
+| `test_classes.py` | class lists (paste/CSV), bulk moves, the gradebook (live DB, ZZTEST rows) |
 
 `.venv/Scripts/python.exe -m pyflakes *.py` should print nothing.
 
@@ -76,6 +80,7 @@ attempt_sync.py     keeping an attempt in step with its quiz. Pure.
 ingestion.py        question-bank upload: blocks, layouts, answer marks,
                     case material. Pure.
 local_time.py       the class's time zone for every opening/closing time
+roster_import.py    reading a pasted or CSV class list. Pure.
 ai_reader.py        the optional OpenAI reader for files ingestion can't
                     follow. No Streamlit, no database; one HTTPS call.
 server_state.py     state outliving one browser tab (sign-out epochs,

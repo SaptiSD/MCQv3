@@ -287,11 +287,40 @@ def _oidc_configured() -> bool:
         return False
 
 
+def password_login_enabled() -> bool:
+    """Whether email-and-password sign-in exists at all.
+
+    Everyone signs in with Google: every student and teacher has a school
+    Google account, and a second, password-based way in was one more thing to
+    reset, leak and support. Passwords survive only where Google cannot be
+    used -- a local checkout with no OAuth client, or a test server that sets
+    `[app] allow_password_login = true` so automated testing can sign in as the
+    seeded ZZTEST accounts. The live site sets neither.
+    """
+    if not _oidc_configured():
+        return True
+    try:
+        return bool(st.secrets.get("app", {}).get("allow_password_login", False))
+    except Exception:
+        return False
+
+
 def _login_panel(side: str, eyebrow: str, heading: str, blurb: str, google_ready: bool) -> None:
     """One half of the split login. `side` is "teacher" or "student"."""
     with st.container(border=True):
         st.markdown(f'<div class="eyebrow">{text(eyebrow)}</div><h3>{text(heading)}</h3>', unsafe_allow_html=True)
         st.caption(blurb)
+        if google_ready:
+            if st.button("Sign in with Google", key=f"google-{side}", type="primary", width="stretch"):
+                st.session_state.pop("needs_sign_in", None)
+                st.session_state.signup_role = side
+                st.login("google")
+            st.caption(f"Use your school Google account. The first time you sign in from this side, a "
+                       f"{ROLE_LABELS[side]} account is created for you.")
+        if not password_login_enabled():
+            return
+        if google_ready:
+            st.caption(":material/science: **Local testing only** — password sign-in is switched off on the live site.")
         with st.form(f"login-{side}"):
             identifier = st.text_input("Email or full name", key=f"login-id-{side}")
             password = st.text_input("Password", type="password", key=f"login-pw-{side}")
@@ -312,12 +341,6 @@ def _login_panel(side: str, eyebrow: str, heading: str, blurb: str, google_ready
                     # twice and should keep both. Only signing out invalidates.
                     server_state.stamp_session(user)
                     st.rerun()
-        if google_ready:
-            if st.button("Continue with Google", key=f"google-{side}", width="stretch"):
-                st.session_state.pop("needs_sign_in", None)
-                st.session_state.signup_role = side
-                st.login("google")
-            st.caption(f"New here? Signing in with Google from this side creates a {ROLE_LABELS[side]} account.")
 
 
 def portal_mismatch_message(role: str) -> str:

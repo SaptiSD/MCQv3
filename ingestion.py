@@ -433,8 +433,9 @@ class _Reader:
         left out instead, and the notes name them.
         """
         if _KEY_LINE.match(line) or _CORRECT_IS.match(line) or _EMAIL.search(line) or _REVIEW_PAGE.search(line):
+            # Not `_settle()`: a passage still being gathered for the next
+            # question must not be cut short by a stray line in the middle of it.
             self.review_page = self.review_page or bool(_REVIEW_PAGE.search(line))
-            self._settle()
             self.ignored.append(line)
             return
         self.pending.append(line)

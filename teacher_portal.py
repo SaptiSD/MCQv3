@@ -18,16 +18,19 @@ import ai_reader
 import grading
 import ingestion
 import local_time
+import roster_import
 import server_state
 from ui import (empty_state, flash, markdown_source, metric_row, page_header, percent, pill, require_session,
                 show_flash, text, when)
-from repository import (ACTIVE, add_student_to_roster, assigned_student_ids, create_quiz, set_quiz_active,
+from repository import (ACTIVE, add_student_to_roster, assigned_student_ids, class_memberships, create_class,
+                        create_quiz, delete_class, enrol_by_email, move_students_to_class, rename_class,
+                        set_quiz_active,
                         delete_quiz, move_question, questions_for_quiz, quiz_attempt_counts,
                         quiz_counts_for_teacher, quiz_for_teacher, quizzes_for_teacher,
-                        quiz_has_attempts, regrade_quiz, save_case_material, save_question_bank,
+                        gradebook, quiz_has_attempts, regrade_quiz, save_case_material, save_question_bank,
                         set_quiz_assignments, students,
                         student_analytics, student_detail_analytics, student_progress_for_quiz,
-                        set_team_members, student_ids_for_teams, team_student_ids, teams_for_student, teams_for_teacher,
+                        student_ids_for_teams, team_student_ids, teams_for_teacher,
                         teacher_analytics, update_quiz_settings)
 
 
@@ -405,6 +408,13 @@ def analytics_page(user) -> None:
         (len(students_data), "Students tracked"),
     ], per_row=3)
     st.divider()
+    st.subheader("Scores")
+    st.caption("Every student on your roster with their class, and one column per assessment: their most recent "
+               "submitted score, blank if they haven't handed it in. Opens in Excel or Google Sheets.")
+    st.download_button("Download gradebook (CSV) — all students, all assessments",
+                       lambda: _gradebook_csv(user["id"]), f"gradebook-{local_time.today().isoformat()}.csv",
+                       "text/csv", type="primary", on_click="ignore", key="gradebook-csv", width="stretch")
+    st.divider()
     st.subheader("Student performance")
     if students_data:
         st.dataframe(pd.DataFrame([{"Student": row["name"], "Email": row["email"], "Assigned": row["assigned_quizzes"], "Attempts": row["attempts"], "Completed": row["completed"], "Average score": f"{row['average_score']:.1f}%" if row["average_score"] is not None else "-", "Pass rate": f"{row['pass_rate'] * 100:.0f}%" if row["pass_rate"] is not None else "-", "Last activity": when(row["last_activity"])} for row in students_data]), width="stretch", hide_index=True)
@@ -423,7 +433,14 @@ def analytics_page(user) -> None:
                 progress = [row for row in progress if search.lower() in row["student"].lower() or search.lower() in row["email"].lower()]
             counts = {status: sum(row["status"] == status for row in progress) for status in ("Not started", "In progress", "Completed")}
             metric_row([(counts["Not started"], "Not started"), (counts["In progress"], "In progress"), (counts["Completed"], "Completed")], per_row=3)
-            st.dataframe(pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Status": row["status"], "Score": percent(row["score"]), "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress]), width="stretch", hide_index=True)
+            classes = _class_names_by_student(user["id"])
+            st.dataframe(pd.DataFrame([{"Student": row["student"], "Email": row["email"], "Class": classes.get(row["student_id"], ""), "Status": row["status"], "Score": percent(row["score"]), "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress]), width="stretch", hide_index=True)
+            # The quiz is in the key: a deferred download's element id comes
+            # from its key, so a fixed one served the previously chosen exam.
+            st.download_button(f"Download scores for {quiz_options[selected_quiz_id]} (CSV)",
+                               lambda: _results_csv(progress, classes), _csv_name(quiz_options[selected_quiz_id]),
+                               "text/csv", on_click="ignore",
+                               key=f"analytics-scores-{selected_quiz_id}-{search.strip()}")
         else:
             st.info("No students are assigned to this exam yet.")
 
@@ -616,13 +633,14 @@ def _create_settings_section(user, form: dict) -> None:
         with closing_date: st.date_input("Closes on", form.get("new-closing-day", tomorrow), key=_ck("new-closing-day"), disabled=not closing_enabled, on_change=_create_save_setting, args=("new-closing-day",))
         with closing_time: st.time_input("Closing time", form.get("new-closing-clock", time(17, 0)), key=_ck("new-closing-clock"), disabled=not closing_enabled, on_change=_create_save_setting, args=("new-closing-clock",))
         st.divider(); st.subheader("Audience")
-        audience_mode = st.radio("Assign to", ["All", "Students", "Teams"], horizontal=True, key=_ck("new-audience-mode"),
-                                 index=0 if form.get("new-audience-mode") != "Students" and form.get("new-audience-mode") != "Teams" else 1 if form.get("new-audience-mode") == "Students" else 2,
+        stored_mode = {"Teams": "Classes"}.get(form.get("new-audience-mode"), form.get("new-audience-mode"))
+        audience_mode = st.radio("Assign to", ["All", "Students", "Classes"], horizontal=True, key=_ck("new-audience-mode"),
+                                 index=["All", "Students", "Classes"].index(stored_mode) if stored_mode in ("Students", "Classes") else 0,
                                  on_change=_create_save_setting, args=("new-audience-mode",))
         if audience_mode == "Students":
             st.multiselect("Assign to students", options=students(user["id"]), default=form.get("new-selected", []), format_func=lambda row: f"{row['name']}  ·  {row['email']}", key=_ck("new-selected"), on_change=_create_save_setting, args=("new-selected",))
-        elif audience_mode == "Teams":
-            st.multiselect("Assign to teams", options=teams_for_teacher(user["id"]), default=form.get("new-team-selected", []), format_func=lambda team: team["name"], key=_ck("new-team-selected"), on_change=_create_save_setting, args=("new-team-selected",))
+        elif audience_mode == "Classes":
+            st.multiselect("Assign to classes", options=teams_for_teacher(user["id"]), default=form.get("new-team-selected", []), format_func=lambda team: team["name"], key=_ck("new-team-selected"), on_change=_create_save_setting, args=("new-team-selected",))
 
 
 def create(user) -> None:
@@ -812,7 +830,8 @@ def _quiz_downloads(quiz, questions: list | None = None) -> None:
         return
     progress = student_progress_for_quiz(quiz["owner_id"], quiz["id"])
     if progress:
-        st.download_button("Download results CSV", lambda: _results_csv(progress), "student-results.csv", "text/csv", on_click="ignore", key=f"results-download-{quiz['id']}")
+        classes = _class_names_by_student(quiz["owner_id"])
+        st.download_button("Download results CSV", lambda: _results_csv(progress, classes), _csv_name(quiz["title"]), "text/csv", on_click="ignore", key=f"results-download-{quiz['id']}")
     else:
         st.info("No students are assigned to this exam yet.")
     if questions is None:
@@ -839,14 +858,32 @@ def _quiz_downloads(quiz, questions: list | None = None) -> None:
     st.download_button("Download printable DOCX", lambda: _render_quiz_docx(quiz, questions), "quiz.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", on_click="ignore", key=f"docx-{quiz['id']}")
 
 
-def _results_csv(progress) -> bytes:
+def _results_csv(progress, classes: dict[int, str] | None = None) -> bytes:
     # One decimal, the same as the screen: a raw 33.33333333333333 in a
     # spreadsheet column helps nobody and still sorts correctly rounded.
+    classes = classes or {}
     frame = pd.DataFrame([{"Student": row["student"], "Email": row["email"],
+                           "Class": classes.get(row.get("student_id"), ""),
                            "Status": row["status"] if row.get("assigned", True) else f"{row['status']} · unassigned",
                            "Score": round(row["score"], 1) if row["score"] is not None else None,
                            "Result": row["result"], "Last activity": when(row["last_activity"])} for row in progress])
     return frame.to_csv(index=False).encode("utf-8")
+
+
+def _class_names_by_student(teacher_id: int) -> dict[int, str]:
+    names = {row["id"]: row["name"] for row in teams_for_teacher(teacher_id)}
+    return {student_id: ", ".join(sorted(names[c] for c in class_ids if c in names))
+            for student_id, class_ids in class_memberships(teacher_id).items()}
+
+
+def _csv_name(title: str, suffix: str = "scores") -> str:
+    stem = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower() or "quiz"
+    return f"{stem}-{suffix}-{local_time.today().isoformat()}.csv"
+
+
+def _gradebook_csv(teacher_id: int) -> bytes:
+    book = gradebook(teacher_id)
+    return pd.DataFrame(book["rows"], columns=book["columns"]).to_csv(index=False).encode("utf-8")
 
 
 def _question_bank_csv(questions) -> bytes:
@@ -1008,7 +1045,7 @@ def manage_quiz(user, quiz_id: int) -> None:
             settings_editor(quiz)
         else:
             question_bank(quiz)
-        with st.expander("Assign by students or teams · View results"):
+        with st.expander("Assign by students or classes · View results"):
             assignment_editor(quiz)
             results(quiz)
         regrade_controls(quiz, user, attempts["submitted"])
@@ -1931,9 +1968,9 @@ def settings_editor(quiz) -> None:
 def assignment_editor(quiz) -> None:
     roster = students(quiz["owner_id"]); current = assigned_student_ids(quiz["id"])
     st.write("Choose who can see this assessment")
-    st.caption("Select 'All' to assign every student on your roster, or choose specific students or teams.")
+    st.caption("Select 'All' to assign every student on your roster, or choose specific students or classes.")
     is_all = len(roster) > 0 and len(current) == len(roster)
-    audience_mode = st.radio("Assign to", ["All", "Students", "Teams"], horizontal=True, index=0 if is_all else 1, key=f"assigned-mode-{quiz['id']}")
+    audience_mode = st.radio("Assign to", ["All", "Students", "Classes"], horizontal=True, index=0 if is_all else 1, key=f"assigned-mode-{quiz['id']}")
     if audience_mode == "All":
         selected_ids = [row["id"] for row in roster]
     elif audience_mode == "Students":
@@ -1946,14 +1983,14 @@ def assignment_editor(quiz) -> None:
         # to hit Save and unassign everyone.
         already = [team for team in all_teams
                    if (members := team_student_ids(team["id"])) and members <= current]
-        selected_teams = st.multiselect("Assigned teams", options=all_teams, default=already,
+        selected_teams = st.multiselect("Assigned classes", options=all_teams, default=already,
                                         format_func=lambda team: team["name"], key=f"assigned-teams-{quiz['id']}")
         selected_ids = list(student_ids_for_teams(quiz["owner_id"], [team["id"] for team in selected_teams]))
     if st.button("Save assignment", type="primary", key=f"assign-save-{quiz['id']}"):
         set_quiz_assignments(quiz["id"], selected_ids)
         count = len(set(selected_ids))
         if count:
-            # Say the number out loud: picking "Teams" and saving without
+            # Say the number out loud: picking "Classes" and saving without
             # choosing one silently unassigned the whole class.
             st.success(f"Assignment updated — {count} student{'s' if count != 1 else ''} can see this assessment.")
         else:
@@ -1971,6 +2008,212 @@ def results(quiz) -> None:
     st.dataframe(frame, width="stretch", hide_index=True)
 
 
+NO_CLASS = "— no class —"
+
+
+def _classes_section(user, roster, classes) -> None:
+    """Create classes and sort the roster into them -- many students at a time.
+
+    TAs sorting two classes of thirty did it one member at a time, through a
+    per-team multiselect that had to be scrolled and saved for every student.
+    And there was no way to create a class on screen at all.
+    """
+    with st.container(border=True):
+        st.subheader("Classes")
+        show_flash("classes")
+        st.caption("A class is a group of students on your roster -- a section, say. Assign a quiz to whole classes "
+                   "from **Create quiz** or **Manage**.")
+        epoch = int(st.session_state.get("class-epoch", 0))
+        name_column, add_column = st.columns([4, 1], vertical_alignment="bottom")
+        new_name = name_column.text_input("New class name", placeholder="e.g. Section 501", key=f"new-class-name-{epoch}")
+        if add_column.button("Create class", key="create-class", width="stretch"):
+            try:
+                create_class(user["id"], new_name)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                flash("classes", f"Class **{' '.join(new_name.split())}** created.")
+                st.session_state["class-epoch"] = epoch + 1
+                st.rerun()
+        if not classes:
+            st.info("Create your classes above, then sort your students into them here.")
+            return
+        sort_tab, list_tab, manage_tab = st.tabs(["Sort students", "Add from a list", "Rename or delete"])
+        with sort_tab:
+            _sort_into_classes(user, roster, classes, epoch)
+        with list_tab:
+            _enrol_from_list(user, classes, epoch)
+        with manage_tab:
+            _manage_classes(user, classes, epoch)
+
+
+def _sort_into_classes(user, roster, classes, epoch: int) -> None:
+    names = {row["id"]: row["name"] for row in classes}
+    memberships = class_memberships(user["id"])
+
+    def label(student_id: int) -> str:
+        mine = [names[class_id] for class_id in memberships.get(student_id, []) if class_id in names]
+        return ", ".join(sorted(mine)) if mine else NO_CLASS
+
+    labels = {row["id"]: label(row["id"]) for row in roster}
+    counts = [f"**{name}** {sum(1 for value in labels.values() if value == name)}" for name in names.values()]
+    counts.append(f"**not in a class** {sum(1 for value in labels.values() if value == NO_CLASS)}")
+    st.caption(" · ".join(counts))
+    if not roster:
+        st.info("Your roster is empty. Add students under **Add from a list**.")
+        return
+    show_column, search_column = st.columns(2)
+    show = show_column.selectbox("Show", ["Everyone", "Not in a class yet", *names.values()], key=f"class-show-{epoch}")
+    search = search_column.text_input("Search", placeholder="Name or email", key=f"class-search-{epoch}").strip().casefold()
+    tick_all = bool(st.session_state.get(f"class-tick-all-{epoch}"))
+    shown = [row for row in roster
+             if (show == "Everyone" or (show == "Not in a class yet" and labels[row["id"]] == NO_CLASS)
+                 or labels[row["id"]] == show)
+             and (not search or search in row["name"].casefold() or search in row["email"].casefold())]
+    # The editor's edits are stored relative to the rows it was first drawn
+    # with, so those rows are pinned for as long as this key lives, and every
+    # write moves to a new key -- the same rule as the upload review table.
+    editor_key = f"class-sort-{epoch}-{show}-{search}-{int(tick_all)}"
+    pin = f"class-base-{editor_key}"
+    for stale in [key for key in st.session_state if str(key).startswith("class-base-") and key != pin]:
+        st.session_state.pop(stale, None)
+    if pin not in st.session_state:
+        st.session_state[pin] = [{"Move": tick_all, "Student": row["name"], "Email": row["email"],
+                                  "Class": labels[row["id"]], "id": row["id"]} for row in shown]
+    base = st.session_state[pin]
+    options = list(dict.fromkeys([NO_CLASS, *names.values(), *(row["Class"] for row in base)]))
+    edited = st.data_editor(
+        pd.DataFrame(base, columns=["Move", "Student", "Email", "Class", "id"]),
+        key=editor_key, hide_index=True, width="stretch", column_order=["Move", "Student", "Email", "Class"],
+        disabled=["Student", "Email"],
+        column_config={
+            "Move": st.column_config.CheckboxColumn("Tick", width="small", help="Tick students, then move them all at once below."),
+            "Class": st.column_config.SelectboxColumn("Class", options=options, required=True,
+                                                      help="Change it here, then press Save class changes."),
+        },
+    )
+    rows = edited.to_dict("records")
+    ticked = [row["id"] for row in rows if row["Move"]]
+    tick_column, untick_column = st.columns(2)
+    if tick_column.button(f"Tick all {len(shown)} shown", key=f"class-tick-{epoch}", width="stretch"):
+        st.session_state[f"class-tick-all-{epoch}"] = True
+        st.rerun()
+    if untick_column.button("Untick all", key=f"class-untick-{epoch}", width="stretch"):
+        st.session_state[f"class-tick-all-{epoch}"] = False
+        st.rerun()
+    target_column, move_column = st.columns([3, 2], vertical_alignment="bottom")
+    target = target_column.selectbox("Move the ticked students to", [*names.values(), NO_CLASS], key=f"class-target-{epoch}")
+    by_name = {name: class_id for class_id, name in names.items()}
+    if move_column.button(f"Move {len(ticked)} ticked", key=f"class-move-{epoch}", type="primary",
+                          width="stretch", disabled=not ticked):
+        moved = move_students_to_class(user["id"], ticked, by_name.get(target))
+        flash("classes", f"{moved} student{'s' if moved != 1 else ''} moved to **{target}**.")
+        st.session_state["class-epoch"] = epoch + 1
+        st.rerun()
+    changed: dict[str, list[int]] = {}
+    for row, before in zip(rows, base):
+        if row["Class"] != before["Class"] and (row["Class"] in by_name or row["Class"] == NO_CLASS):
+            changed.setdefault(row["Class"], []).append(row["id"])
+    if st.button(f"Save class changes ({sum(len(ids) for ids in changed.values())})", key=f"class-save-{epoch}",
+                 width="stretch", disabled=not changed):
+        for name, ids in changed.items():
+            move_students_to_class(user["id"], ids, by_name.get(name))
+        flash("classes", "Saved: " + "; ".join(f"{len(ids)} to **{name}**" for name, ids in changed.items()) + ".")
+        st.session_state["class-epoch"] = epoch + 1
+        st.rerun()
+    st.caption("A student is in one class at a time: moving them takes them out of your other classes.")
+
+
+def _enrol_from_list(user, classes, epoch: int) -> None:
+    names = {row["id"]: row["name"] for row in classes}
+    by_name = {name.casefold(): class_id for class_id, name in names.items()}
+    st.caption("Paste email addresses -- one per line, copied straight from a spreadsheet, or a whole To: line -- "
+               "or upload a CSV with an **email** column and, if you like, **name** and **class** columns. Students "
+               "who haven't signed in yet are added under their email; Google sign-in finds them when they arrive.")
+    st.download_button("Download a CSV template", roster_import.template_csv(), "class-list-template.csv",
+                       "text/csv", key="class-template")
+    pasted = st.text_area("Paste students", height=140, key=f"enrol-paste-{epoch}",
+                          placeholder="jordan.lee@tamu.edu\nSam Ortiz <sam.ortiz@tamu.edu>")
+    upload = st.file_uploader("...or upload a CSV", type=["csv", "txt"], key=f"enrol-file-{epoch}")
+    reading = roster_import.read_upload(upload.getvalue()) if upload else roster_import.parse(pasted)
+    rows = reading["rows"]
+    for problem in reading["problems"][:5]:
+        st.caption(f"Skipped -- {problem}.")
+    if not rows:
+        return
+    if reading["has_classes"]:
+        unknown = sorted({row["class"] for row in rows if row["class"] and row["class"].casefold() not in by_name})
+        st.write(f"**{len(rows)}** student{'s' if len(rows) != 1 else ''} found, each with the class the list gives.")
+        create_missing = True
+        if unknown:
+            create_missing = st.checkbox(f"Create the class{'es' if len(unknown) != 1 else ''} that don't exist yet: "
+                                         + ", ".join(unknown), value=True, key=f"enrol-create-{epoch}")
+    else:
+        target = st.selectbox("Put them in", [*names.values(), "No class — roster only"], key=f"enrol-target-{epoch}")
+        st.write(f"**{len(rows)}** student{'s' if len(rows) != 1 else ''} found.")
+    st.dataframe(pd.DataFrame(rows).rename(columns=str.title), hide_index=True, width="stretch", height=180)
+    if not st.button(f"Add {len(rows)} student{'s' if len(rows) != 1 else ''}", key=f"enrol-go-{epoch}", type="primary",
+                     width="stretch"):
+        return
+    groups: dict[int | None, list[tuple[str, str]]] = {}
+    for row in rows:
+        if reading["has_classes"]:
+            wanted = row["class"]
+            class_id = by_name.get(wanted.casefold()) if wanted else None
+            if wanted and class_id is None and create_missing:
+                class_id = by_name[wanted.casefold()] = create_class(user["id"], wanted)
+        else:
+            class_id = next((class_id for class_id, name in names.items() if name == target), None)
+        groups.setdefault(class_id, []).append((row["email"], row["name"]))
+    totals = {"added": 0, "already": 0, "placed": 0, "not_students": [], "invalid": []}
+    for class_id, entries in groups.items():
+        report = enrol_by_email(user["id"], entries, class_id)
+        totals["added"] += len(report["added"])
+        totals["already"] += len(report["already"])
+        totals["placed"] += report["placed"]
+        totals["not_students"] += report["not_students"]
+        totals["invalid"] += report["invalid"]
+    message = (f"{totals['added']} added to your roster, {totals['already']} already on it; "
+               f"{totals['placed']} placed in a class.")
+    if totals["not_students"]:
+        message += " Not added, because they are teacher accounts: " + ", ".join(totals["not_students"][:5]) + "."
+    if totals["invalid"]:
+        message += " Not email addresses: " + ", ".join(totals["invalid"][:5]) + "."
+    flash("classes", message)
+    st.session_state["class-epoch"] = epoch + 1
+    st.rerun()
+
+
+def _manage_classes(user, classes, epoch: int) -> None:
+    for row in classes:
+        name_column, save_column, delete_column = st.columns([4, 1, 1], vertical_alignment="bottom")
+        new_name = name_column.text_input("Class name", value=row["name"], key=f"class-name-{row['id']}-{epoch}")
+        if save_column.button("Rename", key=f"class-rename-{row['id']}", width="stretch",
+                              disabled=" ".join(new_name.split()) == row["name"]):
+            try:
+                rename_class(user["id"], row["id"], new_name)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                flash("classes", f"Renamed to **{' '.join(new_name.split())}**.")
+                st.session_state["class-epoch"] = epoch + 1
+                st.rerun()
+        armed = st.session_state.get("class-delete-armed") == row["id"]
+        if delete_column.button("Confirm" if armed else "Delete", key=f"class-delete-{row['id']}",
+                                type="primary" if armed else "secondary", width="stretch"):
+            if not armed:
+                st.session_state["class-delete-armed"] = row["id"]
+                st.rerun()
+            delete_class(user["id"], row["id"])
+            st.session_state.pop("class-delete-armed", None)
+            flash("classes", f"Class **{row['name']}** deleted. Its students are still on your roster, and quizzes "
+                             "already assigned through it stay assigned.")
+            st.session_state["class-epoch"] = epoch + 1
+            st.rerun()
+        if armed:
+            st.caption(f"Press **Confirm** to delete {row['name']}. Its students stay on your roster.")
+
+
 def roster_page(user) -> None:
     roster = students(user["id"])
     performance = student_analytics(user["id"])
@@ -1984,7 +2227,7 @@ def roster_page(user) -> None:
         matches = [row for row in students() if not lookup.strip() or lookup.lower() in row["name"].lower() or lookup.lower() in row["email"].lower()]
         if matches:
             existing = st.selectbox("Find student", matches, format_func=lambda row: f"{row['name']} · {row['email']}", key="existing-student")
-            existing_team_id = st.selectbox("Add to team", [None, *team_options], format_func=lambda value: "No team" if value is None else team_options[value], key="existing-student-team")
+            existing_team_id = st.selectbox("Add to class", [None, *team_options], format_func=lambda value: "No class" if value is None else team_options[value], key="existing-student-team")
             if st.button("Add an existing student to roster", type="primary", width="stretch"):
                 add_student_to_roster(user["id"], existing["name"], existing["email"], existing_team_id)
                 flash("roster-existing", f"{existing['name']} was added to your roster.")
@@ -1997,7 +2240,7 @@ def roster_page(user) -> None:
         with st.form("add-student"):
             name = st.text_input("Student name", placeholder="e.g. Jordan Lee")
             email = st.text_input("Student email", placeholder="student@example.com")
-            team_id = st.selectbox("Add to team", [None, *team_options], format_func=lambda value: "No team" if value is None else team_options[value], key="new-student-team")
+            team_id = st.selectbox("Add to class", [None, *team_options], format_func=lambda value: "No class" if value is None else team_options[value], key="new-student-team")
             submitted = st.form_submit_button("Add a new student", type="primary", width="stretch")
         if submitted:
             if not name.strip() or "@" not in email:
@@ -2009,38 +2252,12 @@ def roster_page(user) -> None:
                     st.error(str(exc))
                 else:
                     flash("roster-new", f"{name.strip()} was added to your roster."); st.rerun()
-    with st.container(border=True):
-        st.subheader("Teams")
-        st.caption("Choose a team to see its members. Use the optional search to add someone without opening the member list.")
-        for team in teams:
-            member_ids = team_student_ids(team["id"])
-            # The epoch renames the box after every write. A Streamlit widget key
-            # outranks the `default=` it is re-rendered with, so after "Add
-            # member" the list still showed the membership from before the click
-            # -- contradicting the header right above it -- and "Save members"
-            # then wrote that stale list back, silently deleting the person who
-            # had just been added while reporting "Team updated."
-            epoch = int(st.session_state.get(f"team-epoch-{team['id']}", 0))
-            with st.expander(f"{team['name']} · {len(member_ids)} member{'s' if len(member_ids) != 1 else ''}"):
-                members = st.multiselect("Members", roster, default=[row for row in roster if row["id"] in member_ids], format_func=lambda row: f"{row['name']} · {row['email']}", key=f"team-members-{team['id']}-{epoch}")
-                show_search = st.checkbox("Show search to add a member", key=f"show-team-search-{team['id']}")
-                if show_search:
-                    member_search = st.text_input("Search roster", placeholder="Search by name or email", key=f"team-search-{team['id']}")
-                    matches = [row for row in roster if not member_search.strip() or member_search.lower() in row["name"].lower() or member_search.lower() in row["email"].lower()]
-                    if matches:
-                        candidate = st.radio("Add member", matches, format_func=lambda row: f"{row['name']} · {row['email']}", key=f"team-candidate-{team['id']}")
-                        if st.button("Add member", key=f"add-team-member-{team['id']}"):
-                            members = [*members, candidate] if candidate["id"] not in {row["id"] for row in members} else members
-                            set_team_members(team["id"], [row["id"] for row in members])
-                            st.session_state[f"team-epoch-{team['id']}"] = epoch + 1
-                            st.rerun()
-                if st.button("Save members", key=f"save-team-{team['id']}"):
-                    set_team_members(team["id"], [row["id"] for row in members])
-                    st.success("Team updated.")
+    _classes_section(user, roster, teams)
     with st.container(border=True):
         st.subheader(f"Your Roster (of students) · {len(roster)}")
         if roster:
-            stats = [{"Student": row["name"], "Email": row["email"], "Team": ", ".join(team["name"] for team in teams_for_student(user["id"], row["id"])), "Assigned": row["assigned_quizzes"], "Attempts": row["attempts"], "Completed": row["completed"], "Average": f"{row['average_score']:.1f}%" if row["average_score"] is not None else "-", "Pass rate": f"{row['pass_rate'] * 100:.0f}%" if row["pass_rate"] is not None else "-"} for row in performance]
+            memberships = class_memberships(user["id"])
+            stats = [{"Student": row["name"], "Email": row["email"], "Class": ", ".join(sorted(team_options[class_id] for class_id in memberships.get(row["id"], []) if class_id in team_options)), "Assigned": row["assigned_quizzes"], "Attempts": row["attempts"], "Completed": row["completed"], "Average": f"{row['average_score']:.1f}%" if row["average_score"] is not None else "-", "Pass rate": f"{row['pass_rate'] * 100:.0f}%" if row["pass_rate"] is not None else "-"} for row in performance]
             st.dataframe(pd.DataFrame(stats), width="stretch", hide_index=True)
             st.caption("Select a student below to view detailed analytics.")
             for row in performance:
@@ -2068,7 +2285,7 @@ def student_detail_dialog(user, student_id: int) -> None:
     student = detail["student"]
     st.subheader(student["name"])
     st.caption(student["email"])
-    st.write("Teams: " + (", ".join(team["name"] for team in detail["teams"]) or "No team"))
+    st.write("Class: " + (", ".join(team["name"] for team in detail["teams"]) or "No class"))
     results_data = [
         {
             "Test": row["title"],

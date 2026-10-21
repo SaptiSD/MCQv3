@@ -22,9 +22,12 @@ from streamlit.testing.v1 import AppTest
 HERE = Path(__file__).parent
 HARNESS = HERE / "_admin_edit_harness.py"
 
-# Text boxes in render order: three for "Add", then three for "Edit".
-EDIT_NAME, EDIT_EMAIL = 3, 4
-ADMIN_EDIT_EMAIL, ADMIN_EDIT_NAME = 9, 10
+# Text boxes in render order, per sign-in mode. With passwords: three for
+# "Add", then three for "Edit". Google-only (the live site) has no password box.
+POSITIONS = {
+    True: {"edit_name": 3, "edit_email": 4, "admin_edit_email": 9, "admin_edit_name": 10},
+    False: {"edit_name": 2, "edit_email": 3, "admin_edit_email": 6, "admin_edit_name": 7},
+}
 
 # A standalone script for AppTest to execute. It stubs out the database so the
 # test exercises widget state and nothing else.
@@ -43,6 +46,7 @@ ADMINS = [
     {{"id": 11, "name": "Second Admin", "email": "second@example.com"}},
 ]
 
+admin_portal.password_login_enabled = lambda: {passwords}
 admin_portal.users_by_role = lambda role: TEACHERS if role == "teacher" else []
 admin_portal.admins_list = lambda: ADMINS
 
@@ -61,11 +65,26 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def main() -> int:
-    HARNESS.write_text(HARNESS_SOURCE.format(here=str(HERE)), encoding="utf-8")
+    for passwords in (True, False):
+        print(f"#### {'with password sign-in (local testing)' if passwords else 'Google sign-in only (live)'}")
+        run(passwords, **POSITIONS[passwords])
+        print()
+    if failures:
+        print(f"{failures} failed.")
+        return 1
+    print("All admin edit-form tests passed.")
+    return 0
+
+
+def run(passwords: bool, edit_name: int, edit_email: int, admin_edit_email: int, admin_edit_name: int) -> None:
+    EDIT_NAME, EDIT_EMAIL, ADMIN_EDIT_EMAIL, ADMIN_EDIT_NAME = edit_name, edit_email, admin_edit_email, admin_edit_name
+    HARNESS.write_text(HARNESS_SOURCE.format(here=str(HERE), passwords=passwords), encoding="utf-8")
     try:
         app = AppTest.from_file(str(HARNESS), default_timeout=30)
         app.run()
         assert not app.exception, app.exception
+        check("password boxes are drawn only when password sign-in exists",
+              any(box.label in ("Password", "New password") for box in app.text_input) == passwords, passwords)
 
         print("== the teacher edit form follows the picker ==")
         check("starts on the first teacher", app.selectbox[0].value == 1, app.selectbox[0].value)
@@ -91,13 +110,6 @@ def main() -> int:
         check("admin email box follows the picker", app.text_input[ADMIN_EDIT_EMAIL].value == "second@example.com", app.text_input[ADMIN_EDIT_EMAIL].value)
     finally:
         HARNESS.unlink(missing_ok=True)
-
-    print()
-    if failures:
-        print(f"{failures} failed.")
-        return 1
-    print("All admin edit-form tests passed.")
-    return 0
 
 
 if __name__ == "__main__":

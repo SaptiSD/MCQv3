@@ -36,7 +36,7 @@ TEACHER_GUIDE = [
         ("p", "MCQ is a place to write multiple-choice and short-answer assessments, assign them to your students, and see how everyone did. This guide covers everything a teacher needs."),
         ("h3", "Signing in"),
         ("p", "The sign-in page has two sides. Use the left panel, Teachers & administrators. Students use the right panel. If you sign in on the wrong side the page will tell you and point you to the other one."),
-        ("p", "Signing in with Google from the teacher panel creates your teacher account straight away - there is no approval queue and nothing to wait for. You can also sign in with an email and password if an administrator set one up for you."),
+        ("p", "Everyone signs in with Google, using their school account - there are no MCQ passwords. Signing in from the teacher panel the first time creates your teacher account straight away; there is no approval queue and nothing to wait for."),
         ("note", "Anyone can create a teacher account. Students, by contrast, must choose at least one teacher before they can do anything, so your students will need to find you by name or email."),
     ]),
 
@@ -50,9 +50,14 @@ TEACHER_GUIDE = [
         ]),
         ("h3", "Adding students yourself"),
         ("p", "Open Students to add someone directly. Add an existing student to roster finds a student who already has an account. Add a new student creates the account from their name and email."),
-        ("note", "A student you create this way has no password yet, so they will need to sign in with Google using that same email address."),
-        ("h3", "Teams"),
-        ("p", "Teams are named groups inside your roster - a class period, a set, a study group. Once a team exists you can assign a whole assessment to it in one click. Manage members from the Students page."),
+        ("note", "A student you add this way signs in with Google using that same email address, and lands straight in your roster."),
+        ("h3", "Classes"),
+        ("p", "Classes are named groups inside your roster - a section, for example. Once a class exists you can assign a whole assessment to it in one click. Create and fill classes on the Students page, under Classes."),
+        ("ul", [
+            "Sort students - a table of your whole roster with a Class column. Change the class on as many rows as you like and press Save class changes once, or tick a set of students (Tick all shown works with the Show filter and the search) and press Move ticked.",
+            "Add from a list - paste email addresses, one per line or straight from a spreadsheet, or upload a CSV with an email column and optionally name and class columns. Everyone is added to your roster and put in their class in one go; classes the file names that do not exist yet can be created for you. Download a CSV template from the same tab.",
+            "A student is in one class at a time: moving them takes them out of your other classes.",
+        ]),
     ]),
 
     ("Building an assessment", [
@@ -67,11 +72,15 @@ TEACHER_GUIDE = [
             "Randomize question order and Randomize answer order - shuffle per student, so neighbours do not see the same paper. True/False options are never shuffled.",
             "Opening and closing date and time - when the assessment is visible. Turn either off to leave that end open.",
         ]),
-        ("note", "Times are entered and shown in your own local time zone."),
+        ("note", "Times are entered and shown in Central time (the label beside them says CDT or CST), whatever computer you use."),
         ("h3", "Audience"),
-        ("p", "Assign to All gives the assessment to everyone currently on your roster, and to anyone who joins you later. Choose Students or Teams to be more specific."),
+        ("p", "Assign to All gives the assessment to everyone currently on your roster, and to anyone who joins you later. Choose Students or Classes to be more specific."),
         ("h3", "Publishing"),
         ("p", "Press Publish quiz. If anything is missing - an untitled quiz, a question with no text, a correct answer that is not one of the options - the page lists exactly what to fix and nothing is saved."),
+        ("h3", "Activating"),
+        ("p", "A published assessment is inactive: no student can see it, whoever it is assigned to and whatever its opening time. When you want the class to take it, press Activate on your dashboard. The confirmation says how many students will see it and when it opens and closes, and warns you if the Description/Context seems to contain answers or an email address."),
+        ("p", "Deactivate hides it again straight away. Anyone already writing it can still hand in; nobody new can start. This is the safe way to take an assessment back - deleting it also deletes every attempt on it."),
+        ("note", "The badge on each assessment says exactly who can see it: Inactive - hidden from students, Active - visible to students, Active - not open yet, or Active - closed."),
     ]),
 
     ("Question types", [
@@ -126,13 +135,14 @@ TEACHER_GUIDE = [
         ("p", "Tables in a .docx, with the sentence introducing them, become the quiz's Description/Context: the passage, case or data the questions refer to. Students see it above the questions while they work, and it is printed at the top of the PDF and DOCX downloads. You can also type or paste it yourself under Description/Context; a table is written one row per line, like | Net sales | $4,885,340 |."),
         ("note", "The Description/Context is part of the paper, so like the questions it is fixed once a real student starts."),
         ("h3", "Read with AI"),
-        ("p", "If the ordinary reader cannot follow a file's layout, Read with AI sends the file's text to Google Gemini to read instead. It copies the answers your file marks and never works them out: an answer it cannot point to in the file is left blank for you. It can take a minute or two, and the result lands in the same table for you to check."),
-        ("note", "Read with AI only appears once a Gemini key has been set up. Do not use it on files that contain student names or other personal details."),
+        ("p", "If the ordinary reader cannot follow a file's layout, Read with AI sends the file's text to OpenAI to read instead. It copies the answers your file marks and never works them out: an answer it cannot point to in the file is left blank for you. It usually takes a few seconds, and the result lands in the same table for you to check."),
+        ("note", "Read with AI only appears once an OpenAI key has been set up. Do not use it on files that contain student names or other personal details."),
+        ("note", "Copy a Moodle quiz from its preview or edit page, not from a review page. A review page carries a student's answers and the marking feedback (You have correctly selected...), and anything left in the Description/Context is shown to every student. The upload leaves such lines out and warns you, and so does Activate."),
     ]),
 
     ("Assigning, scheduling and results", [
         ("h3", "Changing who gets an assessment"),
-        ("p", "Open Manage on a quiz, then Assign by students or teams. You can switch between All, specific students, and teams at any time."),
+        ("p", "Open Manage on a quiz, then Assign by students or classes. You can switch between All, specific students, and classes at any time."),
         ("h3", "While students are working"),
         ("p", "Analytics shows every student's status on a given exam - Not started, In progress or Completed - along with their score and last activity. The same table appears under Manage."),
         ("note", "Once a real student starts an assessment, its settings and its questions become read-only - including the order the questions are in. Your own preview attempts from Student view do not count."),
@@ -142,7 +152,8 @@ TEACHER_GUIDE = [
         ("h3", "Downloads"),
         ("ul", [
             "Download PDF - the paper itself with its Description/Context, optionally with the answer key and the quiz settings.",
-            "Download results CSV - every assigned student with status, score and result.",
+            "Download results CSV - every assigned student with their class, status, score and result. The same file is on Analytics, under the exam's table: Download scores.",
+            "Download gradebook (CSV), on Analytics - every student on your roster with their class and one column per assessment, holding their most recent submitted score.",
             "Download question bank CSV and Download printable DOCX - for editing or handing out on paper.",
         ]),
     ]),
@@ -151,7 +162,8 @@ TEACHER_GUIDE = [
         ("p", "Student view shows the workspace exactly as a student sees it, and lets you take your own assessments to check they read correctly. These attempts are excluded from your analytics."),
         ("h3", "Common questions"),
         ("ul", [
-            "A student cannot see my assessment - check they are on your roster, that the quiz is assigned to them, and that the opening time has passed and the closing time has not.",
+            "A student cannot see my assessment - check it is Active, that they are on your roster, that the quiz is assigned to them, and that the opening time has passed and the closing time has not.",
+            "A student can see an assessment too early - press Deactivate. Never delete it to hide it: deleting throws away the work of anyone who has started.",
             "A student ran out of time - their answers are submitted automatically when the timer reaches zero, and whatever they had answered is marked.",
             "I need to fix a published question - if nobody has started it yet, open Manage, edit it and save. Once a student has started, only the answer key can change: correct it, then use Regrade submitted attempts for results already recorded. To change the question itself, delete the assessment and publish a new one.",
             "I unassigned a student who was halfway through - their unfinished attempt ends with the assignment, and nothing is recorded. Work they had already handed in is kept: unassigning someone never deletes a result.",
@@ -163,12 +175,12 @@ TEACHER_GUIDE = [
 
 STUDENT_GUIDE = [
     ("Getting started", [
-        ("p", "Sign in on the right-hand panel, Students. If you sign in with Google from that side your student account is created straight away."),
+        ("p", "Sign in on the right-hand panel, Students, with Sign in with Google and your school Google account. Your student account is created straight away the first time."),
         ("h3", "Choosing your teacher"),
         ("p", "The first thing you will be asked to do is choose your teacher. Search for them by name or email and select them. You need at least one teacher before you can see any assessments; you can add more, or leave one, from My teachers at any time."),
     ]),
     ("Taking an assessment", [
-        ("p", "Your dashboard lists everything your teachers have assigned and that is currently open. Press Start quiz to begin."),
+        ("p", "Your dashboard lists everything your teachers have assigned, switched on and opened. An assessment appears only when your teacher activates it - usually in class - so if you can't see one yet, it isn't time. Press Start quiz to begin."),
         ("ul", [
             "The countdown starts when you press Start and keeps running - it does not pause if you close the tab.",
             "Your answers save as you go, so you can leave and come back with Resume.",

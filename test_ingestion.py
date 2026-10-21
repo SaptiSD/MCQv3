@@ -277,6 +277,79 @@ check("with the figures intact", exported.tables[0].cell(2, 1).text, "$634,527")
 
 
 print()
+print("== the chapter quizzes of October 2026 ==")
+# A Moodle review page pasted into Word: one-line headers with the theme's
+# "Report an issue" and a flag drawn from an icon font, feedback that gives the
+# answer away, and the footer naming the TA who made the copy.
+REVIEW_COPY = "\n".join([
+    "Quiz 15 - copy - Some TA (ta.person@gmail.com) | Copyright 2025 Cambridge Business Publishers",
+    "Answer: $52.900",
+    "Question 3 Marked out of 14.29  Report an issue",
+    "The gain or loss on the sale of the asset is computed as:",
+    "a. Market value less net book value",
+    "b. Cost less accumulated depreciation ✓",
+    "Question 4 Marked out of 14.29  Report an issue",
+    "Aiello, Inc. had the following inventory in its fiscal year, which this question and the next one are both "
+    "about, so read it with care before you answer anything at all.",
+    "You have correctly selected 1.",
+    "Which method was used?",
+    "a. FIFO",
+    "b. LIFO ✓",
+])
+reading = ingestion.read_blocks(ingestion.text_blocks(REVIEW_COPY))
+texts = [question["question_text"] for question in reading["questions"]]
+check("the one-line Moodle header is not glued onto the question", texts[0],
+      "The gain or loss on the sale of the asset is computed as:")
+check("and neither is the icon font's flag", any("" in text for text in texts), False)
+check("both questions are read, keys intact", [q["correct_label"] for q in reading["questions"]], ["B", "B"])
+case = reading["case_material"]
+check("a passage interrupted by feedback is still kept whole", case.startswith("Aiello, Inc."), True)
+check("an answer with no question to attach to never reaches it", "52.900" in case, False)
+check("nor does the marking feedback", "correctly selected" in case, False)
+check("nor somebody's email address", "@gmail.com" in case, False)
+left_out = " ".join(note for note in reading["notes"] if note.startswith("Not part of any question"))
+check("each of them is named in the notes instead",
+      all(part in left_out for part in ("52.900", "correctly selected", "ta.person")), True)
+check("and the teacher is told it was a review page", ingestion.REVIEW_PAGE_NOTE in reading["notes"], True)
+
+check("a tick from the icon font survives the clean-up", ingestion._strip_icons("b. 4 "), "b. 4 ")
+
+leaks = ingestion.answer_leaks("Hasbro reports net income of $312.79 million.\n\nYou have correctly selected 1.\n\n"
+                               "Question 4(a) — Correct Answer: $25,000\n\nPreesha (desai@example.com)")
+check("answers already in a Description/Context are found", len(leaks), 2)
+check("quoting the lines", "Correct Answer: $25,000" in leaks[0] and "correctly selected" in leaks[0], True)
+check("and the email address", "desai@example.com" in leaks[1], True)
+check("a clean Description/Context raises nothing", ingestion.answer_leaks("| Net sales | $4,885,340 |"), [])
+check("the \\ufffd sign is counted where it was lost",
+      ingestion.unreadable_characters("Kohl�s and Wal-Mart",
+                                      [{"question_text": "HAS� equity", "options": []}])[0][:12],
+      "2 characters")
+
+typed = ingestion.read_blocks(ingestion.text_blocks("\n".join([
+    "1. Which statement reports equity?", "a. Balance sheet", "b. Cash flow", "Answer: A",
+    "2. What is the face value of each Series FF share?",
+    "Question 2 — Correct Answer: $25,000",
+])))
+check("“Question 2 — Correct Answer:” keys the typed question above it",
+      [("25,000" in str(q["correct_label"])) for q in typed["questions"]], [False, True])
+
+
+print()
+print("== tables from merged Word cells ==")
+merged = ingestion.markdown_table([
+    ["", "", "", ""],
+    ["Ticker", "", "", "Market Cap ($ mil)"],
+    ["Advanced Auto Parts (AAP)", "", "", "11,110"],
+    ["", "", "", ""],
+    ["AutoZone (AZO)", "", "", "28,440"],
+])
+lines = merged.splitlines()
+check("a blank first row no longer becomes an empty header", lines[0], "| Ticker | Market Cap ($ mil) |")
+check("the empty columns a merged cell leaves are dropped", lines[2], "| Advanced Auto Parts (AAP) | 11,110 |")
+check("a spacer row inside the table stays", lines[3], "|  |  |")
+check("figures stay right-aligned", lines[1], "| --- | ---: |")
+
+print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S): {FAILURES}")
     raise SystemExit(1)

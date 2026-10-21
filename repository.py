@@ -381,6 +381,116 @@ def set_team_members(team_id: int, student_ids: list[int]) -> None:
         ).execute()
 
 
+# Teachers and students see "classes". The tables keep the name they were made
+# with, `teams` and `team_students`, because renaming tables under a live app
+# is a migration with no upside.
+
+CLASS_NAME_TAKEN = "You already have a class with that name."
+
+
+def create_class(teacher_id: int, name: str) -> int:
+    name = " ".join((name or "").split())
+    if not name:
+        raise ValueError("Give the class a name.")
+    if any(row["name"].casefold() == name.casefold() for row in teams_for_teacher(teacher_id)):
+        raise ValueError(CLASS_NAME_TAKEN)
+    return create_team(teacher_id, name)
+
+
+def rename_class(teacher_id: int, class_id: int, name: str) -> None:
+    name = " ".join((name or "").split())
+    if not name:
+        raise ValueError("Give the class a name.")
+    if any(row["name"].casefold() == name.casefold() and row["id"] != class_id for row in teams_for_teacher(teacher_id)):
+        raise ValueError(CLASS_NAME_TAKEN)
+    client().table("teams").update({"name": name}).eq("id", class_id).eq("teacher_id", teacher_id).execute()
+
+
+def delete_class(teacher_id: int, class_id: int) -> None:
+    """Delete the class itself. Its students stay on the roster, and quizzes
+    already assigned through it stay assigned -- an assignment is to students."""
+    client().table("teams").delete().eq("id", class_id).eq("teacher_id", teacher_id).execute()
+
+
+def class_memberships(teacher_id: int) -> dict[int, list[int]]:
+    """{student_id: [class_id, ...]} across this teacher's classes, in one query.
+
+    The roster table used to ask `teams_for_student` once per student, which for
+    two classes of thirty is sixty round trips to draw one page.
+    """
+    class_ids = [row["id"] for row in teams_for_teacher(teacher_id)]
+    if not class_ids:
+        return {}
+    memberships: dict[int, list[int]] = {}
+    for row in _rows(client().table("team_students").select("team_id,student_id").in_("team_id", class_ids).execute()):
+        memberships.setdefault(row["student_id"], []).append(row["team_id"])
+    return memberships
+
+
+def move_students_to_class(teacher_id: int, student_ids, class_id: int | None) -> int:
+    """Put every one of `student_ids` in `class_id` -- and in none of this
+    teacher's other classes. `None` takes them out of all of them.
+
+    The whole point is the TAs' complaint: sorting sixty students into two
+    classes was sixty separate edits. This is two statements however many
+    students there are, both idempotent, so a repeated click finds nothing to do.
+    Only students on this teacher's roster are touched.
+    """
+    supabase = client()
+    on_roster = {row["id"] for row in students(teacher_id)}
+    ids = sorted({int(student_id) for student_id in student_ids} & on_roster)
+    classes = [row["id"] for row in teams_for_teacher(teacher_id)]
+    if not ids:
+        return 0
+    if class_id is not None and class_id not in classes:
+        raise ValueError("That class no longer exists.")
+    others = [other for other in classes if other != class_id]
+    if others:
+        supabase.table("team_students").delete().in_("team_id", others).in_("student_id", ids).execute()
+    if class_id is not None:
+        supabase.table("team_students").upsert(
+            [{"team_id": class_id, "student_id": student_id, "added_at": utc_now()} for student_id in ids],
+            on_conflict="team_id,student_id",
+        ).execute()
+    return len(ids)
+
+
+def enrol_by_email(teacher_id: int, entries: list[tuple[str, str]], class_id: int | None) -> dict:
+    """Add students by email to the roster and, if given, to one class.
+
+    `entries` are (email, name) pairs -- a pasted column of addresses, or a
+    spreadsheet's rows. A student who has never signed in gets an account under
+    that email, and Google sign-in finds it the first time they arrive. Returns
+    what happened to each address so the screen can say so.
+    """
+    supabase = client()
+    report = {"added": [], "already": [], "not_students": [], "invalid": []}
+    on_roster = {row["email"].lower() for row in students(teacher_id)}
+    wanted: list[int] = []
+    for email, name in entries:
+        email = (email or "").strip().lower()
+        if not email or "@" not in email or " " in email:
+            report["invalid"].append(email or name)
+            continue
+        if email in on_roster:
+            row = _exact(_rows(supabase.table("users").select("*").eq("email", email).limit(1).execute()), "email", email)
+            report["already"].append(email)
+        else:
+            try:
+                row = add_student_to_roster(teacher_id, (name or "").strip() or email.split("@")[0], email)
+            except ValueError:
+                report["not_students"].append(email)
+                continue
+            on_roster.add(email)
+            report["added"].append(email)
+        if row:
+            wanted.append(row["id"])
+    if class_id is not None and wanted:
+        move_students_to_class(teacher_id, wanted, class_id)
+    report["placed"] = len(wanted) if class_id is not None else 0
+    return report
+
+
 def teams_for_student(teacher_id: int, student_id: int):
     team_rows = _rows(
         client().table("team_students").select("team_id").eq("student_id", student_id).execute()
@@ -874,6 +984,7 @@ def student_progress_for_quiz(teacher_id: int, quiz_id: int):
         attempt = sorted_attempts[0] if sorted_attempts else None
         status = "Not started" if attempt is None else ("Completed" if attempt.get("submitted_at") else "In progress")
         progress.append({
+            "student_id": student["id"],
             "student": student["name"],
             "email": student["email"],
             "status": status,
@@ -883,6 +994,52 @@ def student_progress_for_quiz(teacher_id: int, quiz_id: int):
             "last_activity": (attempt.get("submitted_at") or attempt.get("started_at")) if attempt else "-",
         })
     return progress
+
+
+def gradebook(teacher_id: int) -> dict:
+    """Everything a gradebook needs for one teacher, in four queries."""
+    supabase = client()
+    quizzes = sorted(quizzes_for_teacher(teacher_id), key=lambda quiz: (quiz.get("created_at") or "", quiz["id"]))
+    attempts = []
+    if quizzes:
+        attempts = _rows(supabase.table("attempts").select("quiz_id,student_id,submitted_at,score_percent")
+                         .in_("quiz_id", [quiz["id"] for quiz in quizzes]).not_.is_("submitted_at", None).execute())
+    classes = {row["id"]: row["name"] for row in teams_for_teacher(teacher_id)}
+    return gradebook_rows(students(teacher_id), quizzes, attempts, class_memberships(teacher_id), classes)
+
+
+def gradebook_rows(roster: list[dict], quizzes: list[dict], attempts: list[dict],
+                   memberships: dict[int, list[int]], classes: dict[int, str]) -> dict:
+    """One row per student, one column per quiz. Pure.
+
+    A cell is the student's most recent *submitted* score -- the attempt the
+    results table and `quiz_average_score` both use, so the three can never
+    disagree. Blank means not handed in; a teacher's own preview attempts are
+    not on the roster and so never appear.
+    """
+    latest: dict[tuple[int, int], dict] = {}
+    for attempt in attempts:
+        key = (attempt["student_id"], attempt["quiz_id"])
+        if attempt.get("score_percent") is None:
+            continue
+        if key not in latest or (attempt["submitted_at"] or "") > (latest[key]["submitted_at"] or ""):
+            latest[key] = attempt
+    titles = []
+    for quiz in quizzes:
+        title, suffix = quiz["title"], 2
+        while title in titles:  # two quizzes may share a title; columns may not
+            title, suffix = f"{quiz['title']} ({suffix})", suffix + 1
+        titles.append(title)
+    rows = []
+    for student in roster:
+        row = {"Student": student["name"], "Email": student["email"],
+               "Class": ", ".join(sorted(classes[c] for c in memberships.get(student["id"], []) if c in classes))}
+        for quiz, title in zip(quizzes, titles):
+            attempt = latest.get((student["id"], quiz["id"]))
+            row[title] = round(attempt["score_percent"], 1) if attempt else None
+        rows.append(row)
+    rows.sort(key=lambda row: (row["Class"] or "￿", row["Student"].casefold()))
+    return {"columns": ["Student", "Email", "Class", *titles], "rows": rows}
 
 
 def available_quizzes(student_id: int, owner_id: int | None = None):
@@ -1312,9 +1469,12 @@ def admins_list():
     return _rows(client().table("admins").select("*").order("email").execute())
 
 
-def add_admin(email: str, password: str, name: str) -> int:
-    if "@" not in email or not password:
-        raise ValueError("Admin needs an email and password.")
+def add_admin(email: str, password: str, name: str, require_password: bool = True) -> int:
+    # With Google sign-in only, an administrator is an email address: Google
+    # proves who they are, and a stored password would be a second way in that
+    # nobody uses or rotates.
+    if "@" not in email or (require_password and not password):
+        raise ValueError("Admin needs an email and password." if require_password else "Admin needs an email address.")
     try:
         return _rows(
             client().table("admins").insert(
@@ -1343,10 +1503,10 @@ def users_by_role(role: str):
     )
 
 
-def create_user(name: str, email: str, role: str, password: str) -> dict:
+def create_user(name: str, email: str, role: str, password: str, require_password: bool = True) -> dict:
     if not name.strip() or "@" not in email:
         raise ValueError("Enter a name and a valid email address.")
-    if not password:
+    if require_password and not password:
         raise ValueError("Set a password for this account.")
     # Strip as well as lower-case, the way the admin accounts already do. An
     # address pasted with a trailing space -- the usual result of copying out of

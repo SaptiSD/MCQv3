@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 import server_state
-from ui import flash, page_header, show_flash
+from ui import flash, page_header, password_login_enabled, show_flash
 from repository import (add_admin, admins_list, assign_role, create_user, remove_admin,
                         remove_user, update_admin, update_user, users_by_role)
 
@@ -73,13 +73,18 @@ def user_section(title: str, caption: str, role: str, prefix: str) -> None:
             st.info(f"No {title.lower()} yet.")
         st.divider()
         st.markdown(f"**Add {singular}**")
-        add_cols = st.columns(3)
+        passwords = password_login_enabled()
+        if not passwords:
+            st.caption("They sign in with Google using this email address.")
+        add_cols = st.columns(3 if passwords else 2)
         with add_cols[0]: add_name = st.text_input("Name", key=f"{prefix}-add-name")
         with add_cols[1]: add_email = st.text_input("Email", key=f"{prefix}-add-email")
-        with add_cols[2]: add_password = st.text_input("Password", type="password", key=f"{prefix}-add-password")
+        add_password = ""
+        if passwords:
+            with add_cols[2]: add_password = st.text_input("Password", type="password", key=f"{prefix}-add-password")
         if st.button(f"Add {singular}", type="primary", key=f"{prefix}-add", width="stretch"):
             try:
-                create_user(add_name, add_email, role, add_password)
+                create_user(add_name, add_email, role, add_password, require_password=passwords)
             except ValueError as exc:
                 st.error(str(exc))
             else:
@@ -91,14 +96,16 @@ def user_section(title: str, caption: str, role: str, prefix: str) -> None:
             edit_options = {row["id"]: f"{row['name']}  ·  {row['email']}" for row in rows}
             edit_id = st.selectbox(f"Select {singular}", list(edit_options), format_func=edit_options.get, key=f"{prefix}-edit-select")
             selected = next(row for row in rows if row["id"] == edit_id)
-            edit_cols = st.columns(3)
+            edit_cols = st.columns(3 if passwords else 2)
             # The key carries the account id. A text box keeps whatever its key
             # already holds and ignores `value`, so a shared key left the boxes
             # showing the previously selected person after the picker moved on --
             # and saving then wrote their name onto this account.
             with edit_cols[0]: edit_name = st.text_input("Name", value=selected["name"], key=f"{prefix}-edit-name-{edit_id}")
             with edit_cols[1]: edit_email = st.text_input("Email", value=selected["email"], key=f"{prefix}-edit-email-{edit_id}")
-            with edit_cols[2]: edit_password = st.text_input("New password", type="password", key=f"{prefix}-edit-password-{edit_id}")
+            edit_password = ""
+            if passwords:
+                with edit_cols[2]: edit_password = st.text_input("New password", type="password", key=f"{prefix}-edit-password-{edit_id}")
             if st.button("Save changes", key=f"{prefix}-edit-save", width="stretch"):
                 try:
                     update_user(edit_id, edit_name, edit_email, edit_password or None)
@@ -140,13 +147,18 @@ def admins_section(user) -> None:
             st.info("No administrators yet.")
         st.divider()
         st.markdown("**Add administrator**")
-        add_cols = st.columns(3)
+        passwords = password_login_enabled()
+        if not passwords:
+            st.caption("Administrators sign in with Google, on the Teachers & administrators side, using this email.")
+        add_cols = st.columns(3 if passwords else 2)
         with add_cols[0]: add_email = st.text_input("Email", key="admins-add-email")
-        with add_cols[1]: add_password = st.text_input("Password", type="password", key="admins-add-password")
-        with add_cols[2]: add_name = st.text_input("Name", key="admins-add-name")
+        add_password = ""
+        if passwords:
+            with add_cols[1]: add_password = st.text_input("Password", type="password", key="admins-add-password")
+        with add_cols[-1]: add_name = st.text_input("Name", key="admins-add-name")
         if st.button("Add administrator", type="primary", key="admins-add", width="stretch"):
             try:
-                add_admin(add_email, add_password, add_name)
+                add_admin(add_email, add_password, add_name, require_password=passwords)
             except ValueError as exc:
                 st.error(str(exc))
             else:
@@ -158,11 +170,13 @@ def admins_section(user) -> None:
             edit_options = {row["id"]: row["email"] for row in rows}
             edit_id = st.selectbox("Select administrator", list(edit_options), format_func=edit_options.get, key="admins-edit-select")
             selected = next(row for row in rows if row["id"] == edit_id)
-            edit_cols = st.columns(3)
+            edit_cols = st.columns(3 if passwords else 2)
             # Keyed by admin id for the same reason as the accounts above.
             with edit_cols[0]: edit_email = st.text_input("Email", value=selected["email"], key=f"admins-edit-email-{edit_id}")
             with edit_cols[1]: edit_name = st.text_input("Name", value=selected["name"], key=f"admins-edit-name-{edit_id}")
-            with edit_cols[2]: edit_password = st.text_input("New password", type="password", key=f"admins-edit-password-{edit_id}")
+            edit_password = ""
+            if passwords:
+                with edit_cols[2]: edit_password = st.text_input("New password", type="password", key=f"admins-edit-password-{edit_id}")
             if st.button("Save changes", key="admins-edit-save", width="stretch"):
                 try:
                     update_admin(edit_id, edit_email, edit_name, edit_password or None)
