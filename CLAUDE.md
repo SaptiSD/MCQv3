@@ -309,6 +309,19 @@ model identified as questions or answer evidence, which is how Chapter 9's
 (503) and retire models (404) routinely: retries, a fallback model and a hard
 `TOTAL_SECONDS` cap are the design, not an afterthought.
 
+**An answer copy's answers live where the text doesn't.** Monica's answer
+copies were printed Moodle quizzes converted to Word: every answer field became
+a text box, every radio button a tiny picture, and fill-in-the-table answers
+sat in cells the question file left blank. `Document.paragraphs` sees none of
+it, so Chapter 8 read as nine questions with no answers. `_paragraph_lines`
+now carries each line's `boxes` and `icons` *beside* its text, and only
+`document_markdown` (the AI's view) shows them: text becomes Description/
+Context, and an answer box in it would hand out the key. For the same reason
+the question file and the answer copy are separate uploads, and the
+Description/Context always comes from the question file;
+`mark_filled_cells` turns the cells that differ between the two into answer
+boxes. Without that the model found the table answers on some runs only.
+
 **Case material is part of the paper.** Teachers and students see it labelled
 **Description/Context** (`teacher_portal.CONTEXT_LABEL`); the code and the column
 keep the name case material. `quizzes.case_material` is shown above

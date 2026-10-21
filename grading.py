@@ -84,11 +84,29 @@ def answer_spec(question: dict) -> dict:
 _FRACTION = re.compile(r"^([+-]?\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)$")
 
 
+# A finance question's answer is written "$1,613 million" by the teacher and
+# "1613" by half the class. Read as text those never matched, and an answer key
+# copied out of a quiz file marked every correct student wrong (Chapter 8,
+# October 2026). The currency sign and the unit are not the number.
+_CURRENCY = re.compile(r"^([+-]?)\s*[$€£]\s*")
+_UNIT_WORDS = re.compile(
+    r"\s*(?:million|millions|billion|billions|thousand|thousands|shares?(?:\s+outstanding)?|per\s+share|%)\s*\.?$",
+    re.I,
+)
+
+
 def _clean_number_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", str(text or "")).strip()
     text = text.replace("−", "-").replace("–", "-")  # minus sign, en dash
+    text = _UNIT_WORDS.sub("", text)
+    text = _CURRENCY.sub(r"\1", text)
     text = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)  # 1,234 -> 1234
     return text.replace(" ", "")
+
+
+def is_numeric_answer(text: str) -> bool:
+    """Whether a typed answer is a quantity, currency sign and unit aside."""
+    return _to_number(text) is not None
 
 
 def _to_number(text: str) -> Decimal | None:

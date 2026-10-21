@@ -52,12 +52,12 @@ TEACHER_GUIDE = [
         ("p", "Open Students to add someone directly. Add an existing student to roster finds a student who already has an account. Add a new student creates the account from their name and email."),
         ("note", "A student you add this way signs in with Google using that same email address, and lands straight in your roster."),
         ("h3", "Classes"),
-        ("p", "Classes are named groups inside your roster - a section, for example. Once a class exists you can assign a whole assessment to it in one click. Create and fill classes on the Students page, under Classes."),
+        ("p", "Classes are named groups inside your roster - a section, for example. Once a class exists you can assign a whole assessment to it in one click. Create and fill classes on the Students page, under Classes: type a name and press Create class. Every class is listed right below it with how many students it has and a Delete button."),
         ("ul", [
             "Sort students - a table of your whole roster with a Class column. Change the class on as many rows as you like and press Save class changes once, or tick a set of students (Tick all shown works with the Show filter and the search) and press Move ticked.",
             "Add from a list - paste email addresses, one per line or straight from a spreadsheet, or upload a CSV with an email column and optionally name and class columns. Everyone is added to your roster and put in their class in one go; classes the file names that do not exist yet can be created for you. Download a CSV template from the same tab.",
             "A student is in one class at a time: moving them takes them out of your other classes.",
-            "Rename or delete - rename a class, or delete it. Delete asks first and says what will happen: the class goes, its students stay on your roster with every result, and assessments already assigned to them stay assigned. It cannot be undone.",
+            "Delete asks first and says what will happen: the class goes, its students stay on your roster with every result, and assessments already assigned to them stay assigned. It cannot be undone. Rename a class from the Rename tab.",
         ]),
     ]),
 
@@ -82,6 +82,7 @@ TEACHER_GUIDE = [
         ("p", "A published assessment is inactive: no student can see it, whoever it is assigned to and whatever its opening time. When you want the class to take it, press Activate on your dashboard. The confirmation says how many students will see it and when it opens and closes, and warns you if the Description/Context seems to contain answers or an email address."),
         ("p", "Deactivate hides it again straight away. Anyone already writing it can still hand in; nobody new can start. This is the safe way to take an assessment back - deleting it also deletes every attempt on it."),
         ("note", "The badge on each assessment says exactly who can see it: Inactive - hidden from students, Active - visible to students, Active - not open yet, or Active - closed."),
+        ("p", "An assessment never switches itself on. Its card on the dashboard shows the schedule you set - scheduled: opens ..., closes ... (once activated) - and the opening and closing times only apply after you press Activate: activate early and students see it from the opening time; activate in class and they see it straight away, until the closing time. Activating one whose closing time has already passed warns you first."),
     ]),
 
     ("Question types", [
@@ -138,6 +139,8 @@ TEACHER_GUIDE = [
         ("h3", "Read with AI"),
         ("p", "If the ordinary reader cannot follow a file's layout, Read with AI sends the file's text to OpenAI to read instead. It copies the answers your file marks and never works them out: an answer it cannot point to in the file is left blank for you. It usually takes a few seconds, and the result lands in the same table for you to check."),
         ("note", "Read with AI only appears once an OpenAI key has been set up. Do not use it on files that contain student names or other personal details."),
+        ("h3", "An answer copy"),
+        ("p", "If you have two files - the quiz as students should see it, and a copy with the answers filled in - upload the quiz as the question bank and the other as the Answer copy, then press Read with AI. Students see the questions and tables from the first file; the answer copy is only used for the key. Answers typed into the answer boxes of a filled-in copy, ticked radio buttons, and blanks filled in inside a table are all read. Uploading only the answer copy would put its filled-in tables in front of every student."),
         ("note", "Copy a Moodle quiz from its preview or edit page, not from a review page. A review page carries a student's answers and the marking feedback (You have correctly selected...), and anything left in the Description/Context is shown to every student. The upload leaves such lines out and warns you, and so does Activate."),
     ]),
 

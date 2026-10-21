@@ -288,10 +288,12 @@ REVIEW_COPY = "\n".join([
     "The gain or loss on the sale of the asset is computed as:",
     "a. Market value less net book value",
     "b. Cost less accumulated depreciation ✓",
+    "You have correctly selected 1.",
+    "Solution:",
+    "Bava reports $52,900 as income: $29,900 of dividend income plus $23,000 of unrealized gains.",
     "Question 4 Marked out of 14.29  Report an issue",
     "Aiello, Inc. had the following inventory in its fiscal year, which this question and the next one are both "
     "about, so read it with care before you answer anything at all.",
-    "You have correctly selected 1.",
     "Which method was used?",
     "a. FIFO",
     "b. LIFO ✓",
@@ -303,7 +305,9 @@ check("the one-line Moodle header is not glued onto the question", texts[0],
 check("and neither is the icon font's flag", any("" in text for text in texts), False)
 check("both questions are read, keys intact", [q["correct_label"] for q in reading["questions"]], ["B", "B"])
 case = reading["case_material"]
-check("a passage interrupted by feedback is still kept whole", case.startswith("Aiello, Inc."), True)
+check("the next question's passage is kept as Description/Context", case.startswith("Aiello, Inc."), True)
+check("but the worked solution before it is not", "52,900" in case or "Solution" in case, False)
+check("and is not glued onto the question it followed", "Bava" in texts[0], False)
 check("an answer with no question to attach to never reaches it", "52.900" in case, False)
 check("nor does the marking feedback", "correctly selected" in case, False)
 check("nor somebody's email address", "@gmail.com" in case, False)
@@ -348,6 +352,70 @@ check("a blank first row no longer becomes an empty header", lines[0], "| Ticker
 check("the empty columns a merged cell leaves are dropped", lines[2], "| Advanced Auto Parts (AAP) | 11,110 |")
 check("a spacer row inside the table stays", lines[3], "|  |  |")
 check("figures stay right-aligned", lines[1], "| --- | ---: |")
+
+print()
+print("== an answer copy's text boxes and radio buttons ==")
+# Monica's answer copies: a printed Moodle quiz converted to Word, where every
+# answer field became a text box (stored twice -- the drawing and a VML
+# fallback) and every option's radio button a tiny picture.
+from docx.oxml import parse_xml  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
+
+TEXT_BOX = (
+    '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+    'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+    '<mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><w:txbxContent><w:p><w:r><w:t>{answer}</w:t>'
+    '</w:r></w:p></w:txbxContent></w:drawing></mc:Choice><mc:Fallback><w:pict><w:txbxContent><w:p><w:r>'
+    '<w:t>{answer}</w:t></w:r></w:p></w:txbxContent></w:pict></mc:Fallback></mc:AlternateContent></w:r>'
+)
+
+
+def radio(filled):
+    image = Image.new("RGB", (20, 20), "white")
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((2, 2, 17, 17), outline="gray", width=2)
+    if filled:
+        draw.ellipse((6, 6, 13, 13), fill="black")
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    buffer.seek(0)
+    return buffer
+
+
+def answer_copy(document):
+    document.add_paragraph("At what average price were the Merck common shares issued?")
+    answer = document.add_paragraph("$ per share")
+    answer._p.append(parse_xml(TEXT_BOX.format(answer="11.35")))
+    document.add_paragraph("Do the liabilities of the unconsolidated affiliates affect Cummins directly?")
+    for text, filled in (("Not liabilities of the investor.", True), ("Creditors have recourse.", False),
+                         ("Liabilities of the investee.", False)):
+        line = document.add_paragraph()
+        line.add_run().add_picture(radio(filled))
+        line.add_run(" " + text)
+
+
+blocks = ingestion.upload_blocks(docx_upload(answer_copy))
+markdown = ingestion.document_markdown(blocks)
+check("the text box's answer is read", "[answer box: 11.35]" in markdown, True)
+check("once, though Word stores it twice", markdown.count("11.35"), 1)
+check("and never reaches the Description/Context", "11.35" in ingestion.read_blocks(blocks)["case_material"], False)
+icons = [line.split("]")[0] + "]" for line in markdown.splitlines() if line.startswith("[icon")]
+check("each option's radio button is named", len(icons), 3)
+check("the empty ones alike, the filled one different", (icons[1] == icons[2], icons[0] != icons[1]), (True, True))
+
+print()
+print("== an answer copy's filled-in table cells ==")
+question_file = [{"kind": "table", "rows": [["Basic earnings per share", "a.", "$", "$1.63"],
+                                            ["Net income", "", "$28,147", "d."]]}]
+answer_file = [{"kind": "table", "rows": [["Basic earnings per share", "a.", "$ 2.64", "$1.63"],
+                                          ["Net income", "", "$28,147", "d. 17,822"]]}]
+rows = ingestion.mark_filled_cells(question_file, answer_file)[0]["rows"]
+check("a cell blank in the question file and filled in the copy is an answer box", rows[0][2], "[answer box: $ 2.64]")
+check("a figure both files print is not", (rows[0][3], rows[1][2]), ("$1.63", "$28,147"))
+check("nor is a cell the question file already had words in", rows[1][3], "d. 17,822")
+check("tables that don't line up are left alone",
+      ingestion.mark_filled_cells(question_file, [{"kind": "table", "rows": [["only", "two"]]}])[0]["rows"],
+      [["only", "two"]])
 
 print()
 if FAILURES:

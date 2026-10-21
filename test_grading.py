@@ -118,6 +118,22 @@ empty = {"correct_label": "A", "options_json": "[]", "question_type": "Short ans
 check("empty legacy row rejects everything", g.grade(g.answer_spec(empty), "anything"), False)
 
 print()
+print("== a quantity's currency sign and unit are not the number ==")
+# Chapter 8's keys, as the file wrote them. Read as text, "1613" was wrong.
+dividends = g.build_spec("$1,613 million", g.NUMBER)
+accepts(dividends, "$1,613 million", "1613", "1,613", "$1,613", "1613 million", "$ 1,613")
+rejects(dividends, "1614", "16.13", "1,613 billion?")
+eps = g.build_spec("$2.64", g.NUMBER)
+accepts(eps, "2.64", "$2.64", "2.644")
+rejects(eps, "2.6", "$2.65")
+check("its hint still asks for two decimal places", g.student_hint(eps), "Enter a number · round to 2 decimal places")
+accepts(g.build_spec("2,592,559,543 shares outstanding", g.NUMBER), "2592559543", "2,592,559,543 shares")
+accepts(g.build_spec("13.8%", g.NUMBER), "13.8", "13.8%")
+accepts(g.build_spec("-$5", g.NUMBER), "-5", "-$5")
+check("a key copied from a file is recognised as a number", g.is_numeric_answer("$16,619 million"), True)
+check("but two answers in one box are not", g.is_numeric_answer("Assets = $4,850 million Liabilities = $2,887 million"), False)
+
+print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S)")
     raise SystemExit(1)

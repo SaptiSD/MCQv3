@@ -284,6 +284,13 @@ def _window_words(quiz) -> str:
     return "open now" + (f" until {local_time.fmt(closing)}" if closing else ", no closing time")
 
 
+def _schedule_words(quiz) -> str:
+    """The opening and closing times as set, for a quiz that isn't live yet."""
+    opening = f"opens {local_time.fmt(quiz['opening_time'])}" if quiz.get("opening_enabled") else "no opening time"
+    closing = f"closes {local_time.fmt(quiz['closing_time'])}" if quiz.get("closing_enabled") else "no closing time"
+    return f"scheduled: {opening}, {closing} (once activated)"
+
+
 @st.dialog("Activate assessment?")
 def activate_quiz_dialog(user, quiz_id: int) -> None:
     # A dialog body is a fragment: the session check has to happen in here.
@@ -297,6 +304,11 @@ def activate_quiz_dialog(user, quiz_id: int) -> None:
              f"**{assigned} assigned student{'s' if assigned != 1 else ''}** -- {_window_words(quiz)}.")
     if not assigned:
         st.warning("Nobody is assigned yet, so nobody will see it until you assign students under **Manage**.")
+    if _window_words(quiz).startswith("closed"):
+        # Activating never moves the times, so a quiz loaded last week for a
+        # class that has since met would go live already shut.
+        st.warning("Its closing time has already passed, so students will see it but can't start it. Change the "
+                   "closing time under **Manage → Quiz settings** first.")
     for warning in ingestion.answer_leaks(quiz.get("case_material") or ""):
         st.warning(warning)
     confirm, cancel = st.columns(2)
@@ -372,6 +384,8 @@ def dashboard(user) -> None:
                         f"{minutes} minute{'s' if minutes != 1 else ''}", f"pass at {quiz['passing_score']}%", audience]
                 if live:
                     bits.append(_window_words(quiz))
+                elif summary["questions"]:
+                    bits.append(_schedule_words(quiz))
                 st.caption("  ·  ".join(bits))
             with action:
                 if summary["questions"] and quiz["status"] != ACTIVE:
@@ -1547,6 +1561,17 @@ def _upload_panel(store: dict, wkey, changed, case_name: str) -> None:
     """
     upload = st.file_uploader("Question bank (.txt or .docx)", type=["txt", "docx"], key=wkey("upload-file"))
     ai = _ai_settings()
+    answers = None
+    if upload and ai:
+        # Teachers usually have both: the quiz as students should see it, and a
+        # copy with the answers filled in. One file can't be both -- an answer
+        # copy's tables have the answers in them, and the tables become the
+        # Description/Context every student reads.
+        answers = st.file_uploader("Answer copy (optional) — the same quiz with the answers filled in",
+                                   type=["txt", "docx"], key=wkey("upload-answers"))
+        if answers:
+            st.caption("Students will see the questions and tables from the first file. The answer copy is only "
+                       "used to find the answers, so press **Read with AI**.")
     if upload:
         read_column, ai_column = st.columns(2)
         if read_column.button("Read question bank", key=wkey("upload-read"), width="stretch"):
@@ -1556,7 +1581,7 @@ def _upload_panel(store: dict, wkey, changed, case_name: str) -> None:
         if ai and ai_column.button("Read with AI", key=wkey("upload-read-ai"), width="stretch"):
             with st.spinner("The AI is reading the file. This usually takes a few seconds, "
                             "and up to two and a half minutes when OpenAI is busy..."):
-                _read_upload(store, upload, case_name, ai)
+                _read_upload(store, upload, case_name, ai, answers)
             changed()
             st.rerun(scope="fragment")
         if ai:
@@ -1569,15 +1594,29 @@ def _upload_panel(store: dict, wkey, changed, case_name: str) -> None:
         _upload_review(store, wkey, changed, ai)
 
 
-def _read_upload(store: dict, upload, case_name: str, ai: dict | None = None) -> None:
-    """Read `upload` into `store`, replacing any earlier reading."""
+def _read_upload(store: dict, upload, case_name: str, ai: dict | None = None, answers=None) -> None:
+    """Read `upload` into `store`, replacing any earlier reading.
+
+    `answers` is an optional answer copy of the same quiz. Only the AI reader
+    uses it, and only for the answers: the questions and the Description/
+    Context still come from `upload`.
+    """
     store.pop("upload-error", None)
     try:
         blocks = ingestion.upload_blocks(upload)
         reading = ingestion.read_blocks(blocks)
         if ai:
-            reading = ai_reader.read_document(ingestion.document_markdown(blocks), ai["api_key"], ai["models"],
+            document = ingestion.document_markdown(blocks)
+            answer_blocks = []
+            if answers is not None:
+                answer_blocks = ingestion.mark_filled_cells(blocks, ingestion.upload_blocks(answers))
+                document = ai_reader.with_answer_copy(document, ingestion.document_markdown(answer_blocks))
+            reading = ai_reader.read_document(document, ai["api_key"], ai["models"],
                                               case_material=reading["case_material"])
+            if any(block.get("boxes") for block in [*blocks, *answer_blocks]) or answer_blocks:
+                reading["notes"].insert(0, (
+                    f"Answers were read from the filled-in answer fields of "
+                    f"{(answers or upload).name}. Check each one against the file before publishing."))
             # The rule-based reading warns about its own Description; this one
             # was assembled by `ai_reader`, so it is checked the same way here.
             reading["notes"] += (ingestion.answer_leaks(reading["case_material"])
@@ -2038,13 +2077,35 @@ def _classes_section(user, roster, classes) -> None:
         if not classes:
             st.info("Create your classes above, then sort your students into them here.")
             return
-        sort_tab, list_tab, manage_tab = st.tabs(["Sort students", "Add from a list", "Rename or delete"])
+        _class_list(user, classes)
+        sort_tab, list_tab, manage_tab = st.tabs(["Sort students", "Add from a list", "Rename"])
         with sort_tab:
             _sort_into_classes(user, roster, classes, epoch)
         with list_tab:
             _enrol_from_list(user, classes, epoch)
         with manage_tab:
             _manage_classes(user, classes, epoch)
+
+
+def _class_list(user, classes) -> None:
+    """Every class with its size and a Delete button, right under Create class.
+
+    Delete used to live in the last of three tabs, and a teacher asked for "an
+    easy way to add and delete classes": both now sit together at the top.
+    """
+    sizes = {row["id"]: 0 for row in classes}
+    for class_ids in class_memberships(user["id"]).values():
+        for class_id in class_ids:
+            if class_id in sizes:
+                sizes[class_id] += 1
+    st.markdown(f"**Your classes · {len(classes)}**")
+    for row in classes:
+        name_column, delete_column = st.columns([5, 1], vertical_alignment="center")
+        size = sizes[row["id"]]
+        name_column.markdown(f"{text(row['name'])} &nbsp; {pill(f'{size} student' + ('s' if size != 1 else ''), 'grey')}",
+                             unsafe_allow_html=True)
+        if delete_column.button("Delete", key=f"class-delete-{row['id']}", width="stretch"):
+            delete_class_dialog(user, row["id"])
 
 
 def _sort_into_classes(user, roster, classes, epoch: int) -> None:
@@ -2186,7 +2247,7 @@ def _enrol_from_list(user, classes, epoch: int) -> None:
 
 def _manage_classes(user, classes, epoch: int) -> None:
     for row in classes:
-        name_column, save_column, delete_column = st.columns([4, 1, 1], vertical_alignment="bottom")
+        name_column, save_column = st.columns([5, 1], vertical_alignment="bottom")
         new_name = name_column.text_input("Class name", value=row["name"], key=f"class-name-{row['id']}-{epoch}")
         if save_column.button("Rename", key=f"class-rename-{row['id']}", width="stretch",
                               disabled=" ".join(new_name.split()) == row["name"]):
@@ -2198,8 +2259,6 @@ def _manage_classes(user, classes, epoch: int) -> None:
                 flash("classes", f"Renamed to **{' '.join(new_name.split())}**.")
                 st.session_state["class-epoch"] = epoch + 1
                 st.rerun()
-        if delete_column.button("Delete", key=f"class-delete-{row['id']}", width="stretch"):
-            delete_class_dialog(user, row["id"])
 
 
 @st.dialog("Delete class?")

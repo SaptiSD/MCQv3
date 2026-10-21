@@ -79,6 +79,11 @@ _ANSWER_GIVEAWAY = re.compile(
     re.I,
 )
 _REVIEW_PAGE = re.compile(r"you have correctly selected|your answer is (?:correct|incorrect)", re.I)
+# Where a review page's marking feedback starts. Everything after it, up to the
+# next question's header, is the worked solution -- "Bava reports $52,900 as
+# income: ..." -- and kept as Description/Context it handed every student the
+# answer.
+_FEEDBACK_START = re.compile(r"^\s*(?:solution|general feedback|feedback|explanation|the correct answer is)\b\s*:?", re.I)
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _SELECT_ALL_HINT = re.compile(r"select (?:one or more|all that apply)|choose all that apply", re.I)
 _CORRECT_TAG = re.compile(r"\s*[\(\[]\s*correct\s*[\)\]]\s*$", re.I)
@@ -142,9 +147,10 @@ def text_blocks(raw: str) -> list[dict]:
 
 def _docx_blocks(document) -> list[dict]:
     blocks: list[dict] = []
+    icons: dict = {}
     for element in _body_elements(document.element.body):
         if element.tag == qn("w:p"):
-            blocks.extend(_paragraph_lines(Paragraph(element, document)))
+            blocks.extend(_paragraph_lines(Paragraph(element, document), icons))
         else:
             rows = _table_rows(Table(element, document))
             if any(cell for row in rows for cell in row):
@@ -163,22 +169,99 @@ def _body_elements(parent):
                 yield from _body_elements(content)
 
 
-def _paragraph_lines(paragraph) -> list[dict]:
+def _paragraph_lines(paragraph, icons: dict | None = None) -> list[dict]:
     """A paragraph as one block per line, each with the marks its text carries.
 
     A soft line break is a new line to the reader, because a question pasted
     from the web often arrives as one paragraph with its options on breaks.
+
+    Each line also carries its `boxes` -- the text of any text box anchored in
+    it -- and its `icons`. Both are kept apart from `text` on purpose: in a
+    filled-in answer copy a text box *is* the answer (a printed quiz's answer
+    fields become text boxes), and the text goes on to become Description/
+    Context, which every student reads. Only the AI reader is shown them.
     """
+    icons = {} if icons is None else icons
     lines: list[list[tuple[str, set]]] = [[]]
+    extras: list[tuple[list, list]] = [([], [])]
     for item in paragraph.iter_inner_content():
         for run in getattr(item, "runs", [item]):
             marks = _run_marks(run)
+            boxes, pictures = _run_extras(run, icons)
             for index, piece in enumerate((run.text + _symbol_checks(run)).split("\n")):
                 if index:
                     lines.append([])
+                    extras.append(([], []))
                 lines[-1].append((piece, marks))
-    return [{"kind": "text", "text": "".join(piece for piece, _ in parts), "marks": _line_marks(parts)}
-            for parts in lines]
+            extras[-1][0].extend(boxes)
+            extras[-1][1].extend(pictures)
+    return [{"kind": "text", "text": "".join(piece for piece, _ in parts), "marks": _line_marks(parts),
+             "boxes": boxes, "icons": pictures}
+            for parts, (boxes, pictures) in zip(lines, extras)]
+
+
+_TEXT_BOX = qn("w:txbxContent")
+_BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+_EMBED = qn("r:embed")
+# Bigger than this is a chart or a photo, not a radio button.
+ICON_PIXELS = 64
+
+
+def _inside(element, tag: str) -> bool:
+    parent = element.getparent()
+    while parent is not None:
+        if parent.tag == tag:
+            return True
+        parent = parent.getparent()
+    return False
+
+
+def _run_extras(run, icons: dict) -> tuple[list[str], list[str]]:
+    """The text boxes and small pictures drawn in `run`.
+
+    Word stores a text box twice -- the modern drawing and a VML fallback for
+    old readers -- so anything under `mc:Fallback` is the same box again.
+    """
+    boxes, pictures = [], []
+    for element in run._r.iter(_TEXT_BOX, _BLIP):
+        if _inside(element, _FALLBACK):
+            continue
+        if element.tag == _TEXT_BOX:
+            text = " ".join("".join(node.text or "" for node in element.iter(qn("w:t"))).split())
+            if text:
+                boxes.append(text)
+        elif (label := _icon(run.part, element.get(_EMBED), icons)):
+            pictures.append(label)
+    return boxes, pictures
+
+
+def _icon(part, relationship: str | None, icons: dict) -> str | None:
+    """A small picture's label, the same label for pictures that look alike.
+
+    A quiz copied from Moodle marks the chosen option with a filled radio button
+    and the rest with empty ones, each saved as a separate image file -- so the
+    files differ even where the pictures don't. An 8x8 average-hash says which
+    ones look the same, and the option whose picture looks different is the
+    marked one.
+    """
+    try:
+        from PIL import Image
+        blob = part.related_parts[relationship].blob
+        with Image.open(io.BytesIO(blob)) as image:
+            if max(image.size) > ICON_PIXELS:
+                return None
+            small = list(image.convert("L").resize((8, 8)).getdata())
+    except Exception:
+        return None
+    mean = sum(small) / len(small)
+    bits = tuple(value > mean for value in small)
+    for label, known in icons.items():
+        if sum(a != b for a, b in zip(bits, known)) <= 6:
+            return label
+    label = f"icon {chr(ord('A') + len(icons))}" if len(icons) < 26 else f"icon {len(icons)}"
+    icons[label] = bits
+    return label
 
 
 def _symbol_checks(run) -> str:
@@ -268,6 +351,36 @@ def markdown_table(rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+_BLANK_CELL = re.compile(r"^[\s$€£_.]*$")
+
+
+def mark_filled_cells(question_blocks: list[dict], answer_blocks: list[dict]) -> list[dict]:
+    """The answer copy's blocks, with every table cell the student filled in
+    written as an answer box.
+
+    A fill-in-the-table question -- "Basic earnings per share | a. | $ ___" --
+    has its answer in the answer copy's cell and nowhere else, and nothing about
+    "$ 2.64" in a table says it is an answer rather than a figure. Its twin in
+    the question file is blank, so the difference does: a cell that is empty
+    (or just "$") in the question file and holds something in the answer copy
+    is what was filled in. Tables are paired in order and only when their shapes
+    match; anything else is left exactly as it was.
+    """
+    question_tables = [block for block in question_blocks if block["kind"] == "table"]
+    answer_tables = [block for block in answer_blocks if block["kind"] == "table"]
+    if len(question_tables) != len(answer_tables):
+        return answer_blocks
+    filled = {}
+    for question, answer in zip(question_tables, answer_tables):
+        if [len(row) for row in question["rows"]] != [len(row) for row in answer["rows"]]:
+            continue
+        rows = [[f"[answer box: {cell.strip()}]" if _BLANK_CELL.match(blank) and not _BLANK_CELL.match(cell) else cell
+                 for blank, cell in zip(blank_row, row)]
+                for blank_row, row in zip(question["rows"], answer["rows"])]
+        filled[id(answer)] = {**answer, "rows": rows}
+    return [filled.get(id(block), block) for block in answer_blocks]
+
+
 def document_markdown(blocks: list[dict]) -> str:
     """The blocks as Markdown, formatting marks included, for the AI reader.
 
@@ -281,8 +394,11 @@ def document_markdown(blocks: list[dict]) -> str:
             out.append(markdown_table(block["rows"]))
             continue
         line = block["text"].strip()
-        if not line:
+        boxes = [f"[answer box: {text}]" for text in block.get("boxes", [])]
+        pictures = [f"[{label}]" for label in block.get("icons", [])]
+        if not line and not boxes:
             continue
+        line = " ".join([*pictures, line, *boxes]).strip()
         for tick in CHECKS:
             line = line.replace(tick, " [CHECKMARK] ")
         line = " ".join(line.split())
@@ -368,6 +484,7 @@ class _Reader:
         self.stray_options = 0
         self.tables = 0
         self.review_page = False
+        self.in_feedback = False
 
     # Each block, in order.
 
@@ -402,11 +519,23 @@ class _Reader:
             return
         if (header := _QUESTION_HEADER.match(line)):
             self._settle()
+            self.in_feedback = False
             self.next_number = int(header.group(1))
             return
         key = _KEY_LINE.match(line) or _CORRECT_IS.match(line)
         if key and self.current is not None:
             self.current["key_line"] = key.group(1)
+            return
+        numbered_start = self.numbered and _QUESTION.match(line)
+        if self.in_feedback and not numbered_start:
+            self.ignored.append(line)
+            return
+        self.in_feedback = False
+        if _REVIEW_PAGE.search(line) or _FEEDBACK_START.match(line):
+            self.review_page = True
+            self.in_feedback = True
+            self._claim_trailing_as_case()
+            self.ignored.append(line)
             return
         numbered = _QUESTION.match(line) if self.numbered else None
         option = _OPTION.match(line)

@@ -35,9 +35,10 @@ TP.team_student_ids = lambda class_id: {{101, 102, 103}} if class_id == 7 else s
 TP.quizzes_for_teacher = lambda teacher_id: [{{"id": 50, "title": "Chapter 6"}}, {{"id": 51, "title": "Chapter 8"}}]
 TP.assigned_student_ids = lambda quiz_id: {{101, 102, 103, 104}} if quiz_id == 50 else {{104}}
 TP.delete_class = lambda teacher_id, class_id: DELETED.append(class_id)
+TP.class_memberships = lambda teacher_id: {{101: [7], 102: [7], 103: [7]}}
 
 TP.show_flash("classes")
-TP._manage_classes({{"id": 1, "role": "teacher"}}, TP.teams_for_teacher(1), 0)
+TP._class_list({{"id": 1, "role": "teacher"}}, TP.teams_for_teacher(1))
 # In a browser a click inside a dialog re-runs only the dialog, which AppTest
 # does not replay; holding it open by hand stands in for that re-run.
 if st.session_state.get("hold-open"):
@@ -71,7 +72,9 @@ def main() -> int:
         assert not app.exception, app.exception
         print("== Delete warns before it deletes ==")
         deletes = [widget for widget in app.button if widget.label == "Delete"]
-        check("every class has a Delete button", len(deletes) == 2, len(deletes))
+        check("every class has a Delete button, listed with its size", (len(deletes),
+              any("3 students" in str(m.value) for m in app.markdown), any("0 students" in str(m.value) for m in app.markdown)),
+              (2, True, True))
 
         deletes[0].click().run()
         assert not app.exception, app.exception
@@ -103,7 +106,8 @@ def main() -> int:
         app.run()
         text = page_text(app)
         check("still warns it cannot be undone", "cannot be undone" in text, text[:300])
-        check("without counting students it doesn't have", "0 students" not in text, text[:300])
+        warning = " ".join(str(w.value) for w in app.warning)
+        check("without counting students it doesn't have", "0 students" not in warning, warning)
     finally:
         HARNESS.unlink(missing_ok=True)
 

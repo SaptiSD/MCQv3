@@ -59,6 +59,22 @@ Rules:
   line, or a mark on an option -- [CHECKMARK], **bold**, ==highlight==, a
   [colour ...] tag, "(correct)" or an asterisk -- that the other options of that
   question do not have. Copy the exact words that show it into key_evidence.
+- "[answer box: X]" is what was filled into an answer field on this copy. In an
+  answer copy that IS the answer: use X for `correct`, key_source "marked
+  inline", and quote "[answer box: X]" in key_evidence.
+- "[icon A]", "[icon B]"... are small pictures such as radio buttons and check
+  boxes; pictures that look alike share a letter. When one option's icon is
+  different from the icons on its sibling options, that option is the one
+  marked -- quote its line, icon included, as key_evidence.
+- A list of statements each answered True or False is one "True / False"
+  question per statement: question_text is the shared question followed by the
+  statement; options are A True, B False.
+- A question with several blanks (Assets = ___ and Liabilities = ___, or cells
+  a. to e. in a table) is one "Short answer" question per blank, each worded so
+  a student knows which blank it is.
+- If the document has an ANSWER COPY section, take every question's wording,
+  options and shared_context from the part before it, and only the answers from
+  the answer copy.
 - If the document does not show which answer is correct, leave `correct` empty
   and set key_source to "not in document". NEVER work the answer out yourself,
   even if you are sure; a teacher will fill it in.
@@ -70,6 +86,20 @@ Rules:
 
 Document:
 """
+
+
+ANSWER_COPY_HEADING = "=== ANSWER COPY: the same quiz again, with the answers filled in ==="
+
+
+def with_answer_copy(document: str, answer_copy: str) -> str:
+    """The question file and its filled-in answer copy, as one document.
+
+    Teachers often have both: the quiz as students should see it -- its tables
+    with the blanks still blank -- and a copy someone completed. The questions
+    and the Description/Context have to come from the first, or the answers are
+    printed in the tables every student reads; the key comes from the second.
+    """
+    return f"{document.rstrip()}\n\n{ANSWER_COPY_HEADING}\n{answer_copy.strip()}"
 
 
 def _strict(node):
@@ -331,7 +361,9 @@ def _options(raw) -> list[tuple[str, str]]:
 
 
 def _plain(text: str) -> str:
-    for token in ("[CHECKMARK]", "**", "=="):
+    # Table pipes too: a model quoting the row "Common stock $ 4 million" from
+    # "| Common stock | $ 4 million |" is pointing at the file, and was refused.
+    for token in ("[CHECKMARK]", "**", "==", "|", "---:", "---"):
         text = text.replace(token, " ")
     return grading.normalise_text(text)
 

@@ -136,6 +136,19 @@ check("the table stays exactly as the file had it", "| Sales | $5,000 |" in case
 check("and the answer is still the key", typed_reading["questions"][0]["correct_label"], "$52.900")
 
 
+# Chapter 8's Cisco question: the answer copy gives it in a table, and the model
+# quotes the row without the pipes. That is pointing at the file.
+table_file = "Common stock and APIC?\n| Common stock | $ 4 million |\n| Additional paid-in capital | $ 40,573 million |"
+quoted = ai_reader.normalise({"questions": [item("Common stock and APIC?", [], ["$ 4 million"],
+                                                 evidence="Common stock $ 4 million", question_type="Short answer")]},
+                             table_file)
+check("an answer quoted from a table row, pipes left out, is still found", quoted["questions"][0]["correct_label"],
+      "$ 4 million")
+combined = ai_reader.with_answer_copy("1. What is 2+2?", "1. What is 2+2? [answer box: 4]")
+check("an answer copy comes after the questions, under its own heading",
+      combined.index("What is 2+2?") < combined.index(ai_reader.ANSWER_COPY_HEADING) < combined.index("[answer box: 4]"),
+      True)
+
 print()
 print("== talking to OpenAI ==")
 
