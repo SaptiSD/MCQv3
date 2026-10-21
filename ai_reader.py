@@ -1,4 +1,4 @@
-"""Reading a question bank with Gemini, for files the rule-based reader cannot.
+"""Reading a question bank with an OpenAI model, for files the rule-based reader cannot.
 
 The model is asked to *transcribe*, never to answer. That line matters more
 here than anywhere else in the app: a model that works a question out for itself
@@ -7,6 +7,10 @@ debt and 1.07 on total liabilities, and both are defensible -- and a wrong key
 marks every student wrong. So an answer only survives if the model can point at
 the words in the file that give it, and those words are then looked for in the
 file. Anything it cannot trace is left blank for the teacher to fill in.
+
+This used to call Google Gemini, whose overloads (503) and retired models (404)
+made the button unreliable. The safeguards are the same ones, pointed at
+OpenAI's Chat Completions API with a strict JSON schema.
 
 Free of Streamlit and the database. The one network call goes through `post`,
 which the tests replace.
@@ -23,16 +27,16 @@ import grading
 
 SELECT_ALL_TYPE = grading.SELECT_ALL_TYPE
 TYPES = ("Multiple choice", SELECT_ALL_TYPE, "True / False", "Short answer")
+PROVIDER = "OpenAI"
 
-# Google retires models without much ceremony -- gemini-2.5-flash started
-# answering 404 to new keys -- so these are only defaults. `[gemini] models` in
-# secrets.toml overrides them without a code change.
-DEFAULT_MODELS = ("gemini-3.5-flash", "gemini-3.1-flash-lite")
-ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+# Only defaults: models are retired, so `[openai] models` in secrets.toml
+# overrides them without a code change, and a 404 falls through to the next.
+DEFAULT_MODELS = ("gpt-5.4-mini", "gpt-4.1-mini")
+ENDPOINT = "https://api.openai.com/v1/chat/completions"
 TIMEOUT_SECONDS = 75
 RETRIES_PER_MODEL = 3
 # However the retries and fallbacks add up, a teacher is not left watching a
-# spinner for longer than this. A busy Gemini once took two minutes to answer.
+# spinner for longer than this.
 TOTAL_SECONDS = 150
 MAX_DOCUMENT_CHARACTERS = 150_000
 NOT_IN_DOCUMENT = "not in document"
@@ -49,7 +53,8 @@ Rules:
 - Transcribe. Do not write, improve, reword or solve anything.
 - Keep each option's letter as the document gives it, upper-cased (a. -> A). If
   the options have no letters, letter them A, B, C... in order.
-- Leave instructions such as "Select one:" out of the question text.
+- Leave instructions such as "Select one:" and page furniture such as
+  "Question 3 Marked out of 14.29" or "Report an issue" out of the question text.
 - The answer must come from the document: an answer-key section, an "Answer:"
   line, or a mark on an option -- [CHECKMARK], **bold**, ==highlight==, a
   [colour ...] tag, "(correct)" or an asterisk -- that the other options of that
@@ -59,11 +64,28 @@ Rules:
   even if you are sure; a teacher will fill it in.
 - Material several questions share -- a case, a passage, data tables -- goes in
   shared_context as Markdown, tables included, every number copied exactly.
+  NEVER put answers, worked solutions, marking feedback ("You have correctly
+  selected...", "Correct answer: ...") or anyone's email address in
+  shared_context: every student reads it.
 
 Document:
 """
 
-SCHEMA = {
+
+def _strict(node):
+    """The schema in the form OpenAI's strict mode insists on."""
+    if isinstance(node, dict):
+        node = {key: _strict(value) for key, value in node.items()}
+        if node.get("type") == "object":
+            node["additionalProperties"] = False
+            node["required"] = list(node.get("properties", {}))
+        return node
+    if isinstance(node, list):
+        return [_strict(value) for value in node]
+    return node
+
+
+SCHEMA = _strict({
     "type": "object",
     "properties": {
         "shared_context": {"type": "string", "description": "Case, passage or tables the questions refer to, as Markdown. Empty if none."},
@@ -75,19 +97,16 @@ SCHEMA = {
                 "options": {"type": "array", "items": {
                     "type": "object",
                     "properties": {"label": {"type": "string"}, "text": {"type": "string"}},
-                    "required": ["label", "text"],
                 }},
                 "correct": {"type": "array", "items": {"type": "string"},
                             "description": "Option letters (or, for Short answer, the answer) the DOCUMENT marks as correct."},
                 "key_source": {"type": "string", "enum": ["answer key section", "marked inline", NOT_IN_DOCUMENT]},
                 "key_evidence": {"type": "string", "description": "The exact words in the document that show the answer."},
             },
-            "required": ["question_text", "question_type", "options", "correct", "key_source", "key_evidence"],
         }},
         "notes": {"type": "array", "items": {"type": "string"}, "description": "Anything the teacher should check."},
     },
-    "required": ["shared_context", "questions", "notes"],
-}
+})
 
 
 def read_document(document: str, api_key: str, models=DEFAULT_MODELS, *, case_material: str = "",
@@ -108,12 +127,22 @@ def read_document(document: str, api_key: str, models=DEFAULT_MODELS, *, case_ma
     return normalise(raw, document, case_material)
 
 
-def _call(document: str, api_key: str, models: tuple, post, sleep, clock) -> dict:
+def _body(model: str, document: str) -> dict:
     body = {
-        "contents": [{"role": "user", "parts": [{"text": PROMPT + document}]}],
-        "generationConfig": {"responseMimeType": "application/json", "responseSchema": SCHEMA},
+        "model": model,
+        "messages": [{"role": "user", "content": PROMPT + document}],
+        "response_format": {"type": "json_schema",
+                            "json_schema": {"name": "question_bank", "strict": True, "schema": SCHEMA}},
     }
-    problem = "Gemini could not be reached."
+    if model.startswith(("gpt-5", "o")):
+        # Transcribing needs no deliberation, and the default effort is several
+        # times slower for the same reading.
+        body["reasoning_effort"] = "low"
+    return body
+
+
+def _call(document: str, api_key: str, models: tuple, post, sleep, clock) -> dict:
+    problem = "OpenAI could not be reached."
     deadline = clock() + TOTAL_SECONDS
     for model in models:
         for attempt in range(RETRIES_PER_MODEL):
@@ -125,56 +154,61 @@ def _call(document: str, api_key: str, models: tuple, post, sleep, clock) -> dic
             try:
                 # The key goes in a header, never the URL, where proxies and
                 # server logs would keep a copy of it.
-                response = post(ENDPOINT.format(model=model),
-                                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                                json=body, timeout=min(TIMEOUT_SECONDS, remaining))
+                response = post(ENDPOINT, headers={"Authorization": f"Bearer {api_key}",
+                                                   "Content-Type": "application/json"},
+                                json=_body(model, document), timeout=min(TIMEOUT_SECONDS, remaining))
             except httpx.TransportError:
-                problem = "Gemini could not be reached."
+                problem = "OpenAI could not be reached."
                 continue
             status = response.status_code
             if status == 200:
                 return _payload(response)
-            message = _google_message(response)
-            if status in (401, 403) or (status == 400 and "api key" in message.casefold()):
-                raise AIReadError("Google rejected the Gemini API key. Check [gemini] api_key in .streamlit/secrets.toml.")
-            if status == 404:
+            message, code = _error(response)
+            if status == 401 or code == "invalid_api_key":
+                raise AIReadError("OpenAI rejected the API key. Check [openai] api_key in .streamlit/secrets.toml.")
+            if code == "insufficient_quota":
+                # A 429 like a busy server, but retrying cannot help.
+                raise AIReadError("OpenAI says this API key has run out of credit. Add credit to the account, "
+                                  "or use Read question bank instead.")
+            if status == 404 or code == "model_not_found":
                 # Retired or not offered to this key: the next model may be fine.
-                problem = f"The Gemini model {model} isn't available."
+                problem = f"The OpenAI model {model} isn't available."
                 break
             if status in (429, 500, 502, 503, 504):
-                problem = "Gemini is busy right now."
+                problem = "OpenAI is busy right now."
                 continue
-            raise AIReadError(f"Gemini refused the request ({status}): {message or 'no reason given'}")
+            raise AIReadError(f"OpenAI refused the request ({status}): {message or 'no reason given'}")
     raise AIReadError(f"{problem} Try again in a minute, or use Read question bank instead.")
 
 
-def _google_message(response) -> str:
+def _error(response) -> tuple[str, str]:
     try:
-        return str(response.json().get("error", {}).get("message") or "")
+        error = response.json().get("error") or {}
+        return str(error.get("message") or ""), str(error.get("code") or "")
     except (ValueError, AttributeError):
-        return ""
+        return "", ""
 
 
 def _payload(response) -> dict:
     try:
         data = response.json()
     except ValueError:
-        raise AIReadError("Gemini's reply could not be read. Try again.") from None
-    candidates = data.get("candidates") or []
-    if not candidates:
-        reason = (data.get("promptFeedback") or {}).get("blockReason") or "no reason given"
-        raise AIReadError(f"Gemini declined to read this file ({reason}).")
-    candidate = candidates[0]
-    if candidate.get("finishReason") == "MAX_TOKENS":
+        raise AIReadError("OpenAI's reply could not be read. Try again.") from None
+    choices = data.get("choices") or []
+    if not choices:
+        raise AIReadError("OpenAI's reply could not be read. Try again.")
+    choice = choices[0]
+    if choice.get("finish_reason") == "length":
         raise AIReadError("This file is too long to read in one go. Split it into smaller files and upload each one.")
-    parts = (candidate.get("content") or {}).get("parts") or []
-    text = "".join(part.get("text", "") for part in parts if not part.get("thought"))
+    message = choice.get("message") or {}
+    if message.get("refusal"):
+        raise AIReadError(f"OpenAI declined to read this file ({message['refusal']}).")
     try:
-        result = json.loads(text)
+        result = json.loads(message.get("content") or "")
     except ValueError:
-        raise AIReadError("Gemini's reply could not be read. Try again.") from None
+        raise AIReadError("OpenAI's reply could not be read. Try again.") from None
     if not isinstance(result, dict):
-        raise AIReadError("Gemini's reply could not be read. Try again.")
+        raise AIReadError("OpenAI's reply could not be read. Try again.")
     return result
 
 
@@ -241,15 +275,40 @@ def normalise(raw: dict, document: str, case_material: str = "") -> dict:
 
     shared = str(raw.get("shared_context") or "").strip()
     if case_material.strip():
-        shared = case_material.strip()
+        shared = _without_questions(case_material, questions, raw.get("questions") or [])
     elif shared:
         notes.append("The description/context was typed out by the AI. Check its figures against your file before publishing.")
     for remark in (raw.get("notes") or [])[:5]:
         if str(remark).strip():
-            notes.append(f"Gemini: {str(remark).strip()}")
+            notes.append(f"{PROVIDER}: {str(remark).strip()}")
     if not questions:
-        notes.insert(0, "Gemini found no questions in this file either.")
+        notes.insert(0, f"{PROVIDER} found no questions in this file either.")
     return {"questions": questions, "case_material": shared, "notes": notes}
+
+
+def _without_questions(case_material: str, questions: list[dict], raw_questions: list) -> str:
+    """The rule-based reader's Description/Context, minus what the model placed.
+
+    When the rule-based reader finds no questions -- typed-answer files, where
+    nothing has lettered options -- every paragraph near a table becomes case
+    material, so the questions themselves and the lines giving their answers
+    were shown to every student above every question. The model has said which
+    words are questions and which are answers; those come out, and the tables
+    and the passage stay exactly as the file had them.
+    """
+    placed = [_plain(question["question_text"]) for question in questions]
+    placed += [_plain(str(item.get("key_evidence") or "")) for item in raw_questions if isinstance(item, dict)]
+    placed = [text for text in placed if len(text) >= 8]
+    kept = []
+    for paragraph in case_material.strip().split("\n\n"):
+        text = _plain(paragraph)
+        # A table is kept whatever it says; so is a scrap too short to say
+        # whose it is -- a lone "$" is inside every question about money.
+        if paragraph.lstrip().startswith("|") or len(text) < 8:
+            kept.append(paragraph)
+        elif not any(text in question or question in text for question in placed):
+            kept.append(paragraph)
+    return "\n\n".join(kept).strip()
 
 
 def _options(raw) -> list[tuple[str, str]]:

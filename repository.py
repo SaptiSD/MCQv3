@@ -657,7 +657,42 @@ def save_question_bank(quiz_id: int, questions: list[dict]) -> None:
         )
     if previous_ids:
         supabase.table("questions").delete().in_("id", previous_ids).execute()
-    supabase.table("quizzes").update({"status": "active"}).eq("id", quiz_id).execute()
+    # A quiz with questions is ready, not live. This line used to set "active",
+    # which made every save -- the first publish included -- put the quiz in
+    # front of every assigned student at once, and there was no way to load a
+    # quiz ahead of the class it was for. Only `set_quiz_active` turns one on.
+    supabase.table("quizzes").update({"status": INACTIVE}).eq("id", quiz_id).eq("status", DRAFT).execute()
+
+
+# A quiz's `status`. Draft: the row exists but its questions have not landed.
+# Inactive: complete, invisible to students. Active: on students' dashboards
+# (within its opening and closing times). Only a teacher's click moves a quiz
+# between inactive and active.
+DRAFT, INACTIVE, ACTIVE = "draft", "inactive", "active"
+
+QUIZ_HAS_NO_QUESTIONS = "Add at least one question before activating this assessment."
+
+
+def set_quiz_active(quiz_id: int, owner_id: int, active: bool) -> bool:
+    """Show the quiz to its assigned students, or hide it again.
+
+    Deactivating never touches attempts: a student already writing keeps their
+    paper and can hand it in, because the alternative -- what deleting a quiz
+    does -- is throwing away twenty minutes of somebody's work. It only stops the
+    card being drawn and new attempts being started.
+    """
+    supabase = client()
+    owned = _rows(supabase.table("quizzes").select("id,status").eq("id", quiz_id).eq("owner_id", owner_id).limit(1).execute())
+    if not owned:
+        return False
+    if active and not _rows(supabase.table("questions").select("id").eq("quiz_id", quiz_id).limit(1).execute()):
+        raise ValueError(QUIZ_HAS_NO_QUESTIONS)
+    supabase.table("quizzes").update({"status": ACTIVE if active else INACTIVE}).eq("id", quiz_id).execute()
+    return True
+
+
+def quiz_is_live(quiz: dict | None) -> bool:
+    return bool(quiz) and quiz.get("status") == ACTIVE
 
 
 def save_case_material(quiz_id: int, case_material: str) -> None:
@@ -853,11 +888,18 @@ def student_progress_for_quiz(teacher_id: int, quiz_id: int):
 def available_quizzes(student_id: int, owner_id: int | None = None):
     now = utc_now()
     supabase = client()
-    base = supabase.table("quizzes").select("*").eq("status", "active") \
+    if owner_id is not None:
+        # The teacher's own Student view shows inactive quizzes too: trying a
+        # paper out before switching it on is exactly what the switch is for.
+        return _rows(
+            supabase.table("quizzes").select("*").in_("status", [ACTIVE, INACTIVE]).eq("owner_id", owner_id)
+            .or_(f"opening_enabled.eq.0,opening_time.lte.{now}")
+            .or_(f"closing_enabled.eq.0,closing_time.gte.{now}")
+            .order("closing_time").execute()
+        )
+    base = supabase.table("quizzes").select("*").eq("status", ACTIVE) \
         .or_(f"opening_enabled.eq.0,opening_time.lte.{now}") \
         .or_(f"closing_enabled.eq.0,closing_time.gte.{now}")
-    if owner_id is not None:
-        return _rows(base.eq("owner_id", owner_id).order("closing_time").execute())
     # Ask for this student's quizzes only. Fetching every active quiz in the
     # database and filtering here grew with everyone's quizzes -- each with its
     # Description/Context -- and it runs for every student on every dashboard

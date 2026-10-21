@@ -45,17 +45,41 @@ _MARKER = re.compile(r"^\s*answer\s*key\s*:?-?\s*(.*)$", re.I)
 _KEY_PAIR = re.compile(r"(\d+)\s*[.):-]\s*([A-F](?:\s*,\s*[A-F])*)(?![A-Za-z])", re.I)
 # A per-question answer: Moodle's Aiken format ("ANSWER: B") and the feedback
 # line a Moodle review page prints under every question.
-_KEY_LINE = re.compile(r"^\s*(?:answer|ans|correct answer)\s*[:=]\s*(.+?)\s*$", re.I)
+# "Question 4(a) -- Correct Answer: $25,000" is how one teacher keyed a typed
+# question; the label in front of it is not part of the answer.
+_KEY_LINE = re.compile(r"^\s*(?:question\s+\S+\s*[—–:-]+\s*)?(?:answer|ans|correct answer)\s*[:=]\s*(.+?)\s*$", re.I)
 _CORRECT_IS = re.compile(r"^\s*the\s+correct\s+answers?\s+(?:is|are)\s*:?\s*(.+?)\s*$", re.I)
-_QUESTION_HEADER = re.compile(r"^\s*question\s+(\d+)\s*[:.]?\s*$", re.I)
+# Moodle prints its header on one line, and the theme decides what follows the
+# number: "Question 3 Marked out of 14.29 Report an issue" in the copy that taught
+# this. Matched only as "Question 3", the rest of that line was glued onto the
+# next question's wording and the header itself landed in the Description.
+_QUESTION_HEADER = re.compile(
+    r"^\s*question\s+(\d+)\s*[:.]?"
+    r"(?:\s*(?:marked out of [\d.]+|mark [\d.]+ out of [\d.]+|not yet answered|not answered|answer saved"
+    r"|complete|correct|incorrect|partially correct|flag question|remove flag|report an issue)\s*[.,]?)*\s*$",
+    re.I,
+)
 # Page furniture that a copied quiz carries along with its questions.
 _CHROME = re.compile(
     r"^\s*(?:select one(?: or more)?|select all that apply|choose (?:one|all that apply|the (?:best|correct) answer)"
     r"|not yet answered|not answered|answer saved|marked out of [\d.]+|mark [\d.]+ out of [\d.]+"
     r"|flag question|remove flag|question text|correct|incorrect|partially correct|feedback|information"
-    r"|your answer is (?:correct|incorrect|partially correct))\s*[:.!]?\s*$",
+    r"|your answer is (?:correct|incorrect|partially correct)|report an issue)\s*[:.!]?\s*$",
     re.I,
 )
+# Moodle's icon fonts (the flag beside each question, say) arrive as characters
+# from the Private Use Area that no other font can draw. The tick and cross
+# glyphs are among them and *are* meaning -- they mark the answer -- so they stay.
+_ICON_GLYPHS = re.compile("[-]")
+# Lines that give an answer away. In the Description/Context every student reads
+# them above every question; a copy of Moodle's *review* page is full of them.
+_ANSWER_GIVEAWAY = re.compile(
+    r"\b(?:correct answer|the correct answers? (?:is|are)|you have correctly selected|your answer is correct"
+    r"|answer\s*[:=]|ans\s*[:=]|solution\s*[:=]|answer key)",
+    re.I,
+)
+_REVIEW_PAGE = re.compile(r"you have correctly selected|your answer is (?:correct|incorrect)", re.I)
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _SELECT_ALL_HINT = re.compile(r"select (?:one or more|all that apply)|choose all that apply", re.I)
 _CORRECT_TAG = re.compile(r"\s*[\(\[]\s*correct\s*[\)\]]\s*$", re.I)
 # Separated letters only: "A, C" or "a and c", never "Cafe" read as C, A, F, E.
@@ -217,9 +241,22 @@ def _table_rows(table) -> list[list[str]]:
 
 
 def markdown_table(rows: list[list[str]]) -> str:
-    """A table as Markdown, numeric columns right-aligned like a statement."""
+    """A table as Markdown, numeric columns right-aligned like a statement.
+
+    Columns with nothing in them are left out, and so are blank rows before the
+    first real one. Word reports a merged cell once per grid column it spans, so
+    a company name merged across three columns drew two empty columns beside
+    every row; and a blank first row became an empty header that pushed the
+    real one into the body. A blank row *inside* a statement is a spacer the
+    teacher put there, and stays.
+    """
     width = max(len(row) for row in rows)
     rows = [[cell.replace("|", "\\|") for cell in row] + [""] * (width - len(row)) for row in rows]
+    while len(rows) > 1 and not any(cell.strip() for cell in rows[0]):
+        rows = rows[1:]
+    kept = [column for column in range(width) if any(row[column].strip() for row in rows)] or [0]
+    rows = [[row[column] for column in kept] for row in rows]
+    width = len(kept)
     head, body = rows[0], rows[1:]
     alignment = []
     for column in range(width):
@@ -330,6 +367,7 @@ class _Reader:
         self.next_number: int | None = None
         self.stray_options = 0
         self.tables = 0
+        self.review_page = False
 
     # Each block, in order.
 
@@ -344,7 +382,7 @@ class _Reader:
             self._claim_trailing_as_case()
             self.case.append(markdown_table(block["rows"]))
             return
-        line = " ".join(block["text"].split())
+        line = " ".join(_strip_icons(block["text"]).split())
         if not line:
             return
         if (marker := _MARKER.match(line)):
@@ -379,13 +417,27 @@ class _Reader:
             self._option(option, block["marks"])
         elif self.numbered:
             if self.current is None:
-                self.pending.append(line)
+                self._unclaimed(line)
             elif not self.current["options"]:
                 self.current["question_text"] += " " + line
             else:
                 self.trailing.append(line)
         else:
-            self.pending.append(line)
+            self._unclaimed(line)
+
+    def _unclaimed(self, line: str) -> None:
+        """Prose no question has claimed: on its way to the Description/Context.
+
+        Unless it is an answer with no question to attach it to, or somebody's
+        email address. Every student reads the Description/Context, so those are
+        left out instead, and the notes name them.
+        """
+        if _KEY_LINE.match(line) or _CORRECT_IS.match(line) or _EMAIL.search(line) or _REVIEW_PAGE.search(line):
+            self.review_page = self.review_page or bool(_REVIEW_PAGE.search(line))
+            self._settle()
+            self.ignored.append(line)
+            return
+        self.pending.append(line)
 
     def _option(self, match, marks: set) -> None:
         if not self.numbered and (self.current is None or self.pending or not self.current["options"]):
@@ -461,7 +513,10 @@ class _Reader:
             notes.append("Not part of any question, so left out: " + "; ".join(shown) + more + ".")
         if self.stray_options:
             notes.append(f"{self.stray_options} lettered line(s) had no question before them and were left out.")
+        if self.review_page:
+            notes.append(REVIEW_PAGE_NOTE)
         case = "\n\n".join(self.case).strip()
+        notes.extend(answer_leaks(case) + unreadable_characters(case, questions))
         if not questions:
             kept = ""
             if case and self.tables:
@@ -597,6 +652,58 @@ def _key_labels(value: str, options: list) -> list[str]:
         return list(dict.fromkeys(re.findall(r"(?<![A-Z])[A-F](?![A-Z])", value.upper())))
     wanted = grading.normalise_text(value)
     return [label for label, text in options if grading.normalise_text(text) == wanted] or [value]
+
+
+REVIEW_PAGE_NOTE = (
+    "This looks like a copy of a quiz's review page -- it has a student's answers and the marking feedback "
+    "in it. Lines that gave answers away were left out, but check the questions and the Description/Context "
+    "for any answers still showing, or copy the quiz from its preview page instead."
+)
+
+
+def _strip_icons(text: str) -> str:
+    return _ICON_GLYPHS.sub(lambda m: m.group() if m.group() in CHECKS + CROSSES else " ", text)
+
+
+def answer_leaks(case_material: str) -> list[str]:
+    """Warnings for anything in the Description/Context that gives answers away.
+
+    The Description/Context is drawn above every question for every student,
+    so an "Answer:" line in it is the answer key handed out with the paper.
+    Warn rather than delete: a worked example can legitimately say "answer",
+    and silently cutting a teacher's text is how the upload used to lose tables.
+    """
+    warnings = []
+    lines = [" ".join(_strip_icons(line).split()) for line in (case_material or "").splitlines()]
+    giveaways = [line for line in lines if _ANSWER_GIVEAWAY.search(line)]
+    if giveaways:
+        shown = "; ".join(f"“{_clip(line)}”" for line in giveaways[:3])
+        more = f" and {len(giveaways) - 3} more" if len(giveaways) > 3 else ""
+        warnings.append(f"The Description/Context seems to contain answers, and every student sees it: "
+                        f"{shown}{more}. Delete them before activating.")
+    emails = sorted({match.group() for line in lines for match in _EMAIL.finditer(line)})
+    if emails:
+        warnings.append("The Description/Context contains an email address (" + ", ".join(emails[:3])
+                        + "), which every student would see. Remove it unless that is intended.")
+    return warnings
+
+
+def unreadable_characters(case_material: str, questions=()) -> list[str]:
+    """A note for the � sign, which is a character lost before MCQ saw it.
+
+    It appears where a curly apostrophe or a multiplication sign was copied out
+    of a page whose own encoding was broken. Nothing can say which character it
+    was, so the teacher is told rather than given a guess.
+    """
+    places = (case_material or "").count("�") + sum(
+        str(question.get("question_text", "")).count("�")
+        + sum(str(text).count("�") for _, text in question.get("options", []))
+        for question in questions)
+    if not places:
+        return []
+    return [f"{places} character{'s' if places != 1 else ''} in this file could not be read and show as � "
+            "-- usually an apostrophe or a × sign lost when the text was copied. Retype "
+            f"{'them' if places != 1 else 'it'} before publishing."]
 
 
 def _clip(line: str, limit: int = 70) -> str:

@@ -56,7 +56,8 @@ for t in test_*.py; do .venv/Scripts/python.exe $t; done
 | `test_attempt_sync.py` | quiz/attempt drift — fingerprints, resync, re-keying |
 | `test_editor_callbacks.py` | the blank-page crash; runs the real runtime via `AppTest` |
 | `test_ingestion.py` | upload layouts, answer marks, case material, exports |
-| `test_ai_reader.py` | the Gemini reader with the network faked out |
+| `test_ai_reader.py` | the OpenAI reader with the network faked out |
+| `test_activation.py` | quizzes stay hidden until activated; the class's clock (live DB, ZZTEST rows) |
 
 `.venv/Scripts/python.exe -m pyflakes *.py` should print nothing.
 
@@ -74,7 +75,8 @@ grading.py          answer specs + marking. Pure.
 attempt_sync.py     keeping an attempt in step with its quiz. Pure.
 ingestion.py        question-bank upload: blocks, layouts, answer marks,
                     case material. Pure.
-ai_reader.py        the optional Gemini reader for files ingestion can't
+local_time.py       the class's time zone for every opening/closing time
+ai_reader.py        the optional OpenAI reader for files ingestion can't
                     follow. No Streamlit, no database; one HTTPS call.
 server_state.py     state outliving one browser tab (sign-out epochs,
                     draft mirrors, publish claims)
@@ -85,10 +87,29 @@ Dependency direction: `grading` ← `attempt_sync` ← `repository` ← portals,
 `grading` ← `ingestion` / `ai_reader` ← `teacher_portal`. Keep `attempt_sync`,
 `grading`, `ingestion` and `ai_reader` free of Streamlit and of the database.
 
-The Gemini key lives in `[gemini] api_key` in `.streamlit/secrets.toml`
+The OpenAI key lives in `[openai] api_key` in `.streamlit/secrets.toml`
 (gitignored); without it the **Read with AI** button simply isn't drawn.
 
 ## Invariants worth not breaking
+
+**A quiz is invisible to students until its teacher presses Activate.** Status
+is `draft` (no questions yet) -> `inactive` (complete, hidden) -> `active`, and
+only `repository.set_quiz_active` moves it to `active`. `save_question_bank`
+used to set `active` on every save, so publishing put a quiz in front of every
+assigned student at once; in Oct 2026 that showed a class two chapters they had
+not covered, and the "fix" someone reached for -- deleting the quiz -- threw away
+a student's attempt twenty minutes in. Assignment and the opening time are not
+visibility: a student who joins a roster is handed every class-wide quiz
+(`join_teacher`), and the opening time was five hours early (next rule).
+`start_attempt` re-reads the status because a card is not a permission.
+Deactivating stops new starts and never deletes an attempt.
+
+**Times are the class's, not the server's.** The live host runs on UTC, and a
+bare `.astimezone()` turned "8:00 AM" typed in Texas into 8:00 UTC -- 3 AM
+Central -- while the teacher's own screen, formatted on the same machine, read
+it back as 8:00 AM. Every date/time a teacher picks goes through
+`local_time.combine`, and every one shown through `local_time.fmt`/`parse`.
+
 
 **A quiz's paper is fixed once a real student starts it; its answer key is not.**
 This is the same rule the settings have always followed (`settings_editor`), and
@@ -276,8 +297,10 @@ question will sometimes solve it wrong -- Quiz 4's "total debt to equity" is
 0.55 on interest-bearing debt and 1.07 on total liabilities -- and a wrong key
 marks every student wrong. `ai_reader.normalise` keeps an answer only if the
 model's quoted evidence is found in the file, and the `.docx` tables
-`ingestion` read are kept over the model's retyping of them. Gemini overloads
-(503) and retires models (404) routinely: retries, a fallback model and a hard
+`ingestion` read are kept over the model's retyping of them -- minus the paragraphs the
+model identified as questions or answer evidence, which is how Chapter 9's
+"Answer: $52.900" ended up above every question. Providers overload
+(503) and retire models (404) routinely: retries, a fallback model and a hard
 `TOTAL_SECONDS` cap are the design, not an afterthought.
 
 **Case material is part of the paper.** Teachers and students see it labelled

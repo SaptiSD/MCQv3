@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
 from html import escape
 
 import streamlit as st
 
+import local_time
 import server_state
 from db import get_or_create_user
 from repository import PortalMismatch, admin_by_email, authenticate, set_user_role, user_by_email
@@ -214,16 +214,13 @@ def styles() -> None:
 
 
 def when(timestamp) -> str:
-    """Format a stored UTC timestamp for display in the reader's local time."""
+    """Format a stored UTC timestamp in the class's time zone (see `local_time`)."""
     if not timestamp or timestamp == "-":
         return "-"
     try:
-        moment = datetime.fromisoformat(str(timestamp))
+        return local_time.fmt(timestamp, with_zone=False)
     except ValueError:
         return str(timestamp)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone().strftime("%b %d, %I:%M %p").replace(" 0", " ")
 
 
 def percent(value) -> str:

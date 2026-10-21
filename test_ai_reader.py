@@ -1,6 +1,6 @@
 """The AI reader, without the network. Run with: python test_ai_reader.py
 
-What matters here is not whether Gemini reads well -- that was checked against
+What matters here is not whether the model reads well -- that was checked against
 the real files -- but what the app does with whatever comes back: an answer
 the model cannot point to in the file is thrown away, a busy or retired model
 is survived, and a bad key says so in words a teacher can act on.
@@ -110,11 +110,34 @@ own = ai_reader.normalise(GOOD, DOCUMENT)
 check("without them the model's copy is used", own["case_material"], "| Net sales | 4885340 |")
 check("with a warning to check the figures", any("typed out by the AI" in n for n in own["notes"]), True)
 check("an empty reading says so", ai_reader.normalise({"questions": []}, DOCUMENT)["notes"][0],
-      "Gemini found no questions in this file either.")
+      "OpenAI found no questions in this file either.")
+
+# Chapter 9, as a teacher loaded it: a typed-answer file, so the rule-based
+# reader found no questions and kept every paragraph near the table -- the
+# question and its "Answer:" line included -- as the Description every student
+# reads. The model has said which words are the question and which the answer.
+TYPED_FILE = "\n".join([
+    "Cummins Inc. reports investments in affiliated companies.",
+    "| Item | Year 2 |", "|---|---:|", "| Sales | $5,000 |",
+    "How much income does Bava report relating to this investment for the year?",
+    "Answer: $52.900",
+])
+RULE_CASE = ("Cummins Inc. reports investments in affiliated companies.\n\n| Item | Year 2 |\n| --- | ---: |\n"
+             "| Sales | $5,000 |\n\nHow much income does Bava report relating to this investment for the year?"
+             "\n\nAnswer: $52.900\n\n$")
+typed_reading = ai_reader.normalise({"questions": [item(
+    "How much income does Bava report relating to this investment for the year?", [], ["$52.900"],
+    source="marked inline", evidence="Answer: $52.900", question_type="Short answer")]}, TYPED_FILE, RULE_CASE)
+case = typed_reading["case_material"]
+check("the question's own wording is taken out of the Description", "How much income" in case, False)
+check("and so is the line that gives its answer", "52.900" in case, False)
+check("the passage stays", case.startswith("Cummins Inc. reports"), True)
+check("the table stays exactly as the file had it", "| Sales | $5,000 |" in case, True)
+check("and the answer is still the key", typed_reading["questions"][0]["correct_label"], "$52.900")
 
 
 print()
-print("== talking to Google ==")
+print("== talking to OpenAI ==")
 
 
 class Reply:
@@ -127,13 +150,13 @@ class Reply:
         return self._payload
 
 
-def ok(result, finish="STOP"):
-    return Reply(200, {"candidates": [{"finishReason": finish,
-                                        "content": {"parts": [{"text": json.dumps(result)}]}}]})
+def ok(result, finish="stop"):
+    return Reply(200, {"choices": [{"finish_reason": finish,
+                                    "message": {"role": "assistant", "content": json.dumps(result)}}]})
 
 
-def error(status, message):
-    return Reply(status, {"error": {"message": message}})
+def error(status, message, code=None):
+    return Reply(status, {"error": {"message": message, "code": code}})
 
 
 class Script:
@@ -143,7 +166,7 @@ class Script:
         self.replies, self.calls = list(replies), []
 
     def __call__(self, url, headers=None, json=None, timeout=None):
-        self.calls.append({"url": url, "headers": headers})
+        self.calls.append({"url": url, "headers": headers, "json": json})
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
@@ -162,30 +185,37 @@ def run(script, models=("first-model", "second-model")):
 script = Script(ok(GOOD))
 result, problem, _ = run(script)
 check("a good reply is read", (problem, len(result["questions"])), (None, 2))
-check("the key travels in a header", script.calls[0]["headers"]["x-goog-api-key"], "SECRET-KEY")
+check("the key travels in a header", script.calls[0]["headers"]["Authorization"], "Bearer SECRET-KEY")
 check("and never in the URL, where logs would keep it", "SECRET-KEY" in script.calls[0]["url"], False)
+check("nor in the body", "SECRET-KEY" in json.dumps(script.calls[0]["json"]), False)
+check("the reply is held to a strict schema",
+      script.calls[0]["json"]["response_format"]["json_schema"]["strict"], True)
+check("which closes every object, as strict mode requires",
+      ai_reader.SCHEMA["properties"]["questions"]["items"]["properties"]["options"]["items"]["additionalProperties"], False)
 
 script = Script(error(503, "overloaded"), error(503, "overloaded"), ok(GOOD))
 result, problem, naps = run(script)
 check("a busy model is retried", (problem, len(script.calls)), (None, 3))
 check("with a growing pause", naps, [2, 4])
 
-script = Script(error(404, "no longer available"), ok(GOOD))
+script = Script(error(404, "The model `first-model` does not exist", "model_not_found"), ok(GOOD))
 result, problem, _ = run(script)
-check("a retired model falls through to the next", (problem, script.calls[1]["url"].split("/")[-1]),
-      (None, "second-model:generateContent"))
+check("a retired model falls through to the next", (problem, script.calls[1]["json"]["model"]),
+      (None, "second-model"))
 
 script = Script(httpx.ConnectError("dns"), ok(GOOD))
 result, problem, _ = run(script)
 check("a dropped connection is retried", problem, None)
 
-_, problem, _ = run(Script(error(400, "API key not valid. Please pass a valid API key.")))
+_, problem, _ = run(Script(error(401, "Incorrect API key provided", "invalid_api_key")))
 check("a bad key says so", "API key" in (problem or ""), True)
-_, problem, _ = run(Script(error(403, "forbidden")))
-check("so does a forbidden one", "API key" in (problem or ""), True)
+script = Script(error(429, "You exceeded your current quota", "insufficient_quota"))
+_, problem, _ = run(script)
+check("an account out of credit says so, and is not retried", ("credit" in (problem or ""), len(script.calls)),
+      (True, 1))
 
 _, problem, _ = run(Script(*[error(503, "overloaded")] * 6))
-check("busy everywhere ends in plain words", problem.startswith("Gemini is busy right now."), True)
+check("busy everywhere ends in plain words", problem.startswith("OpenAI is busy right now."), True)
 
 now = [0.0]
 
@@ -203,15 +233,16 @@ try:
     problem = None
 except ai_reader.AIReadError as exc:
     problem = str(exc)
-check("however the retries add up, the wait is capped", (problem or "").startswith("Gemini is busy"), True)
+check("however the retries add up, the wait is capped", (problem or "").startswith("OpenAI is busy"), True)
 check("after three slow tries rather than six", len(slow_busy.timeouts), 3)
 check("and the last try only gets the time that is left", slow_busy.timeouts[-1], ai_reader.TOTAL_SECONDS - 140)
 
-_, problem, _ = run(Script(ok(GOOD, finish="MAX_TOKENS")))
+_, problem, _ = run(Script(ok(GOOD, finish="length")))
 check("a truncated reply asks for a smaller file", "Split it" in (problem or ""), True)
-_, problem, _ = run(Script(Reply(200, {"promptFeedback": {"blockReason": "SAFETY"}})))
-check("a refusal is reported with its reason", "SAFETY" in (problem or ""), True)
-_, problem, _ = run(Script(Reply(200, {"candidates": [{"content": {"parts": [{"text": "not json"}]}}]})))
+_, problem, _ = run(Script(Reply(200, {"choices": [{"finish_reason": "stop",
+                                                    "message": {"content": None, "refusal": "I can't help"}}]})))
+check("a refusal is reported with its reason", "I can't help" in (problem or ""), True)
+_, problem, _ = run(Script(Reply(200, {"choices": [{"finish_reason": "stop", "message": {"content": "not json"}}]})))
 check("an unreadable reply is an error, not a crash", "could not be read" in (problem or ""), True)
 
 calls = Script()

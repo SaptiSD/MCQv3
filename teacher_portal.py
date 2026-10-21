@@ -17,10 +17,11 @@ from fpdf import FPDF
 import ai_reader
 import grading
 import ingestion
+import local_time
 import server_state
 from ui import (empty_state, flash, markdown_source, metric_row, page_header, percent, pill, require_session,
                 show_flash, text, when)
-from repository import (add_student_to_roster, assigned_student_ids, create_quiz,
+from repository import (ACTIVE, add_student_to_roster, assigned_student_ids, create_quiz, set_quiz_active,
                         delete_quiz, move_question, questions_for_quiz, quiz_attempt_counts,
                         quiz_counts_for_teacher, quiz_for_teacher, quizzes_for_teacher,
                         quiz_has_attempts, regrade_quiz, save_case_material, save_question_bank,
@@ -268,17 +269,59 @@ def delete_quiz_dialog(user, quiz_id: int, title: str) -> None:
         st.rerun()
 
 
+def _window_words(quiz) -> str:
+    """When an active quiz can actually be started, in the class's time zone."""
+    now = local_time.now()
+    opening = local_time.parse(quiz["opening_time"]) if quiz.get("opening_enabled") else None
+    closing = local_time.parse(quiz["closing_time"]) if quiz.get("closing_enabled") else None
+    if closing and closing <= now:
+        return f"closed {local_time.fmt(closing)}"
+    if opening and opening > now:
+        return f"opens {local_time.fmt(opening)}" + (f", closes {local_time.fmt(closing)}" if closing else "")
+    return "open now" + (f" until {local_time.fmt(closing)}" if closing else ", no closing time")
+
+
+@st.dialog("Activate assessment?")
+def activate_quiz_dialog(user, quiz_id: int) -> None:
+    # A dialog body is a fragment: the session check has to happen in here.
+    if not require_session(user):
+        return
+    quiz = quiz_for_teacher(quiz_id, user["id"])
+    if not quiz:
+        st.rerun()
+    assigned = len(assigned_student_ids(quiz_id))
+    st.write(f"Activating **{text(quiz['title'])}** puts it on the dashboard of "
+             f"**{assigned} assigned student{'s' if assigned != 1 else ''}** -- {_window_words(quiz)}.")
+    if not assigned:
+        st.warning("Nobody is assigned yet, so nobody will see it until you assign students under **Manage**.")
+    for warning in ingestion.answer_leaks(quiz.get("case_material") or ""):
+        st.warning(warning)
+    confirm, cancel = st.columns(2)
+    if confirm.button("Activate", key=f"confirm-activate-{quiz_id}", type="primary", width="stretch"):
+        try:
+            set_quiz_active(quiz_id, user["id"], True)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        flash("dashboard", f"**{quiz['title']}** is active. Assigned students can see it now.")
+        st.rerun()
+    if cancel.button("Cancel", key=f"cancel-activate-{quiz_id}", width="stretch"):
+        st.rerun()
+
+
 def dashboard(user) -> None:
     quizzes = quizzes_for_teacher(user["id"])
     roster = students(user["id"])
     analytics = teacher_analytics(user["id"])
     created_title = st.session_state.pop("quiz_created", None)
     if created_title:
-        st.success(f"**{created_title}** was created.")
+        st.success(f"**{created_title}** was created and is **inactive**: no student can see it. "
+                   "Press **Activate** on it when you want your class to take it.")
+    show_flash("dashboard")
     page_header("Teacher workspace", "Your assessments", "Create, assign, review, and understand the assessments you own.")
     metric_row([
         (analytics["quizzes"], "Total quizzes"),
-        (analytics["active_quizzes"], "Published"),
+        (analytics["active_quizzes"], "Active"),
         (len(roster), "Students in roster"),
         (analytics["completed"], "Completed attempts"),
         (f"{analytics['average_score'] or 0:.0f}%", "Average score"),
@@ -302,18 +345,43 @@ def dashboard(user) -> None:
             with details:
                 summary = counts.get(quiz["id"], {"questions": 0, "assigned": 0})
                 assigned = summary["assigned"]
-                if quiz["status"] != "active" or not summary["questions"]:
+                # "Published" used to mean live to every assigned student the
+                # moment it was saved, and a teacher reading it as "uploaded"
+                # had no way to know otherwise. The badge now says who can see it.
+                live = quiz["status"] == ACTIVE and summary["questions"]
+                if not summary["questions"]:
                     badge = pill("Draft", "grey")
+                elif not live:
+                    badge = pill("Inactive · hidden from students", "grey")
                 elif not assigned:
-                    badge = pill("Not assigned", "amber")
+                    badge = pill("Active · nobody assigned", "amber")
+                elif (window := _window_words(quiz)).startswith("closed"):
+                    badge = pill("Active · closed", "grey")
+                elif window.startswith("opens"):
+                    badge = pill("Active · not open yet", "amber")
                 else:
-                    badge = pill("Published", "green")
+                    badge = pill("Active · visible to students", "green")
                 st.markdown(f"### {text(quiz['title'])} &nbsp;{badge}", unsafe_allow_html=True)
                 audience = f"{assigned} assigned student{'s' if assigned != 1 else ''}" if assigned else "Not assigned"
                 question_count = summary["questions"]
                 minutes = quiz["duration_minutes"]
-                st.caption(f"{question_count} question{'s' if question_count != 1 else ''}  ·  {minutes} minute{'s' if minutes != 1 else ''}  ·  pass at {quiz['passing_score']}%  ·  {audience}")
+                bits = [f"{question_count} question{'s' if question_count != 1 else ''}",
+                        f"{minutes} minute{'s' if minutes != 1 else ''}", f"pass at {quiz['passing_score']}%", audience]
+                if live:
+                    bits.append(_window_words(quiz))
+                st.caption("  ·  ".join(bits))
             with action:
+                if summary["questions"] and quiz["status"] != ACTIVE:
+                    if st.button("Activate", key=f"activate-{quiz['id']}", type="primary", width="stretch"):
+                        activate_quiz_dialog(user, quiz["id"])
+                elif quiz["status"] == ACTIVE:
+                    if st.button("Deactivate", key=f"deactivate-{quiz['id']}", width="stretch"):
+                        set_quiz_active(quiz["id"], user["id"], False)
+                        open_now = quiz_attempt_counts(quiz["id"], exclude_student_id=user["id"])["open"]
+                        flash("dashboard", f"**{quiz['title']}** is inactive. Students can no longer see or start it."
+                              + (f" {open_now} student{'s' if open_now != 1 else ''} already writing it can still hand in."
+                                 if open_now else ""))
+                        st.rerun()
                 if st.button("Manage", key=f"manage-{quiz['id']}", width="stretch"):
                     # Opening the manager always shows what is actually stored.
                     reset_editor_state(quiz["id"])
@@ -532,8 +600,11 @@ def _create_settings_section(user, form: dict) -> None:
         st.checkbox("Show class average to students", form.get("new-average", False), key=_ck("new-average"), on_change=_create_save_setting, args=("new-average",))
         st.checkbox("Randomize question order", form.get("new-randomize-questions", True), key=_ck("new-randomize-questions"), on_change=_create_save_setting, args=("new-randomize-questions",))
         st.checkbox("Randomize answer order", form.get("new-randomize-answers", True), key=_ck("new-randomize-answers"), on_change=_create_save_setting, args=("new-randomize-answers",))
-        today = datetime.now().date()
+        today = local_time.today()
         tomorrow = today + timedelta(days=1)
+        st.caption(f"Times are {local_time.zone_label()} ({local_time.zone().key}). Opening and closing times only "
+                   "limit an assessment that is **active** -- every new assessment starts inactive, and students "
+                   "see nothing until you press **Activate** on your dashboard.")
         opening_enabled = form.get("new-opening-enabled", True)
         st.checkbox("Enable opening date and time", opening_enabled, key=_ck("new-opening-enabled"), on_change=_create_save_setting, args=("new-opening-enabled",))
         opening_date, opening_time = st.columns(2)
@@ -655,8 +726,8 @@ def create(user) -> None:
     if errors:
         st.error(" ".join(errors))
         return
-    opening = datetime.combine(form.get("new-opening-day", datetime.now().date()), form.get("new-opening-clock", time(8, 0))).astimezone()
-    closing = datetime.combine(form.get("new-closing-day", (datetime.now().date() + timedelta(days=1))), form.get("new-closing-clock", time(17, 0))).astimezone()
+    opening = local_time.combine(form.get("new-opening-day", local_time.today()), form.get("new-opening-clock", time(8, 0)))
+    closing = local_time.combine(form.get("new-closing-day", local_time.today() + timedelta(days=1)), form.get("new-closing-clock", time(17, 0)))
     opening_enabled = form.get("new-opening-enabled", True)
     closing_enabled = form.get("new-closing-enabled", True)
     now = datetime.now(timezone.utc)
@@ -666,8 +737,6 @@ def create(user) -> None:
     if closing_enabled and closing <= now:
         st.error("Closing time is in the past; students won't be able to take this quiz. Set a closing time in the future.")
         return
-    if opening_enabled and opening > now:
-        st.info(f"The quiz opens on {opening.astimezone().strftime('%b %d, %I:%M %p')} and won't be visible to students until then.")
     if form.get("new-audience-mode", "All") == "All":
         assigned_students = {row["id"] for row in students(user["id"])}
     else:
@@ -907,7 +976,8 @@ def manage_quiz(user, quiz_id: int) -> None:
             st.success("Answer key saved. The questions are unchanged — anyone still working is marked "
                        "against the corrected key when they hand in.")
         elif just_saved:
-            st.success("Test saved and published. The questions below are what students will now see.")
+            st.success("Questions saved. The questions below are what students will see"
+                       + (" now." if quiz["status"] == ACTIVE else " once you activate this assessment."))
         attempts = quiz_attempt_counts(quiz_id, exclude_student_id=user["id"])
         if just_saved and attempts["submitted"]:
             # An attempt is marked against the key that was live when it was
@@ -1058,8 +1128,8 @@ def _render_quiz_pdf(quiz, questions, format_key: str) -> bytes:
     if format_key == "questions-answers-settings":
         pdf.set_font("Helvetica", "I", 11)
         pdf.set_text_color(90, 90, 90)
-        opening = datetime.fromisoformat(quiz["opening_time"]).astimezone().strftime("%b %d, %I:%M %p") if quiz.get("opening_enabled") else "Any time"
-        closing = datetime.fromisoformat(quiz["closing_time"]).astimezone().strftime("%b %d, %I:%M %p") if quiz.get("closing_enabled") else "Open"
+        opening = local_time.fmt(quiz["opening_time"]) if quiz.get("opening_enabled") else "Any time"
+        closing = local_time.fmt(quiz["closing_time"]) if quiz.get("closing_enabled") else "Open"
         settings_lines = [
             f"Time allowed: {quiz['duration_minutes']} minute{'s' if quiz['duration_minutes'] != 1 else ''}",
             f"Passing score: {quiz['passing_score']}%",
@@ -1290,9 +1360,9 @@ def _upload_store_key(quiz_id: int) -> str:
 
 
 def _ai_settings() -> dict | None:
-    """The Gemini key and models from secrets.toml, or None when AI reading isn't set up."""
+    """The OpenAI key and models from secrets.toml, or None when AI reading isn't set up."""
     try:
-        section = st.secrets.get("gemini") or {}
+        section = st.secrets.get("openai") or {}
         api_key = str(section.get("api_key") or "").strip()
         models = section.get("models") or ai_reader.DEFAULT_MODELS
     except Exception:
@@ -1447,13 +1517,13 @@ def _upload_panel(store: dict, wkey, changed, case_name: str) -> None:
             changed()
             st.rerun(scope="fragment")
         if ai and ai_column.button("Read with AI", key=wkey("upload-read-ai"), width="stretch"):
-            with st.spinner("Gemini is reading the file. This usually takes under a minute, "
-                            "and up to two and a half when Gemini is busy..."):
+            with st.spinner("The AI is reading the file. This usually takes a few seconds, "
+                            "and up to two and a half minutes when OpenAI is busy..."):
                 _read_upload(store, upload, case_name, ai)
             changed()
             st.rerun(scope="fragment")
         if ai:
-            st.caption("**Read with AI** sends the file's text to Google Gemini, for files the ordinary reader "
+            st.caption("**Read with AI** sends the file's text to OpenAI, for files the ordinary reader "
                        "can't follow. It copies the answers your file marks and never works them out. Either "
                        "way, nothing is published until you've checked the table below.")
     if store.get("upload-error"):
@@ -1471,6 +1541,10 @@ def _read_upload(store: dict, upload, case_name: str, ai: dict | None = None) ->
         if ai:
             reading = ai_reader.read_document(ingestion.document_markdown(blocks), ai["api_key"], ai["models"],
                                               case_material=reading["case_material"])
+            # The rule-based reading warns about its own Description; this one
+            # was assembled by `ai_reader`, so it is checked the same way here.
+            reading["notes"] += (ingestion.answer_leaks(reading["case_material"])
+                                 + ingestion.unreadable_characters(reading["case_material"], reading["questions"]))
     except ai_reader.AIReadError as exc:
         # Any earlier reading stays: a busy model is no reason to lose it.
         store["upload-error"] = str(exc)
@@ -1483,7 +1557,7 @@ def _read_upload(store: dict, upload, case_name: str, ai: dict | None = None) ->
     store["upload-base"] = rows
     store["upload-epoch"] = int(store.get("upload-epoch", 0)) + 1
     store["upload-notes"] = list(reading["notes"])
-    store["upload-reader"] = "Gemini" if ai else "the file reader"
+    store["upload-reader"] = "the AI" if ai else "the file reader"
     store["upload-unread"] = int(reading.get("unread") or 0)
     store["upload-name"] = upload.name
     if reading["case_material"]:
@@ -1500,7 +1574,7 @@ def _upload_review(store: dict, wkey, changed, ai: dict | None) -> None:
         # Saying nothing is what this used to do: "Questions ready: 0" over a
         # file that had plainly been read, and no word about why.
         st.warning(notes.pop(0) if notes else "No questions were found in this file.")
-        if ai and store.get("upload-reader") != "Gemini" and store.get("upload-unread"):
+        if ai and store.get("upload-reader") != "the AI" and store.get("upload-unread"):
             st.info("Try **Read with AI**: it can follow layouts the ordinary reader can't.")
     if notes:
         with st.expander(f"{len(notes)} thing{'s' if len(notes) != 1 else ''} to check", expanded=True):
@@ -1820,9 +1894,10 @@ def settings_editor(quiz) -> None:
     has_attempts = quiz_has_attempts(quiz["id"], exclude_student_id=quiz["owner_id"])
     if has_attempts:
         st.info("Settings are read-only after a student starts this assessment. Your own preview attempts don't count.")
-    opening = datetime.fromisoformat(quiz["opening_time"]).astimezone()
-    closing = datetime.fromisoformat(quiz["closing_time"]).astimezone()
+    opening = local_time.parse(quiz["opening_time"])
+    closing = local_time.parse(quiz["closing_time"])
     with st.form(f"settings-{quiz['id']}"):
+        st.caption(f"Times are {local_time.zone_label()} ({local_time.zone().key}).")
         first, second, third = st.columns(3)
         with first: duration = st.number_input("Time allowed (minutes)", 1, 480, quiz["duration_minutes"], disabled=has_attempts)
         with second: passing = st.number_input("Passing score (%)", 0, 100, quiz["passing_score"], disabled=has_attempts)
@@ -1842,8 +1917,8 @@ def settings_editor(quiz) -> None:
         randomize_answers = st.checkbox("Randomize answer order", bool(quiz["randomize_answers"]), disabled=has_attempts)
         saved = st.form_submit_button("Save settings", type="primary", disabled=has_attempts, width="stretch")
     if saved:
-        opening_value = datetime.combine(opening_day, opening_clock).astimezone()
-        closing_value = datetime.combine(closing_day, closing_clock).astimezone()
+        opening_value = local_time.combine(opening_day, opening_clock)
+        closing_value = local_time.combine(closing_day, closing_clock)
         if opening_enabled and closing_enabled and closing_value <= opening_value:
             st.error("Closing time must be after opening time.")
         elif closing_enabled and closing_value <= datetime.now(timezone.utc):

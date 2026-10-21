@@ -10,9 +10,10 @@ import streamlit as st
 
 import attempt_sync
 import grading
-from repository import (all_teachers, attempt_is_open, attempt_with_quiz, attempts_for_student, available_quizzes,
-                        complete_attempt, create_attempt, join_teacher, leave_teacher,
-                        open_attempt, questions_for_quiz, quiz_average_score, quiz_paper_fingerprint,
+import local_time
+from repository import (INACTIVE, all_teachers, attempt_is_open, attempt_with_quiz, attempts_for_student,
+                        available_quizzes, complete_attempt, create_attempt, get_quiz, join_teacher, leave_teacher,
+                        open_attempt, questions_for_quiz, quiz_average_score, quiz_is_live, quiz_paper_fingerprint,
                         refresh_attempt_key, resync_attempt, save_attempt_answers, search_teachers,
                         submitted_attempt, teachers_for_student)
 from ui import (empty_state, markdown_source, metric_row, page_header, percent, pill, require_session,
@@ -100,6 +101,9 @@ def dashboard(user) -> None:
     early = st.session_state.pop("window_not_open", None)
     if early:
         st.info(f"**{early}** hasn't opened yet. It will be ready at the time your teacher set.")
+    inactive = st.session_state.pop("quiz_not_active", None)
+    if inactive:
+        st.info(f"**{inactive}** isn't available right now. Your teacher will switch it on when it's time to take it.")
     if st.session_state.pop("attempt_withdrawn", False):
         st.warning("The assessment you were taking is no longer yours to take - your teacher either removed it "
                    "or unassigned you - so that attempt has ended and nothing was submitted.")
@@ -201,9 +205,10 @@ def _draw_assessment_list(user, previewing: bool) -> None:
                     tone, label = "amber", "In progress"
                 else:
                     tone, label = "grey", "Not started"
-                st.markdown(f"### {text(quiz['title'])} &nbsp;{pill(label, tone)}", unsafe_allow_html=True)
+                hidden = pill("Inactive · students can't see this", "grey") if quiz.get("status") != "active" else ""
+                st.markdown(f"### {text(quiz['title'])} &nbsp;{pill(label, tone)} {hidden}", unsafe_allow_html=True)
                 closes = (
-                    f"closes {datetime.fromisoformat(quiz['closing_time']).astimezone().strftime('%b %d, %I:%M %p')}"
+                    f"closes {local_time.fmt(quiz['closing_time'])}"
                     if quiz["closing_enabled"] else "no closing date"
                 )
                 minutes = quiz["duration_minutes"]
@@ -316,6 +321,17 @@ def start_attempt(user, quiz) -> None:
             _announce(existing["id"], attempt_sync.describe(summary))
         st.session_state.attempt_id = existing["id"]
         return
+    # Whether the quiz is switched on is read fresh, for the same reason as the
+    # retake and window checks below: the card was drawn from a list that may be
+    # twenty seconds old, and a teacher who has just pressed Deactivate means it
+    # now. A paper already started is let through above -- deactivating stops new
+    # attempts, it never takes away the one a student is writing.
+    fresh = get_quiz(quiz["id"])
+    previewing_own = user["role"] == "teacher" and fresh is not None and fresh["owner_id"] == user["id"]
+    if fresh is None or not (quiz_is_live(fresh) or (previewing_own and fresh["status"] == INACTIVE)):
+        st.session_state.quiz_not_active = quiz["title"]
+        return
+    quiz = fresh
     if not quiz["allow_retake"] and submitted_attempt(quiz["id"], user["id"]):
         # "Completed — no retakes" is only a rendering decision on the dashboard,
         # so a second tab still showing "Start quiz" (or a stale card in this

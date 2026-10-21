@@ -6,3 +6,5 @@ fpdf2>=2.7
 # Streamlit's OIDC sign-in (st.login) needs Authlib installed even though the
 # app never imports it directly.
 authlib>=1.3
+# zoneinfo's time-zone database on hosts that have none of their own (Windows).
+tzdata
